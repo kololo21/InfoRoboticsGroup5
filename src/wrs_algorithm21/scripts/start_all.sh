@@ -1,7 +1,9 @@
 #!/bin/bash -eu
 # 使い方: [DETECTOR=yolo] start_all.sh [a|b|c]
 #   引数なし → wrs_main_node.py（統合版）、a/b/c → wrs_main_node_a.py などを実行
-#   DETECTOR=yolo → 物体検出に YOLOv8 を使う（省略時は今までの Faster R-CNN）
+#   DETECTOR=yolo / frcnn → 物体検出器を指定する
+#   省略時: c（いしい）は YOLOv8、それ以外は今までの Faster R-CNN
+#   YOLO のライブラリ（/workspace/.yolo_env）か重みがなければ Faster R-CNN に戻す
 
 if [ $# -ge 1 ]; then
   case "$1" in
@@ -11,7 +13,16 @@ if [ $# -ge 1 ]; then
 else
   NODE="wrs_main_node.py"
 fi
-DETECTOR=${DETECTOR:-frcnn}
+if [ -z "${DETECTOR:-}" ]; then
+  if [ "${NODE}" = "wrs_main_node_c.py" ]; then DETECTOR=yolo; else DETECTOR=frcnn; fi
+fi
+if [ "${DETECTOR}" = "yolo" ]; then
+  if [ ! -d /workspace/.yolo_env/ultralytics ] || \
+     [ ! -f /workspace/src/wrs_detector/checkpoints/yolo_wrs.pt ]; then
+    echo "[warn] YOLO のライブラリか重みがないので Faster R-CNN で実行します（README の YOLO の章）" >&2
+    DETECTOR=frcnn
+  fi
+fi
 case "${DETECTOR}" in
   frcnn) DETECTOR_LAUNCH="frcnn_finetuned.launch" ;;
   yolo)  DETECTOR_LAUNCH="yolo.launch" ;;

@@ -381,6 +381,8 @@ class WrsMainController(object):
     DETECT_FRAMES = 3     # 何回検出するか
     DETECT_MIN_HITS = 2   # 何回以上見えたものを採用するか
     DETECT_IOU = 0.5      # 同じ物体とみなす BBox の重なり（IoU）
+    DETECT_FRAMES_YOLO = 5     # YOLO のときの検出回数（速いので多めに）
+    DETECT_MIN_HITS_YOLO = 3   # YOLO のときに採用する最低回数
 
     # 指示文の人物 → 配達先 waypoint
     # 人物の正面から見て左が person_a（y=2.8）、右が person_b（y=3.9）と仮定。
@@ -614,6 +616,9 @@ class WrsMainController(object):
                     clusters.append({"label": bbox.label, "boxes": [bbox], "frames": {frame_id}})
 
         def median(values):
+            """62401738 いしい
+            値のリストの中央値を返す
+            """
             values = sorted(values)
             return values[len(values) // 2]
 
@@ -631,16 +636,35 @@ class WrsMainController(object):
             merged.append(rep)
         return sorted(merged, key=lambda box: box.score, reverse=True)
 
+    @staticmethod
+    def get_detector_type():
+        """62401738 いしい
+        検出ノードが使っている検出器を返す（"yolo" / "frcnn_finetuned"。分からなければ "unknown"）。
+        start_all.sh c では YOLO が標準。
+        """
+        return rospy.get_param("/frcnn_detector/detector", "unknown")
+
+    def get_detect_frames(self):
+        """62401738 いしい
+        安定化で何回検出し、何回以上見えたものを残すかを返す。
+        YOLO は1回の検出が速い（約3ms）ので回数を増やし、多数決をより確かにする。
+        """
+        if self.get_detector_type() == "yolo":
+            return self.DETECT_FRAMES_YOLO, self.DETECT_MIN_HITS_YOLO
+        return self.DETECT_FRAMES, self.DETECT_MIN_HITS
+
     def get_stable_detection(self):
         """62401738 いしい
-        DETECT_FRAMES 回検出し、merge_detections で多数決した結果を返す
+        複数回検出し、merge_detections で多数決した結果を返す
+        （回数は get_detect_frames で検出器に合わせて決める）
         """
+        n_frames, min_hits = self.get_detect_frames()
         frames = []
-        for i in range(self.DETECT_FRAMES):
+        for i in range(n_frames):
             frames.append(list(self.get_latest_detection().bboxes))
-            if i < self.DETECT_FRAMES - 1:
+            if i < n_frames - 1:
                 rospy.sleep(0.3)
-        merged = self.merge_detections(frames, self.DETECT_MIN_HITS)
+        merged = self.merge_detections(frames, min_hits)
         rospy.loginfo("stable detection: %s",
                       ", ".join(["{}({:.2f})".format(box.label, box.score) for box in merged]))
         return merged
@@ -676,16 +700,25 @@ class WrsMainController(object):
         n_y = int(round((y_max - y_min) / res)) + 1
 
         def to_cell(point):
+            """62401738 いしい
+            map 座標 (x, y) を格子の番号に変換する（範囲外は端の格子にする）
+            """
             c_x = int(round((point[0] - x_min) / res))
             c_y = int(round((point[1] - y_min) / res))
             return (max(0, min(n_x - 1, c_x)), max(0, min(n_y - 1, c_y)))
 
         def to_xy(cell):
+            """62401738 いしい
+            格子の番号を map 座標 (x, y) に変換する
+            """
             return (x_min + cell[0] * res, y_min + cell[1] * res)
 
         clearance_cache = {}
 
         def clearance(cell):
+            """62401738 いしい
+            格子の中心から一番近い障害物までの距離を返す（計算結果は覚えておく）
+            """
             if cell not in clearance_cache:
                 p_x, p_y = to_xy(cell)
                 dists = [math.hypot(p_x - o_x, p_y - o_y) for o_x, o_y in obstacles]
@@ -697,6 +730,9 @@ class WrsMainController(object):
             return None
 
         def heuristic(cell):
+            """62401738 いしい
+            A* のヒューリスティック: 格子からゴールまでの直線距離 [m]
+            """
             return math.hypot(cell[0] - goal_cell[0], cell[1] - goal_cell[1]) * res
 
         cost = {start_cell: 0.0}
@@ -882,7 +918,7 @@ class WrsMainController(object):
         """62401738 いしい
         task2aを実行する
         """
-        rospy.loginfo("#### start Task 2a ####")
+        rospy.loginfo("#### start Task 2a ####  detector: %s", self.get_detector_type())
         self.change_pose("look_at_near_floor")
         gripper.command(0)
         self.goto_name("standby_2a")
