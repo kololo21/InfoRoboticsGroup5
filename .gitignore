@@ -1,0 +1,16 @@
+# catkin workspace artifacts
+build/
+devel/
+logs/
+install/
+.catkin_tools/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode
+
+# Large model checkpoints (>100MB GitHub limit)
+*.pth
