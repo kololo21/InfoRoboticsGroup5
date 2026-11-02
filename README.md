@@ -80,17 +80,17 @@ rviz -d /workspace/src/wrs_algorithm21/config/wrs_visualize.rviz
 ## 物体検出を YOLOv8 にする（担当: いしい）
 
 今の検出器（torchvision の Faster R-CNN）の代わりに YOLOv8 を使えるようにしてある。
-`start_all.sh c`（いしい）は YOLO が標準。それ以外（a・b・統合版）は今までどおり Faster R-CNN。
+統合版（引数なし）と `c` は YOLO が標準。`a`・`b` は今までどおり Faster R-CNN。
 `DETECTOR=yolo` / `DETECTOR=frcnn` で明示的に選べる。YOLO のライブラリか重みがないサーバでは、
 自動で Faster R-CNN に戻る。
 
 ```bash
-/workspace/src/wrs_algorithm21/scripts/start_all.sh c                    # YOLO
-DETECTOR=frcnn /workspace/src/wrs_algorithm21/scripts/start_all.sh c     # c を Faster R-CNN で
+/workspace/src/wrs_algorithm21/scripts/start_all.sh                      # 統合版を YOLO で
+DETECTOR=frcnn /workspace/src/wrs_algorithm21/scripts/start_all.sh       # 統合版を Faster R-CNN で
 DETECTOR=yolo /workspace/src/wrs_algorithm21/scripts/start_all.sh b      # b を YOLO で試す
 ```
 
-`wrs_main_node_c.py` は検出器を見て、YOLO のときは安定化の検出回数を 3→5 回（3回以上見えたら採用）に増やす。
+Task 2 の関数（いしい）は検出器を見て、YOLO のときは安定化の検出回数を 3→5 回（3回以上見えたら採用）に増やす。
 
 ultralytics は Python 3.8 以上が必要なので、ROS noetic 本体の `/usr/bin/python3` と
 `/workspace/.yolo_env`（git 管理外）のライブラリで検出ノードを動かす。

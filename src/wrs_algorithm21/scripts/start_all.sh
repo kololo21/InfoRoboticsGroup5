@@ -2,7 +2,7 @@
 # 使い方: [DETECTOR=yolo] start_all.sh [a|b|c]
 #   引数なし → wrs_main_node.py（統合版）、a/b/c → wrs_main_node_a.py などを実行
 #   DETECTOR=yolo / frcnn → 物体検出器を指定する
-#   省略時: c（いしい）は YOLOv8、それ以外は今までの Faster R-CNN
+#   省略時: 統合版（引数なし）と c は YOLOv8、a・b は今までの Faster R-CNN
 #   YOLO のライブラリ（/workspace/.yolo_env）か重みがなければ Faster R-CNN に戻す
 
 if [ $# -ge 1 ]; then
@@ -14,7 +14,10 @@ else
   NODE="wrs_main_node.py"
 fi
 if [ -z "${DETECTOR:-}" ]; then
-  if [ "${NODE}" = "wrs_main_node_c.py" ]; then DETECTOR=yolo; else DETECTOR=frcnn; fi
+  case "${NODE}" in
+    wrs_main_node.py|wrs_main_node_c.py) DETECTOR=yolo ;;
+    *) DETECTOR=frcnn ;;
+  esac
 fi
 if [ "${DETECTOR}" = "yolo" ]; then
   if [ ! -d /workspace/.yolo_env/ultralytics ] || \
