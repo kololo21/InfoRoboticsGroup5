@@ -1,0 +1,97 @@
+# 知能ロボティクス実験 第5班
+
+HSR シミュレータ上で Task 1（片付け）・Task 2a（障害物回避）・Task 2b（配達）を行うコード。
+ルール・スコア定義・方針の詳細は [docs/rules_and_strategy.md](docs/rules_and_strategy.md) を参照。
+
+## メンバーと担当
+
+| 担当 | 名前 | 範囲 | 主な関数（`wrs_main_node.py`） |
+|---|---|---|---|
+| A: Task 1「取る」 | さくま | 物体検出結果の選別、掴みやすさの採点、把持、探索地点の追加 | `get_most_graspable_obj`, `calc_score_bbox`, `exec_graspable_method`, `grasp_from_*`, `execute_task1` の探索ループ |
+| B: Task 1「置く」＋まとめ | むかい | ラベル→置き場所の対応、置く位置・姿勢、引き出し、`run()`、スコア記録 | `put_in_place`, `pull_out_trofast`, `push_in_trofast`, `run` |
+| C: Task 2a・2b | いしい | 障害物回避経路、指示文の解析、配達 | `execute_task2a`, `execute_avoid_blocks`, `select_next_waypoint`, `execute_task2b`, `extract_target_obj_and_person`, `deliver_to_target` |
+
+モデル・数学の改善は、それを使うタスクの担当が持つ（例: 検出しきい値・掴みやすさの式は A、回避の幾何は C）。
+物体検出モデルの再学習は後回し。第2週時点で余裕があれば独自機能として検討する。
+
+### 担当関数の書き方（提出要件）
+
+担当の判定は docstring で行われる。自分が書いた関数には必ず入れる。
+
+```python
+def select_next_waypoint(self, current_stp, pos_bboxes):
+    """61X11111 氏名
+    説明...
+    """
+```
+
+1つの関数を複数人で書かない。必要なら関数を分割する。
+
+## スコアの目安
+
+```
+Score(seed) = S1 + S2a + S2b
+S1  = Σ 物体ごとに [置き場所に入った 10点 + カテゴリが正しい +10点]
+S2a = 障害物に触れずに次の部屋へ 30点
+S2b = 正しい物体を届ける 30点（誤った物体なら 20点）
+```
+
+| 目標 | 条件 | 期限 |
+|---|---|---|
+| レベル1 | Seed 86 で 120点以上 | 第1週 18:00（Slack 報告） |
+| レベル2 | Seed 25 + Seed 86 の合計 220点以上 | 第2週 18:00（Slack 報告） |
+| レベル3 | 両 Seed 共通のコード、linter 対応、スライド | 第3週 16:00 デモ |
+
+## 実行方法
+
+```bash
+# 【in GPU server】シミュレータ起動（--build は使用禁止）
+cd ~/sim_ws
+docker compose up -d
+
+# Seed の変更（86 または 25）→ シミュレータ再起動
+./change_seed.sh 86
+docker compose restart simulator
+
+# 【in WebIDE】可視化とタスク実行
+rviz -d /workspace/src/wrs_algorithm21/config/wrs_visualize.rviz
+/workspace/src/wrs_algorithm21/scripts/start_all.sh
+```
+
+- シミュレータ画面: `http://<GPUサーバ名>.local:3000`、WebIDE: `http://<GPUサーバ名>.local:3001`
+- 2回目以降は `docker compose restart simulator` で物体を元に戻し、Gazebo の Play を押してから実行
+- GPU サーバは2台。同時にシミュレーションできるのは2人まで
+
+## Linter（提出前に必ず実行）
+
+基準: pycodestyle の警告 10 以下、pylint のスコア 8.5 以上（1行の最大文字数は 100）。
+
+```bash
+cd /workspace
+pycodestyle --max-line-length=100 src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node.py
+pylint --max-line-length=100 --rcfile src/wrs_algorithm21/pylintrc \
+  src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node.py
+```
+
+## Git の運用
+
+- `main` は動くコードだけを置く。作業は各自のブランチで行う
+  - さくま: `feature/task1-grasp` / むかい: `feature/task1-place` / いしい: `feature/task2`
+- 他人の担当関数は書き換えない。変更が必要なら担当者に相談する
+- こまめに `main` を取り込み、動作確認してから `main` へマージする
+- GPU サーバは第3週の後に初期化されるため、**第3週 17:30 までに必ず push** する
+
+## 実行記録
+
+結果のぶれがあるので、変更の良し悪しは 2〜3 回の平均で判断する。記録はむかいがまとめる。
+
+| 日付 | Seed | 変更内容 | Task 1 | Task 2a | Task 2b | 合計 | 失敗した理由 |
+|---|---|---|---|---|---|---|---|
+| | 86 | サンプルそのまま | | | | | |
+
+## 提出物（第3週の次の日曜 18:00、K-LMS、zip 50MB 以下）
+
+1. 表紙（.pdf、K-LMS のテンプレート）
+2. 発表スライド `IR_5班発表スライド.pdf`（代表者のみ）
+3. 自分の担当部分の説明スライド `IR_5班担当説明_氏名.pdf`（各自、2枚以上）
+4. コード（.py）
