@@ -5,11 +5,24 @@ HSR シミュレータ上で Task 1（片付け）・Task 2a（障害物回避�
 
 ## メンバーと担当
 
-| 担当 | 名前 | 範囲 | 主な関数（`wrs_main_node.py`） |
-|---|---|---|---|
-| A: Task 1「取る」 | さくま | 物体検出結果の選別、掴みやすさの採点、把持、探索地点の追加 | `get_most_graspable_obj`, `calc_score_bbox`, `exec_graspable_method`, `grasp_from_*`, `execute_task1` の探索ループ |
-| B: Task 1「置く」＋まとめ | むかい | ラベル→置き場所の対応、置く位置・姿勢、引き出し、`run()`、スコア記録 | `put_in_place`, `pull_out_trofast`, `push_in_trofast`, `run` |
-| C: Task 2a・2b | いしい | 障害物回避経路、指示文の解析、配達 | `execute_task2a`, `execute_avoid_blocks`, `select_next_waypoint`, `execute_task2b`, `extract_target_obj_and_person`, `deliver_to_target` |
+| 担当 | 名前 | 作業ファイル | 範囲 | 主な関数 |
+|---|---|---|---|---|
+| A: Task 1「取る」 | さくま | `wrs_main_node_a.py` | 物体検出結果の選別、掴みやすさの採点、把持、探索地点の追加 | `get_most_graspable_obj`, `calc_score_bbox`, `exec_graspable_method`, `grasp_from_*`, `execute_task1` の探索ループ |
+| B: Task 1「置く」＋まとめ | むかい | `wrs_main_node_b.py` | ラベル→置き場所の対応、置く位置・姿勢、引き出し、`run()`、スコア記録、統合版への取り込み | `put_in_place`, `pull_out_trofast`, `push_in_trofast`, `run` |
+| C: Task 2a・2b | いしい | `wrs_main_node_c.py` | 障害物回避経路、指示文の解析、配達 | `execute_task2a`, `execute_avoid_blocks`, `select_next_waypoint`, `execute_task2b`, `extract_target_obj_and_person`, `deliver_to_target` |
+
+### ファイルの分け方
+
+`src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/` に、同じ中身のファイルが4つある。
+
+| ファイル | 用途 |
+|---|---|
+| `wrs_main_node.py` | 統合版（提出用）。3人の担当関数を取り込んだもの |
+| `wrs_main_node_a.py` / `_b.py` / `_c.py` | A・B・C それぞれの作業用コピー。自分のファイルだけを編集する |
+
+- 自分のファイルの中では、`run()` を自分のタスクだけに書き換えてよい（例: C は `execute_task2a()` と `execute_task2b()` だけ。2b の指示文は 2a で棚の前に行かないと届かないので、2a は外せない）
+- 担当関数ができたら、その関数を統合版 `wrs_main_node.py` に移す。移す作業はむかいがまとめて行う
+- 他人の作業ファイルは編集しない。ファイルが分かれているので、git の競合は起きにくい
 
 モデル・数学の改善は、それを使うタスクの担当が持つ（例: 検出しきい値・掴みやすさの式は A、回避の幾何は C）。
 物体検出モデルの再学習は後回し。第2週時点で余裕があれば独自機能として検討する。
@@ -55,7 +68,8 @@ docker compose restart simulator
 
 # 【in WebIDE】可視化とタスク実行
 rviz -d /workspace/src/wrs_algorithm21/config/wrs_visualize.rviz
-/workspace/src/wrs_algorithm21/scripts/start_all.sh
+/workspace/src/wrs_algorithm21/scripts/start_all.sh      # 統合版 wrs_main_node.py
+/workspace/src/wrs_algorithm21/scripts/start_all.sh a    # wrs_main_node_a.py（b, c も同様）
 ```
 
 - シミュレータ画面: `http://<GPUサーバ名>.local:3000`、WebIDE: `http://<GPUサーバ名>.local:3001`
@@ -75,10 +89,10 @@ pylint --max-line-length=100 --rcfile src/wrs_algorithm21/pylintrc \
 
 ## Git の運用
 
-- `main` は動くコードだけを置く。作業は各自のブランチで行う
-  - さくま: `feature/task1-grasp` / むかい: `feature/task1-place` / いしい: `feature/task2`
+- 各自が編集するのは自分の作業ファイル（`wrs_main_node_a.py` など）だけ。ファイルが分かれているので、同じブランチに push しても競合しにくい
+- 作業前に `git pull`、区切りがついたら commit して push する。2台の GPU サーバ間の同期もこれで行う
+- 統合版 `wrs_main_node.py` と `run()` の変更はむかいが行う
 - 他人の担当関数は書き換えない。変更が必要なら担当者に相談する
-- こまめに `main` を取り込み、動作確認してから `main` へマージする
 - GPU サーバは第3週の後に初期化されるため、**第3週 17:30 までに必ず push** する
 
 ## 実行記録

@@ -1,5 +1,7 @@
 <launch>
-  <node pkg="wrs_algorithm" type="wrs_main_node.py" name="wrs_main" output="screen" required="true">
+  <!-- 実行するファイル: wrs_main_node.py（統合版）/ wrs_main_node_a.py / _b.py / _c.py -->
+  <arg name="node" default="wrs_main_node.py" />
+  <node pkg="wrs_algorithm" type="$(arg node)" name="wrs_main" output="screen" required="true">
     <param name="test_mode" value="false" />
   </node>
 </launch>
