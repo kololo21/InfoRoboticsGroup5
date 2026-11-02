@@ -35,6 +35,9 @@ class WrsMainController(object):
     TROFAST_Y_OFFSET = 0.2
 
     def __init__(self):
+        """サンプルのまま（担当なし）
+        変数・設定ファイル・ROS通信を初期化する
+        """
         # 変数の初期化
         self.instruction_list = []
         self.detection_list   = []
@@ -60,7 +63,7 @@ class WrsMainController(object):
 
     @staticmethod
     def get_path(pathes, package="wrs_algorithm"):
-        """
+        """サンプルのまま（担当なし）
         ROSパッケージ名とファイルまでのパスを指定して、ファイルのパスを取得する
         """
         if not pathes:  # check if the list is empty
@@ -72,28 +75,28 @@ class WrsMainController(object):
 
     @staticmethod
     def load_json(path):
-        """
+        """サンプルのまま（担当なし）
         jsonファイルを辞書型で読み込む
         """
         with open(path, "r") as json_file:
             return json.load(json_file)
 
     def instruction_cb(self, msg):
-        """
+        """サンプルのまま（担当なし）
         指示文を受信する
         """
         rospy.loginfo("instruction received. [%s]", msg.data)
         self.instruction_list.append(msg.data)
 
     def detection_cb(self, msg):
-        """
+        """サンプルのまま（担当なし）
         検出結果を受信する
         """
         rospy.loginfo("received [Collision detected with %s]", msg.data)
         self.detection_list.append(msg.data)
 
     def get_relative_coordinate(self, parent, child):
-        """
+        """サンプルのまま（担当なし）
         tfで相対座標を取得する
         """
         try:
@@ -108,7 +111,7 @@ class WrsMainController(object):
             return None
 
     def goto_name(self, name):
-        """
+        """サンプルのまま（担当なし）
         waypoint名で指定された場所に移動する
         """
         if name in self.coordinates["positions"].keys():
@@ -120,14 +123,14 @@ class WrsMainController(object):
         return False
 
     def goto_pos(self, pos):
-        """
+        """サンプルのまま（担当なし）
         waypoint名で指定された場所に移動する
         """
         rospy.loginfo("go to [raw_pos](%.2f, %.2f, %.2f)", pos[0], pos[1], pos[2])
         return omni_base.go_abs(pos[0], pos[1], pos[2])
 
     def change_pose(self, name):
-        """
+        """サンプルのまま（担当なし）
         指定された姿勢名に遷移する
         """
         if name in self.poses.keys():
@@ -138,7 +141,7 @@ class WrsMainController(object):
         return False
 
     def check_positions(self):
-        """
+        """サンプルのまま（担当なし）
         読み込んだ座標ファイルの座標を巡回する
         """
         whole_body.move_to_go()
@@ -147,14 +150,14 @@ class WrsMainController(object):
             rospy.sleep(1)
 
     def get_latest_detection(self):
-        """
+        """サンプルのまま（担当なし）
         最新の認識結果が到着するまで待つ
         """
         res = self.detection_clt(GetObjectDetectionRequest())
         return res.bboxes
 
     def get_grasp_coordinate(self, bbox):
-        """
+        """61XXXXXX さくま
         BBox情報から把持座標を取得する
         """
         # BBox情報からtfを生成して、座標を取得
@@ -164,7 +167,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_bbox(cls, obj_list):
-        """
+        """61XXXXXX さくま
         最も把持が行えそうなbboxを一つ返す。
         """
         # objが一つもない場合は、Noneを返す
@@ -174,7 +177,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_obj(cls, obj_list):
-        """
+        """61XXXXXX さくま
         把持すべきscoreが最も高い物体を返す。
         """
         extracted = []
@@ -203,7 +206,7 @@ class WrsMainController(object):
 
     @classmethod
     def calc_score_bbox(cls, bbox):
-        """
+        """61XXXXXX さくま
         detector_msgs/BBoxのスコアを計算する
         """
         gravity_x = bbox.x + bbox.w / 2
@@ -214,7 +217,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_bboxes_by_label(cls, obj_list, label):
-        """
+        """61XXXXXX さくま
         label名が一致するオブジェクトの中から最も把持すべき物体のbboxを返す
         """
         match_objs = [obj for obj in obj_list if obj.label in label]
@@ -225,7 +228,7 @@ class WrsMainController(object):
 
     @staticmethod
     def extract_target_obj_and_person(instruction):
-        """
+        """62401738 いしい
         指示文から対象となる物体名称を抽出する
         """
         #TODO: 関数は未完成です。引数のinstructionを利用すること
@@ -236,7 +239,7 @@ class WrsMainController(object):
         return target_obj, target_person
 
     def grasp_from_side(self, pos_x, pos_y, pos_z, yaw, pitch, roll, preliminary="-y"):
-        """
+        """61XXXXXX さくま
         把持の一連の動作を行う
 
         NOTE: tall_tableに対しての予備動作を生成するときはpreliminary="-y"と設定することになる。
@@ -270,7 +273,7 @@ class WrsMainController(object):
         whole_body.move_end_effector_pose(grasp_back_safe["x"], grasp_back_safe["y"], grasp_back_safe["z"], yaw, pitch, roll)
 
     def grasp_from_front_side(self, grasp_pos):
-        """
+        """61XXXXXX さくま
         正面把持を行う
         ややアームを下に向けている
         """
@@ -279,7 +282,7 @@ class WrsMainController(object):
         self.grasp_from_side(grasp_pos.x, grasp_pos.y, grasp_pos.z, -90, -100, 0, "-y")
 
     def grasp_from_upper_side(self, grasp_pos):
-        """
+        """61XXXXXX さくま
         上面から把持を行う
         オブジェクトに寄るときは、y軸から近づく上面からは近づかない
         """
@@ -288,7 +291,7 @@ class WrsMainController(object):
         self.grasp_from_side(grasp_pos.x, grasp_pos.y, grasp_pos.z, -90, -160, 0, "-y")
 
     def exec_graspable_method(self, grasp_pos, label=""):
-        """
+        """61XXXXXX さくま
         task1専用:posの位置によって把持方法を判定し実行する。
         """
         method = None
@@ -314,6 +317,9 @@ class WrsMainController(object):
         return True
 
     def put_in_place(self, place, into_pose):
+        """61XXXXXX むかい
+        指定場所に入れ、all_neutral姿勢を取る
+        """
         # 指定場所に入れ、all_neutral姿勢を取る。
         self.change_pose("look_at_near_floor")
         a = "go_palce" # TODO 不要な変数
@@ -325,6 +331,9 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def pull_out_trofast(self, x, y, z, yaw, pitch, roll):
+        """61XXXXXX むかい
+        trofastの引き出しを引き出す
+        """
         # trofastの引き出しを引き出す
         self.goto_name("stair_like_drawer")
         self.change_pose("grasp_on_table")
@@ -338,7 +347,7 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def push_in_trofast(self, pos_x, pos_y, pos_z, yaw, pitch, roll):
-        """
+        """61XXXXXX むかい
         trofastの引き出しを戻す
         NOTE:サンプル
             self.push_in_trofast(0.178, -0.29, 0.75, -90, 100, 0)
@@ -356,7 +365,7 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def deliver_to_target(self, target_obj, target_person):
-        """
+        """62401738 いしい
         棚で取得したものを人に渡す。
         """
         self.change_pose("look_at_near_floor")
@@ -386,6 +395,9 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def execute_avoid_blocks(self):
+        """62401738 いしい
+        execute_avoid_blocks
+        """
         # blockを避ける
         for i in range(3):
             detected_objs = self.get_latest_detection()
@@ -397,7 +409,7 @@ class WrsMainController(object):
             self.goto_pos(waypoint)
 
     def select_next_waypoint(self, current_stp, pos_bboxes):
-        """
+        """62401738 いしい
         waypoints から近い場所にあるものを除外し、最適なwaypointを返す。
         x座標を原点に近い方からxa,xb,xcに定義する。bboxを判断基準として移動先を決定する(デフォルトは0.45間隔)
         pos_bboxesは get_grasp_coordinate() 済みであること
@@ -454,7 +466,7 @@ class WrsMainController(object):
         return x_line[current_stp]
 
     def execute_task1(self):
-        """
+        """61XXXXXX さくま
         task1を実行する
         """
         rospy.loginfo("#### start Task 1 ####")
@@ -496,7 +508,7 @@ class WrsMainController(object):
                 total_cnt += 1
 
     def execute_task2a(self):
-        """
+        """62401738 いしい
         task2aを実行する
         """
         rospy.loginfo("#### start Task 2a ####")
@@ -512,7 +524,7 @@ class WrsMainController(object):
         whole_body.move_to_go()
 
     def execute_task2b(self):
-        """
+        """62401738 いしい
         task2bを実行する
         """
         rospy.loginfo("#### start Task 2b ####")
@@ -532,7 +544,7 @@ class WrsMainController(object):
         if target_obj and target_person:            self.deliver_to_target(target_obj, target_person)
 
     def run(self):
-        """
+        """61XXXXXX むかい
         全てのタスクを実行する
         """
         self.change_pose("all_neutral")

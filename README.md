@@ -75,6 +75,64 @@ rviz -d /workspace/src/wrs_algorithm21/config/wrs_visualize.rviz
 - シミュレータ画面: `http://<GPUサーバ名>.local:3000`、WebIDE: `http://<GPUサーバ名>.local:3001`
 - 2回目以降は `docker compose restart simulator` で物体を元に戻し、Gazebo の Play を押してから実行
 - GPU サーバは2台。同時にシミュレーションできるのは2人まで
+- ビルド（`devel/` がないとき、`src/` の構成を変えたとき）: `cd /workspace && catkin build`
+
+## 物体検出を YOLOv8 にする（担当: いしい）
+
+今の検出器（torchvision の Faster R-CNN）の代わりに YOLOv8 を使えるようにしてある。
+`DETECTOR=yolo` を付けたときだけ YOLO が動き、付けなければ今までどおり Faster R-CNN。
+
+```bash
+DETECTOR=yolo /workspace/src/wrs_algorithm21/scripts/start_all.sh c
+```
+
+ultralytics は Python 3.8 以上が必要なので、ROS noetic 本体の `/usr/bin/python3` と
+`/workspace/.yolo_env`（git 管理外）のライブラリで検出ノードを動かす。
+
+| ファイル | 内容 |
+|---|---|
+| `src/wrs_detector/scripts/wrs_detector/yolo_detector.py` | YOLO で検出するクラス（入出力は Faster R-CNN と同じ） |
+| `src/wrs_detector/launch/yolo.launch` | YOLO 版の検出ノード（トピック・サービス名は同じ） |
+| `tools/yolo/convert_to_yolo.py` | 授業のデータセット（COCO / VOC）を YOLO 形式に変換 |
+| `tools/yolo/train_yolo.sh` | 学習して `checkpoints/yolo_wrs.pt` に置く |
+
+### 準備（サーバごとに1回）
+
+```bash
+# 1. ライブラリ（約3GB、/workspace に入るのでコンテナを作り直しても残る）
+/usr/bin/python3 -m pip install --target /workspace/.yolo_env \
+  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  "torch==2.4.1+cu118" "torchvision==0.19.1+cu118" "ultralytics==8.3.40" "numpy<2"
+
+# 2. データセット: 実験手順書の「独自データセット」（慶應アカウントの Google Drive）を
+#    ダウンロードし、WebIDE にドラッグして /workspace/datasets/raw に置く
+/usr/bin/python3 tools/yolo/convert_to_yolo.py /workspace/datasets/raw --out /workspace/datasets/wrs_yolo
+
+# 3. 学習（GPU をシミュレータと取り合うので、誰もシミュレーションしていない時間に）
+tools/yolo/train_yolo.sh yolov8s.pt 100 16
+```
+
+学習済みの重み `src/wrs_detector/checkpoints/yolo_wrs.pt`（22.5MB）は git に入れてあるので、
+`git pull` すれば手に入る。もう1台のサーバで使うときは、上の 1. のライブラリだけ入れればよい（学習はしなくてよい）。
+
+### 学習結果（2026-11-02、YOLOv8s、640px、100エポック中ベストは18エポック目）
+
+データ: 授業の `hsr_sim_obj_1000`（labelme 形式、1017枚・5791個）。
+検証用には seed6・8・15 の150枚を丸ごと使った（同じ部屋の配置の画像を学習に入れないため）。
+
+| 指標 | 値 |
+|---|---|
+| mAP50 | 0.802 |
+| mAP50-95 | 0.730 |
+| 適合率 / 再現率 | 0.88 / 0.73 |
+| 推論時間 | 約3ms / 枚（RTX 3090） |
+
+- よく当たる: `cup` 0.98、`mug` 0.96、`plate` 0.95、果物・箱・缶はほぼ 0.99
+- 弱い: `fork` 0.14、`spoon` 0.61（Container B 行き）、`lego_duplo` 0.73（IGNORE_LIST 対象）
+- 学習データにない・少ないクラスは検出できない: `wine_glass`, `pitcher_lid`, `chain`, `rope`, `timer`,
+  `magazine`, `black_t_shirt`, `bolt_and_nut`, `credit_card_blank`（0個）、`golf_ball`（1個）
+- 今の Faster R-CNN は同じデータで学習されていて検証用の画像も学習に入っている可能性があるため、
+  mAP の数字どうしでは比べられない。比較はシミュレータ上で行う（16:00 の統合時）
 
 ## Linter（提出前に必ず実行）
 

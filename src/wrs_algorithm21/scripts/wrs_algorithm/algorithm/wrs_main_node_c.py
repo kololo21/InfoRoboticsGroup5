@@ -19,6 +19,8 @@ from detector_msgs.srv import (
     GetObjectDetection, GetObjectDetectionRequest)
 from wrs_algorithm.util import omni_base, whole_body, gripper
 import math
+import copy
+import heapq
 
 
 class WrsMainController(object):
@@ -35,6 +37,9 @@ class WrsMainController(object):
     TROFAST_Y_OFFSET = 0.2
 
     def __init__(self):
+        """サンプルのまま（担当なし）
+        変数・設定ファイル・ROS通信を初期化する
+        """
         # 変数の初期化
         self.instruction_list = []
         self.detection_list   = []
@@ -60,7 +65,7 @@ class WrsMainController(object):
 
     @staticmethod
     def get_path(pathes, package="wrs_algorithm"):
-        """
+        """サンプルのまま（担当なし）
         ROSパッケージ名とファイルまでのパスを指定して、ファイルのパスを取得する
         """
         if not pathes:  # check if the list is empty
@@ -72,28 +77,28 @@ class WrsMainController(object):
 
     @staticmethod
     def load_json(path):
-        """
+        """サンプルのまま（担当なし）
         jsonファイルを辞書型で読み込む
         """
         with open(path, "r") as json_file:
             return json.load(json_file)
 
     def instruction_cb(self, msg):
-        """
+        """サンプルのまま（担当なし）
         指示文を受信する
         """
         rospy.loginfo("instruction received. [%s]", msg.data)
         self.instruction_list.append(msg.data)
 
     def detection_cb(self, msg):
-        """
+        """サンプルのまま（担当なし）
         検出結果を受信する
         """
         rospy.loginfo("received [Collision detected with %s]", msg.data)
         self.detection_list.append(msg.data)
 
     def get_relative_coordinate(self, parent, child):
-        """
+        """サンプルのまま（担当なし）
         tfで相対座標を取得する
         """
         try:
@@ -108,7 +113,7 @@ class WrsMainController(object):
             return None
 
     def goto_name(self, name):
-        """
+        """サンプルのまま（担当なし）
         waypoint名で指定された場所に移動する
         """
         if name in self.coordinates["positions"].keys():
@@ -120,14 +125,14 @@ class WrsMainController(object):
         return False
 
     def goto_pos(self, pos):
-        """
+        """サンプルのまま（担当なし）
         waypoint名で指定された場所に移動する
         """
         rospy.loginfo("go to [raw_pos](%.2f, %.2f, %.2f)", pos[0], pos[1], pos[2])
         return omni_base.go_abs(pos[0], pos[1], pos[2])
 
     def change_pose(self, name):
-        """
+        """サンプルのまま（担当なし）
         指定された姿勢名に遷移する
         """
         if name in self.poses.keys():
@@ -138,7 +143,7 @@ class WrsMainController(object):
         return False
 
     def check_positions(self):
-        """
+        """サンプルのまま（担当なし）
         読み込んだ座標ファイルの座標を巡回する
         """
         whole_body.move_to_go()
@@ -147,14 +152,14 @@ class WrsMainController(object):
             rospy.sleep(1)
 
     def get_latest_detection(self):
-        """
+        """サンプルのまま（担当なし）
         最新の認識結果が到着するまで待つ
         """
         res = self.detection_clt(GetObjectDetectionRequest())
         return res.bboxes
 
     def get_grasp_coordinate(self, bbox):
-        """
+        """61XXXXXX さくま
         BBox情報から把持座標を取得する
         """
         # BBox情報からtfを生成して、座標を取得
@@ -164,7 +169,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_bbox(cls, obj_list):
-        """
+        """61XXXXXX さくま
         最も把持が行えそうなbboxを一つ返す。
         """
         # objが一つもない場合は、Noneを返す
@@ -174,7 +179,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_obj(cls, obj_list):
-        """
+        """61XXXXXX さくま
         把持すべきscoreが最も高い物体を返す。
         """
         extracted = []
@@ -203,7 +208,7 @@ class WrsMainController(object):
 
     @classmethod
     def calc_score_bbox(cls, bbox):
-        """
+        """61XXXXXX さくま
         detector_msgs/BBoxのスコアを計算する
         """
         gravity_x = bbox.x + bbox.w / 2
@@ -214,7 +219,7 @@ class WrsMainController(object):
 
     @classmethod
     def get_most_graspable_bboxes_by_label(cls, obj_list, label):
-        """
+        """61XXXXXX さくま
         label名が一致するオブジェクトの中から最も把持すべき物体のbboxを返す
         """
         match_objs = [obj for obj in obj_list if obj.label in label]
@@ -223,20 +228,8 @@ class WrsMainController(object):
             return None
         return cls.get_most_graspable_bbox(match_objs)
 
-    @staticmethod
-    def extract_target_obj_and_person(instruction):
-        """
-        指示文から対象となる物体名称を抽出する
-        """
-        #TODO: 関数は未完成です。引数のinstructionを利用すること
-        rospy.loginfo("[extract_target_obj_and_person] instruction:"+  instruction)
-        target_obj    = "apple"
-        target_person = "right"
-
-        return target_obj, target_person
-
     def grasp_from_side(self, pos_x, pos_y, pos_z, yaw, pitch, roll, preliminary="-y"):
-        """
+        """61XXXXXX さくま
         把持の一連の動作を行う
 
         NOTE: tall_tableに対しての予備動作を生成するときはpreliminary="-y"と設定することになる。
@@ -270,7 +263,7 @@ class WrsMainController(object):
         whole_body.move_end_effector_pose(grasp_back_safe["x"], grasp_back_safe["y"], grasp_back_safe["z"], yaw, pitch, roll)
 
     def grasp_from_front_side(self, grasp_pos):
-        """
+        """61XXXXXX さくま
         正面把持を行う
         ややアームを下に向けている
         """
@@ -279,7 +272,7 @@ class WrsMainController(object):
         self.grasp_from_side(grasp_pos.x, grasp_pos.y, grasp_pos.z, -90, -100, 0, "-y")
 
     def grasp_from_upper_side(self, grasp_pos):
-        """
+        """61XXXXXX さくま
         上面から把持を行う
         オブジェクトに寄るときは、y軸から近づく上面からは近づかない
         """
@@ -288,7 +281,7 @@ class WrsMainController(object):
         self.grasp_from_side(grasp_pos.x, grasp_pos.y, grasp_pos.z, -90, -160, 0, "-y")
 
     def exec_graspable_method(self, grasp_pos, label=""):
-        """
+        """61XXXXXX さくま
         task1専用:posの位置によって把持方法を判定し実行する。
         """
         method = None
@@ -314,6 +307,9 @@ class WrsMainController(object):
         return True
 
     def put_in_place(self, place, into_pose):
+        """61XXXXXX むかい
+        指定場所に入れ、all_neutral姿勢を取る
+        """
         # 指定場所に入れ、all_neutral姿勢を取る。
         self.change_pose("look_at_near_floor")
         a = "go_palce" # TODO 不要な変数
@@ -325,6 +321,9 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def pull_out_trofast(self, x, y, z, yaw, pitch, roll):
+        """61XXXXXX むかい
+        trofastの引き出しを引き出す
+        """
         # trofastの引き出しを引き出す
         self.goto_name("stair_like_drawer")
         self.change_pose("grasp_on_table")
@@ -338,7 +337,7 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def push_in_trofast(self, pos_x, pos_y, pos_z, yaw, pitch, roll):
-        """
+        """61XXXXXX むかい
         trofastの引き出しを戻す
         NOTE:サンプル
             self.push_in_trofast(0.178, -0.29, 0.75, -90, 100, 0)
@@ -355,106 +354,490 @@ class WrsMainController(object):
 
         self.change_pose("all_neutral")
 
-    def deliver_to_target(self, target_obj, target_person):
+    # ------------------------------------------------------------------
+    # Task 2a / 2b（担当 C）
+    # ------------------------------------------------------------------
+    TASK2A_LANES_X = [1.7, 2.15, 2.6]   # 通過するレーンの x 座標（サンプルの xa, xb, xc）
+    TASK2A_STEPS_Y = [2.5, 2.9, 3.3]    # 各ステップで進む y 座標
+    TASK2A_START = (2.5, 1.85)          # standby_2a の座標
+    TASK2A_YAW = 90                     # 進行方向（+y）を向いたまま移動し、カメラで前方を見る
+    TASK2A_AREA = {"x": (1.2, 3.2), "y": (1.9, 3.9), "z_max": 0.3}  # 床の障害物とみなす範囲
+    TASK2A_SAFE_DIST = 0.35   # ロボット中心の経路と障害物中心の最小距離 [m]（HSR 半径約0.22 + 物体）
+    TASK2A_MERGE_DIST = 0.15  # これより近い検出は同じ障害物とみなす [m]
+    TASK2B_WAIT_SEC = 10.0    # 棚の前で指示文を待つ最大時間 [s]
+    TASK2B_DETECT_RETRY = 3   # 対象物体が見つからないときに検出をやり直す回数
+
+    # A* による経路計画（Task 2a）
+    TASK2A_GOAL = (2.0, 3.5)          # go_throw_2a の座標
+    TASK2A_PLAN_X = (1.55, 2.75)      # 経路を探す範囲 x [m]（サンプルのレーン 1.7〜2.6 の少し外まで）
+    TASK2A_PLAN_Y = (1.8, 3.6)        # 経路を探す範囲 y [m]
+    TASK2A_GRID = 0.05                # 格子の大きさ [m]
+    TASK2A_SOFT_DIST = 0.6            # 障害物にこれより近い格子はコストを上乗せする [m]
+    TASK2A_CLEAR_WEIGHT = 2.0         # 上乗せの重み
+    TASK2A_STEP_MAX = 0.5             # 1回に進む最大距離 [m]（進むたびに検出し直す）
+    TASK2A_MAX_MOVES = 10             # 移動回数の上限
+
+    # 検出結果の安定化（複数フレームの多数決）
+    DETECT_FRAMES = 3     # 何回検出するか
+    DETECT_MIN_HITS = 2   # 何回以上見えたものを採用するか
+    DETECT_IOU = 0.5      # 同じ物体とみなす BBox の重なり（IoU）
+
+    # 指示文の人物 → 配達先 waypoint
+    # 人物の正面から見て左が person_a（y=2.8）、右が person_b（y=3.9）と仮定。
+    # 実際の指示文で確認すること（README の実行記録に書く）
+    PERSON_WAYPOINTS = {
+        "left": "person_a", "right": "person_b",
+        "a": "person_a", "b": "person_b",
+    }
+    DEFAULT_PERSON = "right"
+
+    # 検出ラベル（wrs_detector/config/wod-c_classes.json）
+    DETECTOR_LABELS = [
+        "cracker_box", "sugar_box", "pudding_box", "gelatin_box", "potted_meat_can",
+        "master_chef_can", "tuna_fish_can", "chips_can", "mustard_bottle", "tomato_soup_can",
+        "banana", "strawberry", "apple", "lemon", "peach", "pear", "orange", "plum",
+        "windex_bottle", "bleach_cleanser", "sponge", "pitcher_base", "pitcher_lid", "plate",
+        "bowl", "fork", "spoon", "spatula", "wine_glass", "mug", "large_marker", "small_marker",
+        "padlock", "bolt_and_nut", "clamp", "credit_card_blank", "mini_soccer_ball", "softball",
+        "baseball", "tennis_ball", "racquetball", "golf_ball", "marble", "cup", "foam_brick",
+        "dice", "rope", "chain", "rubiks_cube", "colored_wood_block", "nine_hole_peg_test",
+        "toy_airplane", "lego_duplo", "magazine", "black_t_shirt", "timer",
+    ]
+    # ラベル名以外の言い方（指示文で使われそうなもの）
+    LABEL_ALIASES = {
+        "cheez it": "cracker_box", "cracker": "cracker_box", "crackers": "cracker_box",
+        "sugar": "sugar_box", "pudding": "pudding_box", "jello": "gelatin_box",
+        "gelatin": "gelatin_box", "spam": "potted_meat_can", "potted meat": "potted_meat_can",
+        "coffee can": "master_chef_can", "master chef": "master_chef_can",
+        "tuna": "tuna_fish_can", "tuna can": "tuna_fish_can", "pringles": "chips_can",
+        "chips": "chips_can", "mustard": "mustard_bottle", "tomato soup": "tomato_soup_can",
+        "soup can": "tomato_soup_can", "windex": "windex_bottle",
+        "spray bottle": "windex_bottle", "cleanser": "bleach_cleanser",
+        "bleach": "bleach_cleanser", "pitcher": "pitcher_base", "wine glass": "wine_glass",
+        "marker": "large_marker", "keys": "padlock", "key": "padlock",
+        "bolt": "bolt_and_nut", "nut": "bolt_and_nut", "credit card": "credit_card_blank",
+        "soccer ball": "mini_soccer_ball", "soft ball": "softball", "marbles": "marble",
+        "cups": "cup", "clamps": "clamp", "rubik s cube": "rubiks_cube",
+        "rubiks cube": "rubiks_cube", "rubik cube": "rubiks_cube",
+        "wood block": "colored_wood_block", "wooden block": "colored_wood_block",
+        "peg test": "nine_hole_peg_test", "9 peg hole test": "nine_hole_peg_test",
+        "airplane": "toy_airplane", "lego": "lego_duplo", "t shirt": "black_t_shirt",
+        "tshirt": "black_t_shirt",
+    }
+
+    @staticmethod
+    def normalize_text(text):
+        """62401738 いしい
+        文字列を小文字・英数字と空白だけにする（"Tuna_Fish-Can." → "tuna fish can"）
         """
-        棚で取得したものを人に渡す。
+        text = text.lower()
+        text = "".join([c if c.isalnum() else " " for c in text])
+        return " ".join(text.split())
+
+    @classmethod
+    def extract_target_obj_and_person(cls, instruction):
+        """62401738 いしい
+        指示文から対象の物体ラベルと人物（"left" / "right" / "a" / "b"）を取り出す。
+        見つからない場合はそれぞれ None を返す。
+        """
+        rospy.loginfo("[extract_target_obj_and_person] instruction: %s", instruction)
+        words = " " + cls.normalize_text(instruction) + " "
+
+        # 物体: ラベル名と別名のうち、指示文に含まれる最も長いものを採用する
+        candidates = [(cls.normalize_text(label), label) for label in cls.DETECTOR_LABELS]
+        candidates += list(cls.LABEL_ALIASES.items())
+        target_obj = None
+        best_len = 0
+        for phrase, label in candidates:
+            for form in (phrase, phrase + "s", phrase + "es"):
+                if " " + form + " " in words and len(phrase) > best_len:
+                    target_obj = label
+                    best_len = len(phrase)
+
+        # 人物: left / right / person a / person b
+        target_person = None
+        if " left " in words:
+            target_person = "left"
+        elif " right " in words:
+            target_person = "right"
+        else:
+            for key in ("a", "b"):
+                if " person " + key + " " in words:
+                    target_person = key
+
+        rospy.loginfo("[extract_target_obj_and_person] target_obj=%s target_person=%s",
+                      target_obj, target_person)
+        return target_obj, target_person
+
+    def wait_for_instruction(self, timeout):
+        """62401738 いしい
+        指示文が届くまで最大 timeout 秒待ち、最新の指示文を返す。届かなければ None。
+        """
+        end_time = rospy.Time.now() + rospy.Duration(timeout)
+        while not self.instruction_list and rospy.Time.now() < end_time:
+            rospy.sleep(0.5)
+        if not self.instruction_list:
+            return None
+        return self.instruction_list[-1]
+
+    def get_bbox_position(self, bbox):
+        """62401738 いしい
+        BBox の map 座標を返す。tf が取れなければ None（get_grasp_coordinate の None 対応版）
+        """
+        self.tf_from_bbox_clt.call(SetTransformFromBBoxRequest(bbox=bbox, frame=self.GRASP_TF_NAME))
+        rospy.sleep(1.0)  # tfが安定するのを待つ
+        trans = self.get_relative_coordinate("map", self.GRASP_TF_NAME)
+        if trans is None:
+            return None
+        return trans.translation
+
+    def deliver_to_target(self, target_obj, target_person):
+        """62401738 いしい
+        棚で target_obj を取り、target_person に渡す。
+        target_obj が見つからなければ、棚で見えている物体を代わりに渡す（誤った物体でも20点）。
         """
         self.change_pose("look_at_near_floor")
         self.goto_name("shelf")
         self.change_pose("look_at_shelf")
+        rospy.loginfo("target_obj: %s  target_person: %s", target_obj, target_person)
 
-        rospy.loginfo("target_obj: " + target_obj + "  target_person: " + target_person)
-        # 物体検出結果から、把持するbboxを決定
-        detected_objs = self.get_latest_detection()
-        grasp_bbox = self.get_most_graspable_bboxes_by_label(detected_objs.bboxes, target_obj)
+        # 物体検出結果（複数フレームの多数決）から、把持するbboxを決定（見つからなければやり直す）
+        grasp_bbox = None
+        bboxes = []
+        for _ in range(self.TASK2B_DETECT_RETRY):
+            bboxes = self.get_stable_detection()
+            matches = [bbox for bbox in bboxes if bbox.label == target_obj]
+            if matches:
+                grasp_bbox = max(matches, key=lambda bbox: bbox.score)
+                break
+            rospy.sleep(1.0)
+
         if grasp_bbox is None:
-            rospy.logwarn("Cannot find object to grasp. task2b is aborted.")
+            rospy.logwarn("Cannot find [%s]. deliver another object instead.", target_obj)
+            if bboxes:
+                grasp_bbox = max(bboxes, key=lambda bbox: bbox.score)
+        if grasp_bbox is None:
+            rospy.logwarn("Cannot find any object on the shelf. task2b is aborted.")
             return
+        rospy.loginfo("grasp [%s] (%.2f)", grasp_bbox.label, grasp_bbox.score)
 
         # BBoxの3次元座標を取得して、その座標で把持する
-        grasp_pos = self.get_grasp_coordinate(grasp_bbox)
+        grasp_pos = self.get_bbox_position(grasp_bbox)
+        if grasp_pos is None:
+            rospy.logwarn("Cannot get the position of the object. task2b is aborted.")
+            return
         self.change_pose("grasp_on_shelf")
         self.grasp_from_front_side(grasp_pos)
         self.change_pose("all_neutral")
 
         # target_personの前に持っていく
+        if target_person not in self.PERSON_WAYPOINTS:
+            rospy.logwarn("unknown person [%s]. use default [%s].", target_person,
+                          self.DEFAULT_PERSON)
+            target_person = self.DEFAULT_PERSON
         self.change_pose("look_at_near_floor")
-        self.goto_name("person_b")    # TODO: 配達先が固定されているので修正
+        self.goto_name(self.PERSON_WAYPOINTS[target_person])
         self.change_pose("deliver_to_human")
         rospy.sleep(10.0)
         gripper.command(1)
         self.change_pose("all_neutral")
 
-    def execute_avoid_blocks(self):
-        # blockを避ける
-        for i in range(3):
-            detected_objs = self.get_latest_detection()
-            bboxes = detected_objs.bboxes
-            pos_bboxes = [self.get_grasp_coordinate(bbox) for bbox in bboxes]
-            waypoint = self.select_next_waypoint(i, pos_bboxes)
-            # TODO メッセージを確認するためコメントアウトを外す
-            # rospy.loginfo(waypoint)
-            self.goto_pos(waypoint)
-
-    def select_next_waypoint(self, current_stp, pos_bboxes):
+    @classmethod
+    def is_task2a_obstacle(cls, pos):
+        """62401738 いしい
+        検出した物体が Task 2a の床の障害物か（範囲内・床の高さ）を判定する
         """
-        waypoints から近い場所にあるものを除外し、最適なwaypointを返す。
-        x座標を原点に近い方からxa,xb,xcに定義する。bboxを判断基準として移動先を決定する(デフォルトは0.45間隔)
-        pos_bboxesは get_grasp_coordinate() 済みであること
+        area = cls.TASK2A_AREA
+        return (area["x"][0] <= pos.x <= area["x"][1]
+                and area["y"][0] <= pos.y <= area["y"][1]
+                and pos.z <= area["z_max"])
+
+    @classmethod
+    def add_obstacle(cls, obstacles, new_xy):
+        """62401738 いしい
+        障害物リストに追加する。既にある障害物の近くなら、位置を平均して1つにまとめる。
         """
-        interval = 0.45
-        pos_xa = 1.7
-        pos_xb = pos_xa + interval
-        pos_xc = pos_xb + interval
+        for i, (obs_x, obs_y) in enumerate(obstacles):
+            if math.hypot(obs_x - new_xy[0], obs_y - new_xy[1]) < cls.TASK2A_MERGE_DIST:
+                obstacles[i] = ((obs_x + new_xy[0]) / 2, (obs_y + new_xy[1]) / 2)
+                return
+        obstacles.append(new_xy)
 
-        # xa配列はcurrent_stpに関係している
-        waypoints = {"xa": [ [pos_xa, 2.5, 45],[pos_xa, 2.9, 45],[pos_xa, 3.3, 90] ], "xb": [ [pos_xb, 2.5, 90], [pos_xb, 2.9, 90], [pos_xb, 3.3, 90] ],
-            "xc": [ [pos_xc, 2.5, 135],   [pos_xc, 2.9, 135],  [pos_xc, 3.3, 90 ]]
-        }
-
-        # posがxa,xb,xcのラインに近い場合は候補から削除
-        is_to_xa = True
-        is_to_xb = True
-        is_to_xc = True
-        for bbox in pos_bboxes:
-            pos_x = bbox.x
-            # TODO デバッグ時にコメントアウトを外す
-            # rospy.loginfo("detected object obj.x = {:.2f}".format(bbox.x))
-
-            # NOTE Hint:ｙ座標次第で無視してよいオブジェクトもある。
-            if pos_x < pos_xa + (interval/2):
-                is_to_xa = False
-                # rospy.loginfo("is_to_xa=False")
-                continue
-            elif pos_x < pos_xb + (interval/2):
-                is_to_xb = False
-                # rospy.loginfo("is_to_xb=False")
-                continue
-            elif pos_x < pos_xc + (interval/2):
-                is_to_xc = False
-                # rospy.loginfo("is_to_xc=False")
-                continue
-
-        x_line = None   # xa,xb,xcいずれかのリストが入る
-        # NOTE 優先的にxcに移動する
-        if is_to_xc:
-            x_line = waypoints["xc"]
-            rospy.loginfo("select next waypoint_xc")
-        elif is_to_xb:
-            x_line = waypoints["xb"]
-            rospy.loginfo("select next waypoint_xb")
-        elif is_to_xa:
-            x_line = waypoints["xa"]
-            rospy.loginfo("select next waypoint_xa")
+    @staticmethod
+    def dist_point_to_segment(point, seg_start, seg_end):
+        """62401738 いしい
+        点 point と線分 seg_start-seg_end の距離を返す（座標はすべて (x, y)）
+        """
+        seg_x = seg_end[0] - seg_start[0]
+        seg_y = seg_end[1] - seg_start[1]
+        seg_len2 = seg_x ** 2 + seg_y ** 2
+        if seg_len2 == 0:
+            ratio = 0.0
         else:
-            # a,b,cいずれにも移動できない場合
-            x_line = waypoints["xb"]
-            rospy.loginfo("select default waypoint")
+            dot = (point[0] - seg_start[0]) * seg_x + (point[1] - seg_start[1]) * seg_y
+            ratio = dot / seg_len2
+            ratio = max(0.0, min(1.0, ratio))
+        near_x = seg_start[0] + ratio * seg_x
+        near_y = seg_start[1] + ratio * seg_y
+        return math.hypot(point[0] - near_x, point[1] - near_y)
 
-        return x_line[current_stp]
+    @staticmethod
+    def bbox_iou(box_a, box_b):
+        """62401738 いしい
+        2つの BBox の IoU（重なった面積 / 合わせた面積）を返す
+        """
+        inter_w = min(box_a.x + box_a.w, box_b.x + box_b.w) - max(box_a.x, box_b.x)
+        inter_h = min(box_a.y + box_a.h, box_b.y + box_b.h) - max(box_a.y, box_b.y)
+        if inter_w <= 0 or inter_h <= 0:
+            return 0.0
+        inter = inter_w * inter_h
+        union = box_a.w * box_a.h + box_b.w * box_b.h - inter
+        return inter / union if union > 0 else 0.0
+
+    @classmethod
+    def merge_detections(cls, frames, min_hits):
+        """62401738 いしい
+        複数フレームの検出結果を、同じラベルで IoU が DETECT_IOU 以上のものどうしでまとめる。
+        min_hits 回以上のフレームで見えた物体だけを残し（1回だけの誤検出を消す）、
+        BBox の位置は各座標の中央値、score はフレーム数で割った平均（見えなかった回は0）にする。
+        """
+        clusters = []
+        for frame_id, frame in enumerate(frames):
+            for bbox in frame:
+                for cluster in clusters:
+                    if (cluster["label"] == bbox.label and frame_id not in cluster["frames"]
+                            and cls.bbox_iou(cluster["boxes"][0], bbox) >= cls.DETECT_IOU):
+                        cluster["boxes"].append(bbox)
+                        cluster["frames"].add(frame_id)
+                        break
+                else:
+                    clusters.append({"label": bbox.label, "boxes": [bbox], "frames": {frame_id}})
+
+        def median(values):
+            values = sorted(values)
+            return values[len(values) // 2]
+
+        merged = []
+        for cluster in clusters:
+            if len(cluster["frames"]) < min_hits:
+                continue
+            boxes = cluster["boxes"]
+            rep = copy.copy(max(boxes, key=lambda box: box.score))
+            rep.x = median([box.x for box in boxes])
+            rep.y = median([box.y for box in boxes])
+            rep.w = median([box.w for box in boxes])
+            rep.h = median([box.h for box in boxes])
+            rep.score = sum([box.score for box in boxes]) / len(frames)
+            merged.append(rep)
+        return sorted(merged, key=lambda box: box.score, reverse=True)
+
+    def get_stable_detection(self):
+        """62401738 いしい
+        DETECT_FRAMES 回検出し、merge_detections で多数決した結果を返す
+        """
+        frames = []
+        for i in range(self.DETECT_FRAMES):
+            frames.append(list(self.get_latest_detection().bboxes))
+            if i < self.DETECT_FRAMES - 1:
+                rospy.sleep(0.3)
+        merged = self.merge_detections(frames, self.DETECT_MIN_HITS)
+        rospy.loginfo("stable detection: %s",
+                      ", ".join(["{}({:.2f})".format(box.label, box.score) for box in merged]))
+        return merged
+
+    def update_task2a_obstacles(self, obstacles):
+        """62401738 いしい
+        安定化した検出結果から床の障害物を取り出し、obstacles（map 座標）に追加する
+        """
+        for bbox in self.get_stable_detection():
+            pos = self.get_bbox_position(bbox)
+            if pos is None:
+                continue
+            if not self.is_task2a_obstacle(pos):
+                rospy.loginfo("ignore %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
+                continue
+            rospy.loginfo("obstacle %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
+            self.add_obstacle(obstacles, (pos.x, pos.y))
+
+    @classmethod
+    def plan_path_astar(cls, start, goal, obstacles, safe_dist):
+        """62401738 いしい
+        TASK2A_GRID 間隔の格子の上で、start から goal までの経路を A* で探す。
+        - 障害物から safe_dist 未満の格子は通れない（start の格子だけは例外）
+        - 障害物から TASK2A_SOFT_DIST 未満の格子は、近いほどコストを上乗せする
+          （ぎりぎりを通らず、余裕のある経路を選ぶため）
+        - 8近傍で移動し、ヒューリスティックはゴールまでの直線距離
+        経路（(x, y) のリスト）を返す。見つからなければ None。
+        """
+        res = cls.TASK2A_GRID
+        x_min, x_max = cls.TASK2A_PLAN_X
+        y_min, y_max = cls.TASK2A_PLAN_Y
+        n_x = int(round((x_max - x_min) / res)) + 1
+        n_y = int(round((y_max - y_min) / res)) + 1
+
+        def to_cell(point):
+            c_x = int(round((point[0] - x_min) / res))
+            c_y = int(round((point[1] - y_min) / res))
+            return (max(0, min(n_x - 1, c_x)), max(0, min(n_y - 1, c_y)))
+
+        def to_xy(cell):
+            return (x_min + cell[0] * res, y_min + cell[1] * res)
+
+        clearance_cache = {}
+
+        def clearance(cell):
+            if cell not in clearance_cache:
+                p_x, p_y = to_xy(cell)
+                dists = [math.hypot(p_x - o_x, p_y - o_y) for o_x, o_y in obstacles]
+                clearance_cache[cell] = min(dists) if dists else float("inf")
+            return clearance_cache[cell]
+
+        start_cell, goal_cell = to_cell(start), to_cell(goal)
+        if clearance(goal_cell) < safe_dist:
+            return None
+
+        def heuristic(cell):
+            return math.hypot(cell[0] - goal_cell[0], cell[1] - goal_cell[1]) * res
+
+        cost = {start_cell: 0.0}
+        parent = {start_cell: None}
+        open_list = [(heuristic(start_cell), start_cell)]
+        closed = set()
+        while open_list:
+            _, cell = heapq.heappop(open_list)
+            if cell in closed:
+                continue
+            if cell == goal_cell:
+                path = []
+                while cell is not None:
+                    path.append(to_xy(cell))
+                    cell = parent[cell]
+                path.reverse()
+                path[0] = (start[0], start[1])
+                path[-1] = (goal[0], goal[1])
+                return path
+            closed.add(cell)
+            for d_x in (-1, 0, 1):
+                for d_y in (-1, 0, 1):
+                    nxt = (cell[0] + d_x, cell[1] + d_y)
+                    if (d_x == 0 and d_y == 0) or nxt in closed:
+                        continue
+                    if not (0 <= nxt[0] < n_x and 0 <= nxt[1] < n_y):
+                        continue
+                    clr = clearance(nxt)
+                    if clr < safe_dist:
+                        continue
+                    step = math.hypot(d_x, d_y) * res
+                    penalty = cls.TASK2A_CLEAR_WEIGHT * max(0.0, cls.TASK2A_SOFT_DIST - clr)
+                    new_cost = cost[cell] + step * (1.0 + penalty)
+                    if new_cost < cost.get(nxt, float("inf")):
+                        cost[nxt] = new_cost
+                        parent[nxt] = cell
+                        heapq.heappush(open_list, (new_cost + heuristic(nxt), nxt))
+        return None
+
+    @classmethod
+    def is_segment_free(cls, seg_start, seg_end, obstacles, safe_dist):
+        """62401738 いしい
+        線分の上をロボットが通ったとき、すべての障害物から safe_dist 以上離れているか
+        """
+        return all([cls.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
+                    for obs in obstacles])
+
+    @classmethod
+    def simplify_path(cls, path, obstacles, safe_dist):
+        """62401738 いしい
+        A* の格子経路から、障害物に近づかずに直線で結べる点を飛ばして、曲がり角だけにする
+        """
+        if len(path) <= 2:
+            return list(path)
+        result = [path[0]]
+        i = 0
+        while i < len(path) - 1:
+            j = len(path) - 1
+            while j > i + 1 and not cls.is_segment_free(path[i], path[j], obstacles, safe_dist):
+                j -= 1
+            result.append(path[j])
+            i = j
+        return result
+
+    @classmethod
+    def plan_next_point(cls, current, goal, obstacles):
+        """62401738 いしい
+        A* で current から goal までの経路を求め、次に進む点（最大 TASK2A_STEP_MAX 先）を返す。
+        経路がなければ安全距離を2割縮めてもう一度探し、それでもなければ None。
+        """
+        for safe_dist in (cls.TASK2A_SAFE_DIST, cls.TASK2A_SAFE_DIST * 0.8):
+            path = cls.plan_path_astar(current, goal, obstacles, safe_dist)
+            if path is None:
+                rospy.logwarn("A*: no path with safe_dist=%.2f", safe_dist)
+                continue
+            corners = cls.simplify_path(path, obstacles, safe_dist)
+            rospy.loginfo("A* path: %s",
+                          " -> ".join(["({:.2f}, {:.2f})".format(p[0], p[1]) for p in corners]))
+            target = corners[1] if len(corners) > 1 else corners[0]
+            dist = math.hypot(target[0] - current[0], target[1] - current[1])
+            if dist > cls.TASK2A_STEP_MAX:
+                ratio = cls.TASK2A_STEP_MAX / dist
+                target = (current[0] + (target[0] - current[0]) * ratio,
+                          current[1] + (target[1] - current[1]) * ratio)
+            return target
+        return None
+
+    def execute_avoid_blocks(self):
+        """62401738 いしい
+        床の障害物を避けながら go_throw_2a まで進む。
+        1回進むごとに検出し直し、見つけた障害物は map 座標で覚えておいて（近づいて見えなくなっても
+        避ける）、A* で経路を計画し直す。A* で経路が見つからないときは、3レーン方式
+        （select_next_waypoint）で次の段へ進む。
+        """
+        obstacles = []
+        current = self.TASK2A_START
+        for _ in range(self.TASK2A_MAX_MOVES):
+            self.update_task2a_obstacles(obstacles)
+            target = self.plan_next_point(current, self.TASK2A_GOAL, obstacles)
+            if target is not None:
+                waypoint = [target[0], target[1], self.TASK2A_YAW]
+            else:
+                steps = [i for i, s_y in enumerate(self.TASK2A_STEPS_Y) if s_y > current[1] + 0.05]
+                if not steps:
+                    break
+                waypoint = self.select_next_waypoint(steps[0], obstacles, current)
+            self.goto_pos(waypoint)
+            current = (waypoint[0], waypoint[1])
+            if math.hypot(current[0] - self.TASK2A_GOAL[0], current[1] - self.TASK2A_GOAL[1]) < 0.1:
+                break
+
+    @classmethod
+    def select_next_waypoint(cls, current_stp, obstacles, current_pos):
+        """62401738 いしい
+        次の段（y = TASK2A_STEPS_Y[current_stp]）のどのレーンへ進むかを決める。
+        現在地から各レーンへの移動経路（線分）と障害物の距離を計算し、
+          1. 距離が TASK2A_SAFE_DIST 以上のレーンのうち、横移動が最も少ないもの
+          2. 安全なレーンがなければ、障害物から最も離れられるレーン
+        を選ぶ。obstacles は (x, y) のリスト、戻り値は [x, y, yaw]。
+        """
+        target_y = cls.TASK2A_STEPS_Y[current_stp]
+        lanes = []
+        for lane_x in cls.TASK2A_LANES_X:
+            goal = (lane_x, target_y)
+            dists = [cls.dist_point_to_segment(obs, current_pos, goal) for obs in obstacles]
+            clearance = min(dists) if dists else float("inf")
+            lanes.append({"x": lane_x, "clearance": clearance,
+                          "lateral": abs(lane_x - current_pos[0])})
+            rospy.loginfo("step %d lane x=%.2f clearance=%.2f", current_stp, lane_x, clearance)
+
+        safe = [lane for lane in lanes if lane["clearance"] >= cls.TASK2A_SAFE_DIST]
+        if safe:
+            best = min(safe, key=lambda lane: (lane["lateral"], -lane["clearance"]))
+        else:
+            rospy.logwarn("no safe lane at step %d. choose the widest one.", current_stp)
+            best = max(lanes, key=lambda lane: lane["clearance"])
+        rospy.loginfo("select next waypoint x=%.2f y=%.2f", best["x"], target_y)
+        return [best["x"], target_y, cls.TASK2A_YAW]
 
     def execute_task1(self):
-        """
+        """61XXXXXX さくま
         task1を実行する
         """
         rospy.loginfo("#### start Task 1 ####")
@@ -496,14 +879,14 @@ class WrsMainController(object):
                 total_cnt += 1
 
     def execute_task2a(self):
-        """
+        """62401738 いしい
         task2aを実行する
         """
         rospy.loginfo("#### start Task 2a ####")
         self.change_pose("look_at_near_floor")
         gripper.command(0)
-        self.change_pose("look_at_near_floor")
         self.goto_name("standby_2a")
+        log_start = len(self.detection_list)
 
         # 落ちているブロックを避けて移動
         self.execute_avoid_blocks()
@@ -511,34 +894,41 @@ class WrsMainController(object):
         self.goto_name("go_throw_2a")
         whole_body.move_to_go()
 
+        # 障害物に触れたかを確認する（触れると 2a は0点）
+        hits = [msg for msg in self.detection_list[log_start:] if "task2a" in msg]
+        if hits:
+            rospy.logwarn("task2a collision: %s", ", ".join(hits))
+        else:
+            rospy.loginfo("task2a: no collision")
+
     def execute_task2b(self):
-        """
-        task2bを実行する
+        """62401738 いしい
+        task2bを実行する。指示文は棚の前に行くと届くので、棚へ移動してから待つ。
         """
         rospy.loginfo("#### start Task 2b ####")
+        self.change_pose("look_at_near_floor")
+        self.goto_name("shelf")
 
-        # 命令文を取得
-        if self.instruction_list:
-            latest_instruction = self.instruction_list[-1]
-            rospy.loginfo("recieved instruction: %s", latest_instruction)
+        # 命令文を取得して解釈
+        instruction = self.wait_for_instruction(self.TASK2B_WAIT_SEC)
+        if instruction is None:
+            rospy.logwarn("no instruction received. deliver any object to the default person.")
+            target_obj, target_person = None, None
         else:
-            rospy.logwarn("instruction_list is None")
-            return
+            rospy.loginfo("recieved instruction: %s", instruction)
+            target_obj, target_person = self.extract_target_obj_and_person(instruction)
 
-        # 命令内容を解釈
-        target_obj, target_person = self.extract_target_obj_and_person(latest_instruction)
-
-        # 指定したオブジェクトを指定した配達先へ
-        if target_obj and target_person:            self.deliver_to_target(target_obj, target_person)
+        # 指定したオブジェクトを指定した配達先へ（見つからなくても何かを届けて20点を狙う）
+        self.deliver_to_target(target_obj, target_person)
 
     def run(self):
-        """
-        全てのタスクを実行する
+        """61XXXXXX むかい
+        全てのタスクを実行する（wrs_main_node_c.py: Task 2a・2b だけを実行）
         """
         self.change_pose("all_neutral")
-        self.execute_task1()
-        # self.execute_task2a()
-        # self.execute_task2b()
+        # self.execute_task1()
+        self.execute_task2a()
+        self.execute_task2b()
 
 
 def main():

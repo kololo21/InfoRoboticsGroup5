@@ -48,6 +48,11 @@ class Detector:
             self.detector = detector_module.FasterRcnnDetector(
                 rospy.get_param("~frcnn_finetuned/class_config_path"),
                 rospy.get_param("~frcnn_finetuned/checkpoint_path"))
+        elif detector_str == "yolo":
+            detector_module = importlib.import_module("wrs_detector.yolo_detector")
+            self.detector = detector_module.YoloDetector(
+                rospy.get_param("~yolo/weights_path"),
+                int(rospy.get_param("~yolo/image_size", 640)))
         elif detector_str == "mmdet":
             detector_module = importlib.import_module("wrs_detector.mmdet_detector")
             rospy.get_param("~mode")

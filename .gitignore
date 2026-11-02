@@ -14,3 +14,10 @@ __pycache__/
 
 # Large model checkpoints (>100MB GitHub limit)
 *.pth
+
+# YOLO (python3.8 libs, datasets, training runs)
+.yolo_env/
+datasets/
+runs/
+*.pt
+!src/wrs_detector/checkpoints/yolo_wrs.pt

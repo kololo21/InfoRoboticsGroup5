@@ -1,0 +1,22 @@
+<launch>
+  <!-- YOLOv8 で物体検出する。frcnn_finetuned.launch と同じトピック・サービス名で動くので、
+       wrs_main_node 側の変更は不要。start_all.sh を DETECTOR=yolo で実行すると使われる -->
+  <arg name="weights_path"
+       default="$(find wrs_detector)/checkpoints/yolo_wrs.pt" />
+  <arg name="image_size" default="640" />
+
+  <node name="frcnn_detector" pkg="wrs_detector" type="detector_node.py" output="screen"
+        launch-prefix="$(find wrs_detector)/scripts/run_with_yolo_env.sh">
+    <param name="detector" value="yolo"/>
+    <param name="yolo/weights_path" value="$(arg weights_path)"/>
+    <param name="yolo/image_size" value="$(arg image_size)"/>
+    <param name="mode" value="with_request"/>
+    <param name="threshold" value="0.2"/>
+    <param name="publish_image" value="true"/>
+
+    <remap from="in" to="/hsrb/head_rgbd_sensor/rgb/image_rect_color" />
+    <remap from="result" to="detection/bbox" />
+    <remap from="result_image" to="detection/image" />
+    <remap from="get_object_detection" to="detection/get_object_detection" />
+  </node>
+</launch>
