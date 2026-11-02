@@ -135,7 +135,12 @@ class Detector:
             draw.rectangle(
                 [(box["x"], box["y"]), (box["x"] + box["w"], box["y"] + box["h"])],
                 outline="red", width=3)
-            text_w, text_h = fnt.getsize(label_str)
+            # Pillow 10 で getsize が廃止されたので getbbox を使う（YOLO 用の環境は Pillow 10）
+            if hasattr(fnt, "getbbox"):
+                left, top, right, bottom = fnt.getbbox(label_str)
+                text_w, text_h = right - left, bottom - top
+            else:
+                text_w, text_h = fnt.getsize(label_str)
             draw.rectangle([box["x"], box["y"]-text_h, box["x"]+text_w, box["y"]], fill="red")
             draw.text((box["x"], box["y"]-text_h), label_str, font=fnt, fill="white")
 
