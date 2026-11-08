@@ -1171,6 +1171,97 @@ class WrsMainController(object):
                     return cand
         return cls.TASK2A_GOAL
 
+    # ------------------------------------------------------------------
+    # 引き出し（上段を下段に重ねてダブルスコアを狙う）
+    # 座標は公開版 WRS ワールド（tmc_wrs_gazebo の wrs2020.world）から求めた map 座標。
+    #   ロボット初期位置 world(-2.1, 1.2, yaw -90°) が map 原点なので
+    #   map_x = 1.2 - world_y,  map_y = world_x + 2.1
+    #   下段 trofast_2: world(-2.7, 1.0, z 0.10) → map(0.2, -0.6)、上段 trofast_3: z 0.36
+    #   引き出しの箱は奥行き 0.42m（map の y 方向）・幅 0.30m・高さ 0.227m → 前面は y = -0.39
+    # 授業のシミュレータで値がずれていたら、ここの数字だけ直す（Gazebo で引き出しをクリックして確認）
+    # ------------------------------------------------------------------
+    USE_DRAWER = True                       # False にすると引き出しを使わない（サンプルどおり bin へ）
+    DRAWER_STANDPOINT = [0.2, 0.25, -90]    # 引き出しの正面に立つ位置（開けた引き出しに当たらない距離）
+    DRAWER_HANDLE_X = 0.2                   # 取っ手の x
+    DRAWER_HANDLE_Y = -0.29                 # 取っ手をつかむ手先の y（サンプル pull_out_trofast の値）
+    DRAWER_HANDLE_Z = {"bottom": 0.29, "top": 0.55}  # 取っ手の高さ = 箱の底 + 0.19（要実測）
+    DRAWER_HAND_RPY = (-90, 100, 0)         # 取っ手をつかむ手の向き（サンプルの push_in_trofast と同じ）
+    # 引き出す距離。下段は普通に、上段は大きく引き出して前に傾け、下段の判定範囲に重ねる
+    DRAWER_PULL = {"bottom": 0.20, "top": 0.32}
+    # 物体を落とす位置: 上段（開けた後 y -0.49〜-0.07）と下段（開けた後 y -0.61〜-0.19）が重なる所
+    DRAWER_DROP = (0.2, -0.33, 0.70)
+    DRAWER_DROP_RPY = (-90, -160, 0)        # 落とすときの手の向き（grasp_from_upper_side と同じ下向き）
+    # Task items（bin_a が正解）は bin_a、それ以外は引き出しへ
+    BIN_A_LABELS = ("rubiks_cube", "colored_wood_block", "nine_hole_peg_test", "toy_airplane",
+                    "lego_duplo", "magazine", "black_t_shirt", "timer")
+
+    def pull_drawer(self, level):
+        """62401738 いしい
+        level（"bottom" / "top"）の引き出しを DRAWER_PULL[level] だけ引き出す。
+        pull_out_trofast と同じ動き（手前から差し込む → つかむ → 手前に引く → 離す）。
+        """
+        yaw, pitch, roll = self.DRAWER_HAND_RPY
+        pos_x, pos_y = self.DRAWER_HANDLE_X, self.DRAWER_HANDLE_Y
+        pos_z = self.DRAWER_HANDLE_Z[level]
+        pull = self.DRAWER_PULL[level]
+        rospy.loginfo("pull %s drawer %.2f m", level, pull)
+        gripper.command(1)
+        if not whole_body.move_end_effector_pose(
+                pos_x, pos_y + self.TROFAST_Y_OFFSET, pos_z, yaw, pitch, roll):
+            return False
+        if not whole_body.move_end_effector_pose(pos_x, pos_y, pos_z, yaw, pitch, roll):
+            return False
+        gripper.command(0)
+        moved = whole_body.move_end_effector_pose(pos_x, pos_y + pull, pos_z, yaw, pitch, roll)
+        gripper.command(1)
+        whole_body.move_end_effector_pose(
+            pos_x, pos_y + pull + 0.1, pos_z, yaw, pitch, roll)  # 手を抜く
+        return bool(moved)
+
+    def open_drawers(self):
+        """62401738 いしい
+        下段を先に開け、次に上段を大きく開ける（上段が前に傾いて下段の判定範囲と重なる）。
+        両方開けたら True。物を持つ前（Task 1 の最初）に呼ぶ。
+        """
+        self.drawers_open = False
+        if not self.USE_DRAWER:
+            return False
+        self.change_pose("all_neutral")
+        self.goto_pos(self.DRAWER_STANDPOINT)
+        self.change_pose("grasp_on_table")
+        self.drawers_open = bool(self.pull_drawer("bottom") and self.pull_drawer("top"))
+        self.change_pose("all_neutral")
+        if not self.drawers_open:
+            rospy.logwarn("could not open the drawers. use the bins instead.")
+        return self.drawers_open
+
+    def put_in_drawer(self):
+        """62401738 いしい
+        持っている物体を、開けた上段と下段が重なる位置（DRAWER_DROP）の上から落とす。
+        """
+        self.change_pose("look_at_near_floor")
+        self.goto_pos(self.DRAWER_STANDPOINT)
+        self.change_pose("all_neutral")
+        pos_x, pos_y, pos_z = self.DRAWER_DROP
+        yaw, pitch, roll = self.DRAWER_DROP_RPY
+        whole_body.move_end_effector_pose(pos_x, pos_y, pos_z, yaw, pitch, roll)
+        gripper.command(1)
+        self.change_pose("all_neutral")
+
+    def put_object_c(self, label, count):
+        """62401738 いしい
+        Task 1 で持った物体を置く。Task items は bin_a、それ以外は引き出し（開いていれば）。
+        引き出しが開いていなければサンプルどおり bin_a / bin_b に交互に入れる（count は何個目か）。
+        """
+        if label in self.BIN_A_LABELS:
+            self.put_in_place("bin_a_place", "put_in_bin")
+        elif getattr(self, "drawers_open", False):
+            self.put_in_drawer()
+        elif count % 2 == 0:
+            self.put_in_place("bin_a_place", "put_in_bin")
+        else:
+            self.put_in_place("bin_b_place", "put_in_bin")
+
     def execute_task1(self):
         """61XXXXXX さくま
         task1を実行する
@@ -1208,9 +1299,8 @@ class WrsMainController(object):
                 self.exec_graspable_method(grasp_pos, label)
                 self.change_pose("all_neutral")
 
-                # binに入れる
-                if total_cnt % 2 == 0:  self.put_in_place("bin_a_place", "put_in_bin")
-                else:  self.put_in_place("bin_b_place", "put_in_bin")
+                # 置く（Task items は bin_a、それ以外は引き出し）
+                self.put_object_c(label, total_cnt)
                 total_cnt += 1
 
     # 障害物を持って退かす（Task 2a）。把持している物体との接触は衝突にならない
@@ -1356,10 +1446,11 @@ class WrsMainController(object):
 
     def run(self):
         """61XXXXXX むかい
-        全てのタスクを実行する（wrs_main_node_c.py: Task 2a・2b だけを実行）
+        全てのタスクを実行する（wrs_main_node_c.py: 引き出しを開ける → Task 1 → 2a → 2b）
         """
         self.change_pose("all_neutral")
-        # self.execute_task1()
+        self.open_drawers()
+        self.execute_task1()
         self.execute_task2a()
         self.execute_task2b()
 

@@ -742,7 +742,8 @@ class WrsMainController(object):
         if category is None:
             raise ValueError("Unrecognized placement label: {}".format(label))
         if category in ("drawer_tools", "drawer_shape"):
-            return self.select_drawer_place(label, category)
+            raise ValueError("Drawer placement is not implemented for {} ({})".format(
+                label, category))
         self.ensure_sensor_placements(category, destinations[category])
         targets = getattr(self, "placement_targets", {})
         candidates = [(place, pose) for place, pose in destinations[category]
@@ -958,90 +959,6 @@ class WrsMainController(object):
 
         self.change_pose("all_neutral")
 
-    # ------------------------------------------------------------------
-    # 引き出し（上段を下段に重ねてダブルスコアを狙う）
-    # 座標は公開版 WRS ワールド（tmc_wrs_gazebo の wrs2020.world）から求めた map 座標。
-    #   ロボット初期位置 world(-2.1, 1.2, yaw -90°) が map 原点なので
-    #   map_x = 1.2 - world_y,  map_y = world_x + 2.1
-    #   下段 trofast_2: world(-2.7, 1.0, z 0.10) → map(0.2, -0.6)、上段 trofast_3: z 0.36
-    #   引き出しの箱は奥行き 0.42m（map の y 方向）・幅 0.30m・高さ 0.227m → 前面は y = -0.39
-    # 授業のシミュレータで値がずれていたら、ここの数字だけ直す（Gazebo で引き出しをクリックして確認）
-    # ------------------------------------------------------------------
-    USE_DRAWER = True                       # False にすると引き出しを使わない（今までどおり bin_b へ）
-    DRAWER_STANDPOINT = [0.2, 0.25, -90]    # 引き出しの正面に立つ位置（開けた引き出しに当たらない距離）
-    DRAWER_HANDLE_X = 0.2                   # 取っ手の x
-    DRAWER_HANDLE_Y = -0.29                 # 取っ手をつかむ手先の y（サンプル pull_out_trofast の値）
-    DRAWER_HANDLE_Z = {"bottom": 0.29, "top": 0.55}  # 取っ手の高さ = 箱の底 + 0.19（要実測）
-    DRAWER_HAND_RPY = (-90, 100, 0)         # 取っ手をつかむ手の向き（サンプルの push_in_trofast と同じ）
-    # 引き出す距離。下段は普通に、上段は大きく引き出して前に傾け、下段の判定範囲に重ねる
-    DRAWER_PULL = {"bottom": 0.20, "top": 0.32}
-    # 物体を落とす位置: 上段（開けた後 y -0.49〜-0.07）と下段（開けた後 y -0.61〜-0.19）が重なる所
-    DRAWER_DROP = {"x": 0.2, "y": -0.33, "z": 0.70, "hover": 0.10}
-    DRAWER_PLACE_NAME = "drawer_top_place"
-
-    def pull_drawer(self, level):
-        """62401738 いしい
-        level（"bottom" / "top"）の引き出しを DRAWER_PULL[level] だけ引き出す。
-        pull_out_trofast と同じ動き（手前から差し込む → つかむ → 手前に引く → 離す）。
-        """
-        yaw, pitch, roll = self.DRAWER_HAND_RPY
-        pos_x, pos_y = self.DRAWER_HANDLE_X, self.DRAWER_HANDLE_Y
-        pos_z = self.DRAWER_HANDLE_Z[level]
-        pull = self.DRAWER_PULL[level]
-        rospy.loginfo("pull %s drawer %.2f m", level, pull)
-        gripper.command(1)
-        if not whole_body.move_end_effector_pose(
-                pos_x, pos_y + self.TROFAST_Y_OFFSET, pos_z, yaw, pitch, roll):
-            return False
-        if not whole_body.move_end_effector_pose(pos_x, pos_y, pos_z, yaw, pitch, roll):
-            return False
-        gripper.command(0)
-        moved = whole_body.move_end_effector_pose(pos_x, pos_y + pull, pos_z, yaw, pitch, roll)
-        gripper.command(1)
-        whole_body.move_end_effector_pose(
-            pos_x, pos_y + pull + 0.1, pos_z, yaw, pitch, roll)  # 手を抜く
-        return bool(moved)
-
-    def open_drawers(self):
-        """62401738 いしい
-        下段を先に開け、次に上段を大きく開ける（上段が前に傾いて下段の判定範囲と重なる）。
-        両方開いたら、上段の重なる位置を置き場所 DRAWER_PLACE_NAME として登録する。
-        """
-        self.drawers_open = False
-        if not self.USE_DRAWER:
-            return False
-        self.change_pose("all_neutral")
-        self.goto_pos(self.DRAWER_STANDPOINT)
-        self.change_pose("grasp_on_table")
-        opened = self.pull_drawer("bottom") and self.pull_drawer("top")
-        self.change_pose("all_neutral")
-        if not opened:
-            rospy.logwarn("could not open the drawers. use bin_b instead.")
-            return False
-        self.coordinates["positions"][self.DRAWER_PLACE_NAME] = list(self.DRAWER_STANDPOINT)
-        self.placement_targets[self.DRAWER_PLACE_NAME] = dict(self.DRAWER_DROP)
-        self.drawers_open = True
-        return True
-
-    def select_drawer_place(self, label, category):
-        """62401738 いしい
-        引き出し行きの物体（Tools / Shape items）の置き場所を返す。
-        開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
-        """
-        if not getattr(self, "drawers_open", False):
-            raise ValueError("Drawers are not open for {} ({})".format(label, category))
-        rospy.loginfo("place %s (%s) at %s", label, category, self.DRAWER_PLACE_NAME)
-        return self.DRAWER_PLACE_NAME, None
-
-    def put_in_fallback(self, label):
-        """62401738 いしい
-        正しい置き場所に置けなかった物体を置く。
-        引き出しが開いていれば上段の重なる位置（判定2つ分）、開いていなければ bin_b（10点）。
-        """
-        if getattr(self, "drawers_open", False):
-            return self.put_in_place(self.DRAWER_PLACE_NAME, None, label=label)
-        return self.put_in_place("bin_b_place", "put_in_bin", label=label)
-
     def execute_task1(self):
         """62408993 Masami Sakuma
         Task1を実行する。
@@ -1062,9 +979,6 @@ class WrsMainController(object):
 
         start_time = rospy.Time.now()
         time_limit = 14 * 60
-
-        # 物を持つ前に引き出しを開けておく（下段 → 上段を大きく）
-        self.open_drawers()
 
         rospy.loginfo("Start searching objects.")
 
@@ -1121,10 +1035,10 @@ class WrsMainController(object):
                     placed.append(label)
                 elif not getattr(self, "last_placement_result", {}).get("released", False):
                     # まだ持っている（引き出し行きは未実装・置き場所が分からない など）。
-                    # 持ったまま次へ進むと次の探索地点で落とすので、引き出し（開いていれば）か Bin B に入れる
-                    rospy.logwarn("Placement failed for %s; put it in the fallback place", label)
-                    if self.put_in_fallback(label):
-                        placed.append(label + "(fallback)")
+                    # 持ったまま次へ進むと次の探索地点で落とすので、Bin B に入れる（置き場所に入れば10点）
+                    rospy.logwarn("Placement failed for %s; put it in bin_b instead", label)
+                    if self.put_in_place("bin_b_place", "put_in_bin", label=label):
+                        placed.append(label + "(bin_b)")
 
         rospy.loginfo("#### finish Task 1 ####")
         rospy.loginfo("Placed objects (%d): %s", len(placed), ", ".join(placed))
