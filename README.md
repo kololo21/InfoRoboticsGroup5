@@ -101,6 +101,7 @@ ultralytics は Python 3.8 以上が必要なので、ROS noetic 本体の `/usr
 | `src/wrs_detector/launch/yolo.launch` | YOLO 版の検出ノード（トピック・サービス名は同じ） |
 | `tools/yolo/convert_to_yolo.py` | 授業のデータセット（COCO / VOC）を YOLO 形式に変換 |
 | `tools/yolo/augment_dataset.py` | train を水増し（複製・ノイズ・傾け。BBox も回転に合わせる） |
+| `tools/yolo/capture_images.py` | シミュレータの頭部カメラ画像を授業データセットと同じ形式（`seedN/NNNN_image.png` と `_pose.json`）で保存。`--mode tour`（地点を回って首を振る）/ `--mode passive`（走行中に一定間隔で撮る） |
 | `tools/yolo/sam3_autolabel.py` | シミュレータの画像に SAM 3 で自動ラベル付け（理論上の手順。GPU・Python 3.12 が必要で未実行） |
 | `tools/yolo/train_yolo.sh` | 学習して `checkpoints/yolo_wrs.pt` に置く |
 
