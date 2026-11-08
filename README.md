@@ -168,6 +168,7 @@ pylint --max-line-length=100 --rcfile src/wrs_algorithm21/pylintrc \
 | 日付 | Seed | 変更内容 | Task 1 | Task 2a | Task 2b | 合計 | 失敗した理由 |
 |---|---|---|---|---|---|---|---|
 | | 86 | サンプルそのまま | | | | | |
+| 11/2 | 86 | | | | | 110 | |
 
 ## 提出物（第3週の次の日曜 18:00、K-LMS、zip 50MB 以下）
 
