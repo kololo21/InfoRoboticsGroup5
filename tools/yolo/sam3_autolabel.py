@@ -127,8 +127,10 @@ def main():
         image = Image.open(path).convert("RGB")
         width, height = image.size
         found = label_image(processor, image, prompts, args.min_score, args.iou)
-        stem = os.path.splitext(os.path.basename(path))[0]
-        shutil.copy(path, os.path.join(img_dir, os.path.basename(path)))
+        # seed86/0000_image.png と seed25/0000_image.png がぶつからないよう、フォルダ名を頭に付ける
+        name = os.path.relpath(path, args.images).replace(os.sep, "_")
+        stem = os.path.splitext(name)[0]
+        shutil.copy(path, os.path.join(img_dir, name))
         with open(os.path.join(lbl_dir, stem + ".txt"), "w") as label_file:
             for idx, _, box in found:
                 label_file.write(to_yolo_line(idx, box, width, height))
@@ -138,9 +140,9 @@ def main():
                 draw.rectangle(box, outline=(255, 0, 0), width=2)
                 draw.text((box[0], max(0, box[1] - 12)),
                           "%s %.2f" % (prompts[idx][0], score), fill=(255, 0, 0))
-            image.save(os.path.join(prev_dir, os.path.basename(path)))
+            image.save(os.path.join(prev_dir, name))
         n_boxes += len(found)
-        print("%s: %d objects" % (os.path.basename(path), len(found)))
+        print("%s: %d objects" % (name, len(found)))
     print("images: %d, boxes: %d -> %s" % (len(paths), n_boxes, args.out))
 
 
