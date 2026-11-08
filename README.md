@@ -100,6 +100,7 @@ ultralytics は Python 3.8 以上が必要なので、ROS noetic 本体の `/usr
 | `src/wrs_detector/scripts/wrs_detector/yolo_detector.py` | YOLO で検出するクラス（入出力は Faster R-CNN と同じ） |
 | `src/wrs_detector/launch/yolo.launch` | YOLO 版の検出ノード（トピック・サービス名は同じ） |
 | `tools/yolo/convert_to_yolo.py` | 授業のデータセット（COCO / VOC）を YOLO 形式に変換 |
+| `tools/yolo/augment_dataset.py` | train を水増し（複製・ノイズ・傾け。BBox も回転に合わせる） |
 | `tools/yolo/train_yolo.sh` | 学習して `checkpoints/yolo_wrs.pt` に置く |
 
 ### 準備（サーバごとに1回）
