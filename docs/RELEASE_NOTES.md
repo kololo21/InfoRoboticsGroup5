@@ -29,7 +29,7 @@
 - Task 2b: 棚の前で指示文を待って物体と人物を解析し、person_a / person_b に配達。見つからなければ任意の物体を渡す（20点）
 - 検出の安定化: 3フレームの投票（IoUでクラスタリングし、bboxは中央値）
 
-## 物体検出
+## 物体検出（いしい）
 - YOLOv8s を追加（hsr_sim_obj_1000 で学習、val mAP50 0.802 / mAP50-95 0.730）
 - 統合版と `c` は YOLO が既定。ライブラリや重みがなければ Faster R-CNN に戻る。`DETECTOR=frcnn/yolo` で切り替え可
 - Pillow 10 で結果画像の描画が落ちる問題を修正
@@ -37,7 +37,7 @@
 ## 開発環境
 - `wrs_main_node_a/b/c.py`: メンバーごとの作業用コピー。`start_all.sh a|b|c` で選んで実行
 - README（担当表・実行方法）と `docs/rules_and_strategy.md`
-- YOLO用のツール `tools/yolo`（データ変換・学習スクリプト）
+- YOLO用のツール `tools/yolo`（データ変換・学習スクリプト。いしい）
 
 ## コード品質
 - pycodestyle: 警告0
