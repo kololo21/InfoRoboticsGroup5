@@ -9,7 +9,6 @@ import json
 import os
 from select import select
 import traceback
-from turtle import pos
 import rospy
 import rospkg
 import tf2_ros
@@ -557,17 +556,45 @@ class WrsMainController(object):
         self.grasp_from_front_side(grasp_pos)
         self.change_pose("all_neutral")
 
-        # target_personの前に持っていく
+        # 2人の間をスライドして渡す（もう1人の前から始めて、target_person の前で離す）
         if target_person not in self.PERSON_WAYPOINTS:
             rospy.logwarn("unknown person [%s]. use default [%s].", target_person,
                           self.DEFAULT_PERSON)
             target_person = self.DEFAULT_PERSON
+        end = self.PERSON_WAYPOINTS[target_person]
+        start = "person_a" if end == "person_b" else "person_b"
         self.change_pose("look_at_near_floor")
-        self.goto_name(self.PERSON_WAYPOINTS[target_person])
+        self.goto_name(start)
         self.change_pose("deliver_to_human")
+        self.slide_base_to(self.coordinates["positions"][end])
         rospy.sleep(10.0)
         gripper.command(1)
         self.change_pose("all_neutral")
+
+    TASK2B_SLIDE_SPEED = 0.1   # 人の前をスライドする速さ [m/s]
+
+    def slide_base_to(self, waypoint):
+        """62401738 いしい
+        向きを waypoint の角度に保ったまま、waypoint (x, y, yaw[deg]) まで横に直進する（腕は出したまま）。
+        tf が取れなければ move_base（goto_pos）で移動する。
+        """
+        pose = self.get_robot_pose()
+        if pose is None:
+            self.goto_pos(waypoint)
+            return
+        dist0 = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
+        end_time = rospy.Time.now() + rospy.Duration(dist0 / self.TASK2B_SLIDE_SPEED * 2.0 + 5.0)
+        while not rospy.is_shutdown() and rospy.Time.now() < end_time:
+            pose = self.get_robot_pose()
+            if pose is None:
+                break
+            if math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < self.TASK2A_GOAL_TOL:
+                break
+            vel_x, vel_y, yaw_rate = self.calc_base_velocity(
+                pose, waypoint[:2], waypoint[2], self.TASK2B_SLIDE_SPEED)
+            omni_base.cmd_vel(vel_x, vel_y, yaw_rate)
+            rospy.sleep(self.TASK2A_CONTROL_DT)
+        self.stop_base()
 
     @classmethod
     def is_task2a_obstacle(cls, pos):
@@ -988,23 +1015,27 @@ class WrsMainController(object):
         omni_base.cmd_vel(0.0, 0.0, 0.0)
 
     @classmethod
-    def calc_base_velocity(cls, pose, target):
+    def calc_base_velocity(cls, pose, target, yaw_deg=None, max_speed=None):
         """62401738 いしい
         今の姿勢 pose (x, y, yaw) から target (x, y) へ直進するための速度指令を計算する。
-        - 位置: map 座標での誤差に比例した速度（最大 TASK2A_MAX_SPEED）で、目標へ一直線に向かう
-        - 向き: TASK2A_YAW を保つ（全方向台車なので、向きを変えずに横にも進める）
+        - 位置: map 座標での誤差に比例した速度（最大 max_speed、省略時 TASK2A_MAX_SPEED）で、目標へ一直線に向かう
+        - 向き: yaw_deg（省略時 TASK2A_YAW）を保つ（全方向台車なので、向きを変えずに横にも進める）
         map 座標の速度をロボット座標に回転して (vx, vy, w[deg/s]) を返す。
         """
+        if yaw_deg is None:
+            yaw_deg = cls.TASK2A_YAW
+        if max_speed is None:
+            max_speed = cls.TASK2A_MAX_SPEED
         err_x, err_y = target[0] - pose[0], target[1] - pose[1]
         dist = math.hypot(err_x, err_y)
-        speed = min(cls.TASK2A_MAX_SPEED, cls.TASK2A_GAIN * dist)
+        speed = min(max_speed, cls.TASK2A_GAIN * dist)
         map_vx = err_x / dist * speed if dist > 0 else 0.0
         map_vy = err_y / dist * speed if dist > 0 else 0.0
         cos_y, sin_y = math.cos(pose[2]), math.sin(pose[2])
         robot_vx = cos_y * map_vx + sin_y * map_vy
         robot_vy = -sin_y * map_vx + cos_y * map_vy
-        yaw_err = math.atan2(math.sin(math.radians(cls.TASK2A_YAW) - pose[2]),
-                             math.cos(math.radians(cls.TASK2A_YAW) - pose[2]))
+        yaw_err = math.atan2(math.sin(math.radians(yaw_deg) - pose[2]),
+                             math.cos(math.radians(yaw_deg) - pose[2]))
         yaw_rate = max(-30.0, min(30.0, math.degrees(cls.TASK2A_YAW_GAIN * yaw_err)))
         return robot_vx, robot_vy, yaw_rate
 
@@ -1182,9 +1213,97 @@ class WrsMainController(object):
                 else:  self.put_in_place("bin_b_place", "put_in_bin")
                 total_cnt += 1
 
+    # 障害物を持って退かす（Task 2a）。把持している物体との接触は衝突にならない
+    TASK2A_MODE = "grasp"                 # "grasp": 持って退かす / "avoid": A* で避ける（従来）
+    TASK2A_GRASP_STANDOFF = 0.45          # 障害物の手前で止まる距離 [m]（> TASK2A_DANGER_DIST）
+    TASK2A_GRASP_MAX = 5                  # 退かす障害物の数の上限
+    TASK2A_MATCH_DIST = 0.25              # 近づいて見直したとき、同じ障害物とみなす距離 [m]
+    TASK2A_DROP_POS = [2.5, 1.45, -90]    # 退かした障害物を置く場所（standby_2a の後ろ。後で通らない）
+
+    def find_nearest_obstacle(self, pos, max_dist):
+        """62401738 いしい
+        近くで検出し直し、pos (x, y) から max_dist 以内で一番近い床の物体の (位置, ラベル) を返す。
+        """
+        best, best_dist = None, max_dist
+        for bbox in self.get_stable_detection():
+            obj = self.get_bbox_position(bbox)
+            if obj is None or obj.z > self.TASK2A_AREA["z_max"]:
+                continue
+            dist = math.hypot(obj.x - pos[0], obj.y - pos[1])
+            if dist < best_dist:
+                best, best_dist = (obj, bbox.label), dist
+        return best
+
+    def remove_obstacle(self, obstacles):
+        """62401738 いしい
+        obstacles の中で一番手前（y が小さい）の障害物に近づいて持ち上げ、TASK2A_DROP_POS に置く。
+        持ち上げたら obstacles から消して True を返す。
+        """
+        goal_y = self.TASK2A_GOAL[1]
+        ahead = [obs for obs in obstacles if obs[1] < goal_y + 0.3]
+        if not ahead:
+            return False
+        target = min(ahead, key=lambda obs: obs[1])
+        others = [obs for obs in obstacles if obs != target]
+        standoff = (target[0], target[1] - self.TASK2A_GRASP_STANDOFF)
+        result = self.move_straight_to(standoff, others)
+        rospy.loginfo("task2a: approach obstacle (%.2f, %.2f): %s", target[0], target[1], result)
+        if result not in ("reached", "no_tf"):
+            return False
+
+        self.change_pose("look_at_near_floor")
+        found = self.find_nearest_obstacle(target, self.TASK2A_MATCH_DIST)
+        if found is None:
+            rospy.logwarn("task2a: obstacle disappeared at (%.2f, %.2f)", target[0], target[1])
+            obstacles.remove(target)
+            return True
+        grasp_pos, label = found
+        rospy.loginfo("task2a: grasp %s (%.2f, %.2f, %.2f)",
+                      label, grasp_pos.x, grasp_pos.y, grasp_pos.z)
+        if not self.grasp_from_upper_side(grasp_pos):
+            return False
+        self.change_pose("all_neutral")
+
+        # 後ろ（もう通らない場所）に置いてから、元の位置に戻る
+        self.goto_pos(self.TASK2A_DROP_POS)
+        self.change_pose("put_in_bin")
+        gripper.command(1)
+        self.change_pose("all_neutral")
+        obstacles.remove(target)
+        self.change_pose("look_at_near_floor")
+        self.goto_name("standby_2a")
+        return True
+
+    def execute_clear_blocks(self):
+        """62401738 いしい
+        床の障害物を手前から順に持ち上げて退かし、何もなくなったら go_throw_2a まで直進する。
+        退かせなかったときは False を返す（execute_task2a が A* の回避に切り替える）。
+        """
+        obstacles = []
+        whole_body.move_to_joint_positions(
+            {"head_pan_joint": 0.0, "head_tilt_joint": self.TASK2A_NEAR_TILT})
+        self.update_task2a_obstacles(obstacles)
+        self.scan_task2a_obstacles(
+            obstacles, (self.TASK2A_SCAN_PAN, -self.TASK2A_SCAN_PAN, 0.0))
+        for _ in range(self.TASK2A_GRASP_MAX):
+            if not obstacles:
+                break
+            if not self.remove_obstacle(obstacles):
+                return False
+            # 退かした後に見え方が変わるので見渡し直す
+            obstacles = []
+            self.scan_task2a_obstacles(
+                obstacles, (self.TASK2A_SCAN_PAN, -self.TASK2A_SCAN_PAN, 0.0))
+        if obstacles:
+            return False
+        result = self.move_straight_to(self.TASK2A_GOAL, obstacles)
+        rospy.loginfo("task2a: go to goal: %s", result)
+        return result == "reached"
+
     def execute_task2a(self):
         """62401738 いしい
-        task2aを実行する
+        task2aを実行する。TASK2A_MODE が "grasp" なら障害物を持って退かし、
+        退かせなかったときだけ A* で避ける（execute_avoid_blocks）。
         """
         rospy.loginfo("#### start Task 2a ####  detector: %s", self.get_detector_type())
         self.change_pose("look_at_near_floor")
@@ -1192,8 +1311,15 @@ class WrsMainController(object):
         self.goto_name("standby_2a")
         log_start = len(self.detection_list)
 
-        # 落ちているブロックを避けて移動
-        reached = self.execute_avoid_blocks()
+        reached = False
+        if self.TASK2A_MODE == "grasp":
+            reached = self.execute_clear_blocks()
+            if not reached:
+                rospy.logwarn("task2a: could not clear the obstacles. avoid them with A*.")
+                self.change_pose("look_at_near_floor")
+        if not reached:
+            # 落ちているブロックを避けて移動
+            reached = self.execute_avoid_blocks()
 
         # 回避の移動でゴールに着けなかったときだけ move_base でゴールへ向かう
         # （着いているのに move_base を使うと、床の物体が見えない move_base が近くの物体に寄ることがある）
