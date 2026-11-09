@@ -277,11 +277,10 @@ class WrsMainController(object):
 
     def measure_object(self, bbox, detection, floor=False):
         """62418450 向井悠人
-        RGBと時刻の近い深度から対象の中心と見える範囲の寸法を推定する。
+        RGBと深度を照合し、計測結果、対象外の高さ、深度不足を区別する。
         """
         deadline = time.monotonic() + 0.5
         stamp = detection.header.stamp
-        cloud = None
         while not rospy.is_shutdown() and time.monotonic() < deadline:
             clouds = self.depth_clouds.copy()
             if clouds:
@@ -290,26 +289,38 @@ class WrsMainController(object):
                     break
             time.sleep(0.03)
         else:
-            return None
+            return "measurement_failed", None
         if not cloud.header.frame_id or cloud.height <= 1:
-            return None
+            return "measurement_failed", None
 
-        pixels = [(u, v)
-                  for v in range(max(0, bbox.y), min(cloud.height, bbox.y + bbox.h), 2)
-                  for u in range(max(0, bbox.x), min(cloud.width, bbox.x + bbox.w), 2)]
-        if not pixels:
-            return None
+        pixels = np.asarray([
+            (u, v) for v in range(max(0, bbox.y), min(cloud.height, bbox.y + bbox.h), 2)
+            for u in range(max(0, bbox.x), min(cloud.width, bbox.x + bbox.w), 2)
+        ])
+        if not len(pixels):
+            return "measurement_failed", None
+
+        other_boxes = [other for other in detection.bboxes
+                       if other is not bbox and self.bbox_iou(bbox, other) > 0
+                       and (other.label != bbox.label or self.bbox_iou(bbox, other) < 0.85)]
+        keep = np.ones(len(pixels), dtype=bool)
+        u, v = pixels.T
+        for other in other_boxes:
+            keep &= ~((other.x <= u) & (u < other.x + other.w)
+                      & (other.y <= v) & (v < other.y + other.h))
+        pixels = pixels[keep]
+        if len(pixels) < 15:
+            return "measurement_failed", None
+
+        uvs = [tuple(pixel) for pixel in pixels.tolist()]
         points = np.asarray(list(point_cloud2.read_points(
-            cloud, field_names=("x", "y", "z"), skip_nans=True, uvs=pixels)), dtype=float)
+            cloud, field_names=("x", "y", "z"), skip_nans=False, uvs=uvs)), dtype=float)
+        if points.shape != (len(pixels), 3):
+            return "measurement_failed", None
+        valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
+        points, pixels = points[valid], pixels[valid]
         if len(points) < 15:
-            return None
-        points = points[np.isfinite(points).all(axis=1) & (points[:, 2] > 0)]
-        ordered = points[np.argsort(points[:, 2])]
-        groups = np.split(ordered, np.flatnonzero(np.diff(ordered[:, 2]) > 0.035) + 1)
-        points = next((group for group in groups if len(group) >= max(15, len(points) * 0.12)),
-                      None)
-        if points is None:
-            return None
+            return "measurement_failed", None
 
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -317,16 +328,36 @@ class WrsMainController(object):
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as error:
             rospy.logwarn("Cannot measure %s: %s", bbox.label, error)
-            return None
+            return "measurement_failed", None
         rotation, translation = self.transform_arrays(transform)
-        points = points.dot(rotation.T) + translation
-        if floor:
-            points = points[(points[:, 2] > 0.012) & (points[:, 2] < 0.35)]
-        if len(points) < 15:
-            return None
+        world = points.dot(rotation.T) + translation
+        height = world[:, 2]
+        valid = ((height > 0.012) & (height < 0.35)) if floor else height >= 0.32
+        other_height = height >= 0.35 if floor else (height > 0.012) & (height < 0.32)
+        if np.all(other_height):
+            return "outside_height", None
+        world, depths, pixels = world[valid], points[valid, 2], pixels[valid]
+        if len(world) < 15:
+            return "measurement_failed", None
+
+        middle = np.array([bbox.x + bbox.w / 2, bbox.y + bbox.h / 2])
+        half_core = 0.28 * np.array([bbox.w, bbox.h])
+        core = np.all(np.abs(pixels - middle) <= half_core, axis=1)
+        order = np.argsort(depths)
+        groups = np.split(order, np.flatnonzero(np.diff(depths[order]) > 0.035) + 1)
+        ranked = sorted(
+            ((int(np.count_nonzero(core[group])), len(group), index)
+             for index, group in enumerate(groups)
+             if len(group) >= max(15, len(world) * 0.12)), reverse=True)
+        if (not ranked or ranked[0][0] < 4
+                or (len(ranked) > 1 and ranked[1][0] >= 0.65 * ranked[0][0])):
+            rospy.logwarn("Cannot associate depth confidently with %s", bbox.label)
+            return "measurement_failed", None
+
+        points = world[groups[ranked[0][2]]]
         low, high = np.percentile(points, [3, 97], axis=0)
-        return {"center": (low + high) / 2, "size": np.maximum(high - low, 0.015),
-                "points": points}
+        return "measured", {"center": (low + high) / 2,
+                            "size": np.maximum(high - low, 0.015), "points": points}
 
     @staticmethod
     def transform_arrays(transform):
@@ -938,7 +969,8 @@ class WrsMainController(object):
             if np.mean(edge) < 0.65:
                 continue
             detections.append({"kind": kind, "x": float(center[0]), "y": float(center[1]),
-                               "rim_z": table_z + height, "width": float(width),
+                               "rim_z": table_z + height, "support_z": table_z,
+                               "width": float(width),
                                "length": float(length)})
         return detections
 
@@ -1046,9 +1078,56 @@ class WrsMainController(object):
             self.sensor_placement_names.add(place)
             rospy.loginfo("Sensor placement %s: %s", place, json.dumps(item, sort_keys=True))
 
+    @staticmethod
+    def opening_bottom_height(place, kind, center, half, frames, rim_z):
+        """62418450 向井悠人
+        実測した深さか、支持面付近に見える底面から収納先の内底の高さを決める。
+        """
+        depths = rospy.get_param("~placement_inner_depths", {})
+        depth = depths.get(place, depths.get(kind)) if isinstance(depths, dict) else None
+        if depth is not None:
+            if (not isinstance(depth, (float, int)) or isinstance(depth, bool)
+                    or not math.isfinite(depth) or not 0.004 <= depth <= 0.45):
+                rospy.logwarn("Invalid measured opening depth for %s", place)
+                return None
+            return rim_z - depth
+
+        bottoms = []
+        for cloud, rim in frames:
+            support = rim.get("support_z")
+            if support is None:
+                return None
+            inside = np.all(np.abs(cloud[:, :2] - center) < half, axis=1)
+            heights = cloud[inside, 2]
+            # 台や床のすぐ上で、縁より低い面だけを底面の候補にする。
+            base = heights[(heights >= support - 0.005)
+                           & (heights <= min(support + 0.025, rim["rim_z"] - 0.004))]
+            if len(base) < 8:
+                return None
+            bottoms.append(float(np.median(base)))
+        if abs(bottoms[0] - bottoms[1]) > 0.010:
+            return None
+        return sum(bottoms) / len(bottoms)
+
+    @staticmethod
+    def opening_patch_is_clear(cloud, xy, extent, bottom, rim_z):
+        """62418450 向井悠人
+        置く範囲の四隅側で底面を確認し、底より高い物体がある候補を除外する。
+        """
+        relative = cloud[:, :2] - xy
+        inside = np.all(np.abs(relative) <= extent + 0.008, axis=1)
+        heights = cloud[inside, 2]
+        tolerance = min(0.009, max(0.003, (rim_z - bottom) * 0.28))
+        raised = (heights > bottom + tolerance) & (heights < rim_z + 0.25)
+        if np.count_nonzero(raised) >= 2:
+            return False
+        bottom_points = relative[inside][np.abs(heights - bottom) <= tolerance]
+        quadrants = {(x >= 0, y >= 0) for x, y in bottom_points}
+        return len(quadrants) == 4
+
     def measure_container_opening(self, place, pan, tilt, skip=None):
         """62418450 向井悠人
-        到着後の2フレームで同じ容器の縁と保持物を入れられる空きを探す。
+        到着後の2フレームで縁と底面を確かめ、保持物が入る空きを探す。
         """
         target = self.placement_targets[place]
         kind = target.get("kind", place.rsplit("_place", 1)[0])
@@ -1091,6 +1170,10 @@ class WrsMainController(object):
         center = np.array([(first[axis] + second[axis]) / 2 for axis in ("x", "y")])
         rim_z = max(first["rim_z"], second["rim_z"])
         half = min(first["width"], second["width"]) / (2 * math.sqrt(2)) - 0.008
+        bottom = self.opening_bottom_height(place, kind, center, half, frames, rim_z)
+        if bottom is None or bottom >= rim_z:
+            rospy.logwarn("Cannot confirm the bottom of %s", place)
+            return False
         rotation, _ = self.transform_arrays(self.hand_pose())
         extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
         slack = half - extent[:2] - 0.012
@@ -1100,16 +1183,8 @@ class WrsMainController(object):
             xy = center + np.asarray(shift) * slack
             if skip is not None and math.dist(xy, skip) < 0.012:
                 continue
-            free = True
-            for cloud, _ in frames:
-                inside = np.all(np.abs(cloud[:, :2] - xy) <= extent[:2] + 0.008, axis=1)
-                heights = cloud[inside, 2]
-                if (np.count_nonzero((heights < rim_z - 0.014) & (heights > rim_z - 0.30)) < 3
-                        or np.count_nonzero((heights >= rim_z - 0.014)
-                                            & (heights < rim_z + 0.25)) >= 3):
-                    free = False
-                    break
-            if free:
+            if all(self.opening_patch_is_clear(cloud, xy, extent[:2], bottom, rim_z)
+                   for cloud, _ in frames):
                 target.update(rim_z=rim_z, drop_x=float(xy[0]), drop_y=float(xy[1]),
                               opening_x=float(center[0]), opening_y=float(center[1]),
                               opening_half=half)
@@ -1438,13 +1513,127 @@ class WrsMainController(object):
             self.stop_base()
         return False
 
+    @staticmethod
+    def update_floor_obstacles(observation, obstacles, cleared):
+        """62418450 向井悠人
+        障害物を登録し、同じセルの床面を2回十分に観測した場合だけ消す。
+        """
+        floor, raised = observation
+        raised = {tuple(point) for point in raised}
+        observed_subcells = {}
+        for x, y in np.unique(np.floor(floor / 0.025).astype(int), axis=0):
+            cell = (x // 2, y // 2)
+            observed_subcells.setdefault(cell, set()).add((x % 2, y % 2))
+        for point in obstacles - raised:
+            cell = tuple(math.floor(value / 0.05) for value in point)
+            if len(observed_subcells.get(cell, ())) == 4:
+                cleared[point] = cleared.get(point, 0) + 1
+                if cleared[point] >= 2:
+                    obstacles.remove(point)
+                    cleared.pop(point, None)
+            else:
+                cleared.pop(point, None)
+        for point in raised:
+            cleared.pop(point, None)
+        obstacles.update(raised)
+
+    def route_step_target(self, current, path, obstacles, radius):
+        """62418450 向井悠人
+        計画線に沿う短い移動点を選び、壁と記憶した床の物体を横切る候補を除く。
+        """
+        if not path:
+            return None
+        origin = np.asarray(current)
+        selected = None
+        for point in path[1:]:
+            delta = np.asarray(point) - origin
+            length = float(np.linalg.norm(delta))
+            if length < 0.045:
+                continue
+            step = tuple(origin + delta * min(1.0, 0.30 / length))
+            wall_clear = self.wall_map is None or self.wall_segment_clear(
+                current, step, radius + 0.07)
+            if not wall_clear or any(self.dist_point_to_segment(obstacle, current, step)
+                                     < radius + 0.125 for obstacle in obstacles):
+                break
+            selected = step
+            if length >= 0.30:
+                break
+        return selected
+
+    def plan_floor_detour(self, current, path, obstacles, radius):
+        """62418450 向井悠人
+        壁と床の物体を避け、元の経路の先へ合流する局所A*経路を返す。
+        """
+        forward = [point for point in path if 0.60 <= math.dist(current, point) <= 1.6]
+        if math.dist(current, path[-1]) < 0.60:
+            forward = [path[-1]]
+        if not forward:
+            return None
+        joins = dict.fromkeys(min(forward, key=lambda point: abs(math.dist(current, point) - distance))
+                             for distance in (1.0, 1.5, 0.65))
+        for goal in joins:
+            bounds = tuple((min(a, b) - 0.65, max(a, b) + 0.65)
+                           for a, b in zip(current, goal))
+            candidate = self.plan_path_astar(
+                current, goal, obstacles, radius + 0.125, bounds=bounds, wall_radius=radius + 0.07)
+            if candidate and self.route_step_target(current, candidate, obstacles, radius):
+                return candidate
+        return None
+
+    def drive_observed_step(self, target, name, timeout_param, obstacles, cleared):
+        """62418450 向井悠人
+        床を観測してから短い目標へ進み、失敗時の床障害物も次の計画に残す。
+        """
+        current = self.get_robot_pose()
+        if current is None:
+            return False
+        heading = math.degrees(math.atan2(target[1] - current[1], target[0] - current[0]))
+        if not self.turn_base_toward(heading):
+            observation = self.observe_floor()
+            if observation is not None:
+                self.update_floor_obstacles(observation, obstacles, cleared)
+            return False
+        current = self.get_robot_pose()
+        if current is None:
+            return False
+        radius = self.base_radius_with_payload(current)
+        if radius is None:
+            return False
+        if self.wall_map is not None and not self.wall_segment_clear(
+                current[:2], target, radius + 0.07):
+            return False
+        for tilt in (-1.15, -0.85):
+            observation = self.observe_floor(tilt=tilt)
+            if observation is None:
+                continue
+            self.update_floor_obstacles(observation, obstacles, cleared)
+            floor, _ = observation
+            occupied = np.asarray(list(obstacles), dtype=float).reshape(-1, 2)
+            margin = radius - self.ROBOT_RADIUS + 0.09
+            if self.observed_segment_clear(current[:2], target, (floor, occupied), margin):
+                break
+        else:
+            rospy.logwarn("Floor not clear on the next segment to %s", name)
+            return False
+        if self.navigate_to_pose([*target, heading], name, timeout_param,
+                                 corridor=(current[:2], target)):
+            reached = self.get_robot_pose()
+            return reached is not None and math.dist(current[:2], reached[:2]) >= 0.035
+        observation = self.observe_floor()
+        if observation is not None:
+            self.update_floor_obstacles(observation, obstacles, cleared)
+        return False
+
     def navigate_checked(self, pos, name, timeout_param="~navigation_timeout"):
         """62418450 向井悠人
-        経路の次の短い区間を床観測で確認し、move_baseでその区間を進む。
+        観測した床障害物を保持して経路を引き直し、確認済みの短い区間を進む。
         """
         self.confirm_navigation_finished()
         if not self.arm_ready:
             return False
+        obstacles = set()
+        cleared = {}
         for _ in range(32):
             current = self.get_robot_pose()
             if current is None or rospy.is_shutdown():
@@ -1452,46 +1641,30 @@ class WrsMainController(object):
             if math.dist(current[:2], pos[:2]) <= 0.10:
                 return self.turn_base_toward(pos[2])
             path = self.plan_base_path(pos)
-            if not path:
-                return False
-            # 曲がった先へ飛ばず、経路上で現在地から20〜30cm先の点を選ぶ。
-            next_point = path[-1]
-            for point in path[1:]:
-                if math.dist(current[:2], point) >= 0.20:
-                    next_point = point
-                    break
-            delta = np.asarray(next_point) - np.asarray(current[:2])
-            distance = float(np.linalg.norm(delta))
-            if distance < 0.06:
-                return False
-            target = np.asarray(current[:2]) + delta * min(1.0, 0.30 / distance)
-            heading = math.degrees(math.atan2(delta[1], delta[0]))
-            if not self.turn_base_toward(heading):
-                return False
-            current = self.get_robot_pose()
-            if current is None:
+            if not path and (not obstacles or self.wall_map is None
+                             or math.dist(current[:2], pos[:2]) > 1.6):
                 return False
             radius = self.base_radius_with_payload(current)
             if radius is None:
                 return False
-            margin = radius - self.ROBOT_RADIUS + 0.09
-            observation = self.observe_floor()
-            if observation is None or not self.observed_segment_clear(
-                    current[:2], target, observation, margin):
-                observation = self.observe_floor(tilt=-0.85)
-                if observation is None or not self.observed_segment_clear(
-                        current[:2], target, observation, margin):
-                    rospy.logwarn("Floor not clear on the next segment to %s", name)
-                    return False
-            if self.wall_map is not None and not self.wall_segment_clear(
-                    current[:2], target, radius + 0.07):
+            radius = float(radius)
+            step = self.route_step_target(current[:2], path, obstacles, radius)
+            if step is not None and self.drive_observed_step(
+                    step, name, timeout_param, obstacles, cleared):
+                continue
+
+            current = self.get_robot_pose()
+            if current is None or not obstacles or self.wall_map is None:
                 return False
-            if not self.navigate_to_pose([*target, heading], name, timeout_param,
-                                         corridor=(current[:2], target)):
+            # 同じ直線を再送せず、床の占有セルを足した地図で先の経路へ合流する。
+            route = path or [current[:2], tuple(pos[:2])]
+            detour = self.plan_floor_detour(current[:2], route, obstacles, radius)
+            step = self.route_step_target(current[:2], detour, obstacles, radius)
+            if step is None or not self.drive_observed_step(
+                    step, name + "_detour", timeout_param, obstacles, cleared):
+                rospy.logwarn("No checked detour to %s", name)
                 return False
-            reached = self.get_robot_pose()
-            if reached is None or math.dist(current[:2], reached[:2]) < 0.035:
-                return False
+            rospy.loginfo("Used checked detour towards %s via %s", name, step)
         rospy.logwarn("Checked navigation used its segment limit for %s", name)
         return False
 
@@ -1733,11 +1906,13 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     def observe_pick_candidate(self, pose, floor=False, attempted=(), label=None,
-                               previous=None, shelf=False):
+                               previous=None, shelf=False, allow_approach=False):
         """62418450 向井悠人
-        新しい観測から、指定条件と把持範囲を満たす候補を選ぶ。
+        検出と深度から候補を選び、観測失敗と候補なしを区別する。
         """
         tilt = self.poses[pose]["head_tilt_joint"]
+        observed = False
+        unmeasured = False
         for pan in (0.0, 0.45 if previous is None else -0.45):
             if not self.point_head(pan, tilt):
                 continue
@@ -1746,7 +1921,8 @@ class WrsMainController(object):
                 continue
             base = self.get_robot_pose()
             if base is None:
-                return None
+                return "observation_failed", None
+            observed = True
             ranked = sorted(detection.bboxes, key=self.calc_score_bbox, reverse=True)
             candidates = []
             for bbox in ranked:
@@ -1754,26 +1930,57 @@ class WrsMainController(object):
                         or (label is not None and bbox.label != label)
                         or (not shelf and self.placement_category(bbox.label) is None)):
                     continue
-                item = self.measure_object(bbox, detection, floor)
-                if item is None or (not floor and item["center"][2] < 0.32):
+                measurement, item = self.measure_object(bbox, detection, floor)
+                if measurement == "measurement_failed":
+                    unmeasured = True
+                if item is None:
                     continue
                 center = item["center"]
                 reach = math.hypot(center[0] - base[0], center[1] - base[1])
-                if (reach < 0.25 or reach > 0.95
+                if (reach < 0.25 or (reach > 0.95 and not allow_approach)
                         or (previous is not None and math.dist(center, previous) > 0.18)
                         or any(bbox.label == kind and math.dist(center, location) < 0.12
                                for kind, location in attempted)):
                     continue
                 item["label"] = bbox.label
                 item["placement"] = self.planned_placement(bbox.label) if not shelf else None
-                if not floor:
-                    return item
-                # 台車の進行方向付近にある床の物体を先に検討する。
                 lateral = abs(-math.sin(base[2]) * (center[0] - base[0])
                               + math.cos(base[2]) * (center[1] - base[1]))
-                candidates.append((lateral > 0.32, reach, item))
+                # 床では進行方向を優先し、机と棚では検出スコア順を保つ。
+                priority = (lateral > 0.32, reach) if floor else (reach > 0.95,)
+                candidates.append((priority, item))
             if candidates:
-                return min(candidates, key=lambda entry: entry[:2])[2]
+                return "found", min(candidates, key=lambda entry: entry[0])[1]
+        return ("empty" if observed and not unmeasured else "observation_failed"), None
+
+    def approach_pick_candidate(self, item, pose, floor):
+        """62418450 向井悠人
+        遠い物体へ床を確認しながら接近し、停止後の再計測で同じ個体を選ぶ。
+        """
+        center = np.asarray(item["center"], dtype=float)
+        base = self.get_robot_pose()
+        if base is None:
+            return None
+        direction = np.asarray(base[:2]) - center[:2]
+        distance = float(np.linalg.norm(direction))
+        if not math.isfinite(distance) or distance < 0.25:
+            return None
+        if distance <= 0.95:
+            # すでに把持範囲に入った場合も、現在地から新しく測る。
+            _, fresh = self.observe_pick_candidate(
+                pose, floor, label=item["label"], previous=center)
+            return fresh
+
+        direction /= distance
+        side = np.array([-direction[1], direction[0]])
+        for offset in (0.0, -0.15, 0.15):
+            stop = center[:2] + 0.64 * direction + offset * side
+            heading = math.degrees(math.atan2(center[1] - stop[1], center[0] - stop[0]))
+            if self.navigate_checked([*stop, heading], "grasp_approach"):
+                _, fresh = self.observe_pick_candidate(
+                    pose, floor, label=item["label"], previous=center)
+                if fresh is not None:
+                    return fresh
         return None
 
     def observe_detections(self):
@@ -1800,7 +2007,7 @@ class WrsMainController(object):
             if self.hand_state != "empty" or not self.arm_ready or attempt == 2:
                 break
             rospy.loginfo("Reobserving %s after grasp failure (view=%s)", item["label"], view)
-            fresh = self.observe_pick_candidate(
+            _, fresh = self.observe_pick_candidate(
                 pose, floor, label=item["label"], previous=item["center"], shelf=shelf)
             if fresh is None:
                 break
@@ -1809,65 +2016,86 @@ class WrsMainController(object):
 
     def execute_task1(self):
         """62418450 向井悠人
-        床、机の順に片付け、配置後は現在地から次の物体を探す。
+        床、机の順に片付け、観測失敗、動作失敗、探索終了を別々に返す。
         """
         rospy.loginfo("#### start Task 1 ####")
         phases = ((True, ("near_long_table_l",), "look_at_near_floor"),
                   (False, ("tall_table", "long_table_r"), "look_at_tall_table"))
         attempted = []
         placed = 0
+        incomplete = False
         started = rospy.Time.now()
         limit = float(rospy.get_param("~task1_time_limit", 14 * 60))
         for floor, places, search_pose in phases:
             views = list(places)
-            scans = 0
             last_view = None
-            while scans < 12 * len(places) and not rospy.is_shutdown():
+            status = "empty"
+            for _ in range(12 * len(places)):
+                if rospy.is_shutdown():
+                    return "motion_failed"
                 if limit > 0 and (rospy.Time.now() - started).to_sec() >= limit:
                     rospy.loginfo("Task 1 search budget used; placements=%d", placed)
-                    return True
-                scans += 1
+                    return "time_budget"
                 current = self.get_robot_pose()
                 if current is None:
-                    return False
-                if not self.turn_base_toward(self.coordinates["positions"][places[0]][2]):
-                    item = None
-                else:
-                    item = self.observe_pick_candidate(search_pose, floor, attempted)
+                    return "motion_failed"
+                status, item = "observation_failed", None
+                if self.turn_base_toward(self.coordinates["positions"][places[0]][2]):
+                    status, item = self.observe_pick_candidate(
+                        search_pose, floor, attempted, allow_approach=True)
                 if item is None:
-                    if not views:
+                    while views:
+                        name = min(views, key=lambda view: math.dist(
+                            current[:2], self.coordinates["positions"][view][:2]))
+                        views.remove(name)
+                        if self.navigate_checked(self.coordinates["positions"][name], name):
+                            last_view = name
+                            break
+                        current = self.get_robot_pose()
+                        if current is None:
+                            return "motion_failed"
+                    else:
                         break
-                    name = min(views, key=lambda view: math.hypot(
-                        current[0] - self.coordinates["positions"][view][0],
-                        current[1] - self.coordinates["positions"][view][1]))
-                    views.remove(name)
-                    if self.navigate_checked(self.coordinates["positions"][name], name):
-                        last_view = name
                     continue
 
-                if limit > 0 and (rospy.Time.now() - started).to_sec() >= limit:
-                    return True
                 attempted.append((item["label"], tuple(item["center"])))
+                if math.dist(current[:2], item["center"][:2]) > 0.95:
+                    item = self.approach_pick_candidate(item, search_pose, floor)
+                    if item is None:
+                        rospy.logwarn("Task 1: could not safely approach or reobserve %s",
+                                      attempted[-1][0])
+                        incomplete = True
+                        continue
+                if limit > 0 and (rospy.Time.now() - started).to_sec() >= limit:
+                    rospy.loginfo("Task 1 search budget used; placements=%d", placed)
+                    return "time_budget"
                 grasped, item = self.try_pick_object(item, search_pose, floor, last_view)
                 identity = (item["label"], tuple(item["center"]))
                 if identity != attempted[-1]:
                     attempted.append(identity)
                 if not grasped:
-                    if not (self.hand_state == "empty" and self.arm_ready):
+                    if self.hand_state != "empty" or not self.arm_ready:
                         if not self.recover_after_transport():
-                            return False
+                            return "motion_failed"
                     continue
 
                 completed = self.put_object_by_label(item["label"], item["placement"])
                 if completed or self.last_placement_result.get("released", False):
                     placed += 1
-                if not (self.hand_state == "empty" and self.arm_ready):
+                if self.hand_state != "empty" or not self.arm_ready:
                     if not self.recover_after_transport():
                         rospy.logerr("Cannot resume Task 1 after placement failure")
-                        return False
+                        return "motion_failed"
 
-        rospy.loginfo("#### finish Task 1 #### placement motions completed=%d", placed)
-        return True
+            if status == "observation_failed":
+                rospy.logwarn("Task 1: no usable %s observation after trying available views",
+                              "floor" if floor else "table")
+                incomplete = True
+
+        result = "observation_failed" if incomplete else "completed"
+        rospy.loginfo("#### finish Task 1 #### outcome=%s placement motions completed=%d",
+                      result, placed)
+        return result
 
     # ------------------------------------------------------------------
     # Task 2a / 2b（担当 C）
@@ -2038,17 +2266,24 @@ class WrsMainController(object):
             return False
         attempted = []
         for label in ((target_obj, None) if target_obj is not None else (None,)):
-            item = self.observe_pick_candidate(
+            status, item = self.observe_pick_candidate(
                 "look_at_shelf", label=label, attempted=attempted, shelf=True)
+            if status == "observation_failed":
+                rospy.logwarn("Task 2b: shelf observation failed (requested label=%s)", label)
             if item is None:
                 continue
+            attempted.append((item["label"], tuple(item["center"])))
             grasped, item = self.try_pick_object(item, "look_at_shelf", False, shelf=True)
             if grasped:
                 break
-            attempted.append((item["label"], tuple(item["center"])))
+            identity = (item["label"], tuple(item["center"]))
+            if identity != attempted[-1]:
+                attempted.append(identity)
             if self.hand_state != "empty" or not self.arm_ready:
-                self.recover_after_transport()
-                return False
+                if not self.recover_after_transport():
+                    return False
+                if not self.move_placement_pose("look_at_shelf"):
+                    return False
         else:
             rospy.logwarn("Task 2b: no deliverable object")
             return False
@@ -2212,19 +2447,20 @@ class WrsMainController(object):
             rospy.loginfo("obstacle %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
             self.add_obstacle(obstacles, (pos.x, pos.y))
 
-    def plan_path_astar(self, start, goal, obstacles, safe_dist):
+    def plan_path_astar(self, start, goal, obstacles, safe_dist, bounds=None, wall_radius=None):
         """62418450 向井悠人
         TASK2A_GRID 間隔の格子の上で、start から goal までの経路を A* で探す。
         - 障害物から safe_dist 未満の格子は通れない（start の格子だけは例外）
         - 障害物から TASK2A_SOFT_DIST 未満の格子は、近いほどコストを上乗せする
           （ぎりぎりを通らず、余裕のある経路を選ぶため）
         - 8近傍で移動し、ヒューリスティックはゴールまでの直線距離
-        壁と床の物体を避ける経路を返し、経路がなければNoneを返す。
+        Task 2aまたは指定の探索範囲で壁と床の物体を避ける経路を返す。
         """
         cls = type(self)
         res = cls.TASK2A_GRID
-        x_min, x_max = cls.TASK2A_PLAN_X
-        y_min, y_max = cls.TASK2A_PLAN_Y
+        (x_min, x_max), (y_min, y_max) = bounds or (cls.TASK2A_PLAN_X, cls.TASK2A_PLAN_Y)
+        if not all(x_min <= x <= x_max and y_min <= y <= y_max for x, y in (start, goal)):
+            return None
         n_x = int(round((x_max - x_min) / res)) + 1
         n_y = int(round((y_max - y_min) / res)) + 1
 
@@ -2255,7 +2491,7 @@ class WrsMainController(object):
             return clearance_cache[cell]
 
         start_cell, goal_cell = to_cell(start), to_cell(goal)
-        if clearance(goal_cell) < safe_dist or not self.wall_segment_clear(goal, goal):
+        if clearance(goal_cell) < safe_dist or not self.wall_segment_clear(goal, goal, wall_radius):
             return None
 
         def heuristic(cell):
@@ -2291,7 +2527,7 @@ class WrsMainController(object):
                         continue
                     clr = clearance(nxt)
                     if clr < safe_dist or not self.is_segment_free(
-                            to_xy(cell), to_xy(nxt), obstacles, safe_dist):
+                            to_xy(cell), to_xy(nxt), obstacles, safe_dist, wall_radius):
                         continue
                     step = math.hypot(d_x, d_y) * res
                     penalty = cls.TASK2A_CLEAR_WEIGHT * max(0.0, cls.TASK2A_SOFT_DIST - clr)
@@ -2349,11 +2585,11 @@ class WrsMainController(object):
                    and distances[y, x] >= margin + resolution * math.sqrt(2)
                    for x, y in indices)
 
-    def is_segment_free(self, seg_start, seg_end, obstacles, safe_dist):
+    def is_segment_free(self, seg_start, seg_end, obstacles, safe_dist, wall_radius=None):
         """62418450 向井悠人
-        線分全体で、壁と床上の障害物の両方から距離を確保できるか調べる。
+        台車や保持物の幅を含め、線分全体が壁と床上の障害物を避けるか調べる。
         """
-        return (self.wall_segment_clear(seg_start, seg_end)
+        return (self.wall_segment_clear(seg_start, seg_end, wall_radius)
                 and all(self.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
                         for obs in obstacles))
 
@@ -2579,24 +2815,22 @@ class WrsMainController(object):
 
     def execute_avoid_blocks(self):
         """62418450 向井悠人
-        壁と床を確認して短く進み、行き止まりでは観測位置を変えて再計画する。
+        障害物の記録を使って短く進み、観測不足の区間は再計測してから判断する。
         """
         history = []
         attempted = set()
+        observation_misses = {}
         obstacles = set()
+        cleared = {}
         for iteration in range(self.TASK2A_MAX_MOVES * 2):
             pose = self.get_robot_pose()
             if pose is None or rospy.is_shutdown():
                 return False
             current = pose[:2]
-            observations = [self.observe_floor(pan, -1.0)
-                            for pan in ((0.0, -0.7, 0.7) if iteration == 0 else (0.0,))]
-            observations = [entry for entry in observations if entry is not None]
-            for floor, raised in observations:
-                # 以前の障害物も、同じ位置に床が見えるまで候補として残す。
-                obstacles = {point for point in obstacles
-                             if np.min(np.linalg.norm(floor - point, axis=1)) > 0.03}
-                obstacles.update(tuple(point) for point in raised)
+            for pan in ((0.0, -0.7, 0.7) if iteration == 0 else (0.0,)):
+                observation = self.observe_floor(pan, -1.0)
+                if observation is not None:
+                    self.update_floor_obstacles(observation, obstacles, cleared)
             goal = self.find_free_goal(obstacles)
             if goal is not None and math.dist(current, goal) <= 0.09:
                 return True
@@ -2605,30 +2839,36 @@ class WrsMainController(object):
             if history:
                 alternatives.append(history[-1])
             moved = False
+            needs_reobserve = False
             for target in [primary] + alternatives:
                 if target is None:
                     continue
                 edge = tuple(round(value, 1) for value in (*current, *target))
-                if edge in attempted or not self.is_segment_free(
-                        current, target, obstacles, self.TASK2A_SAFE_DISTS[-1]):
+                reversing = bool(history) and target == history[-1]
+                if (edge in attempted or (not reversing and observation_misses.get(edge, 0) >= 2)
+                        or not self.is_segment_free(
+                            current, target, obstacles, self.TASK2A_SAFE_DISTS[-1])):
                     continue
-                attempted.add(edge)
                 pan = self.side_to_look(pose, target) or 0.0
                 observation = self.observe_floor(pan, -1.0)
-                reversing = bool(history) and target == history[-1]
                 if observation is not None:
-                    obstacles.update(tuple(point) for point in observation[1])
+                    self.update_floor_obstacles(observation, obstacles, cleared)
                 if not self.is_segment_free(current, target, obstacles,
                                             self.TASK2A_SAFE_DISTS[-1]):
                     continue
                 if not reversing and not (
                         observation is not None
                         and self.observed_segment_clear(current, target, observation)):
+                    misses = observation_misses.get(edge, 0) + 1
+                    observation_misses[edge] = misses
+                    needs_reobserve = needs_reobserve or misses < 2
                     continue
+                attempted.add(edge)
                 result = self.move_straight_to(target, obstacles)
                 rospy.loginfo("Task 2a segment %s: %s", target, result)
                 moved = True
                 if result == "reached":
+                    observation_misses.clear()
                     if reversing:
                         history.pop()
                     else:
@@ -2639,7 +2879,7 @@ class WrsMainController(object):
                         # 直前に通った同じ線分だけを戻り、新しい方向は次の観測で決める。
                         self.move_straight_to(current, obstacles, watch=False)
                 break
-            if not moved:
+            if not moved and not needs_reobserve:
                 rospy.logwarn("Task 2a: alternate views and known retreat exhausted")
                 return False
         return False
@@ -2733,23 +2973,29 @@ class WrsMainController(object):
         if self.hand_state != "empty":
             return
         try:
-            rospy.wait_for_service("detection/get_object_detection", timeout=30.0)
             self.read_placement_cloud(rospy.Time.now(), stride=8)
         except (ValueError, rospy.ROSException, tf2_ros.LookupException,
                 tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as error:
-            rospy.logerr("Cannot start without depth and detector services: %s", error)
+            rospy.logerr("Cannot start without depth: %s", error)
             return
-        if self.get_robot_pose() is None or self.observe_detections() is None:
-            rospy.logerr("Cannot start without localization and a fresh RGB detection response")
+        if self.get_robot_pose() is None:
+            rospy.logerr("Cannot start without localization")
             return
+        try:
+            rospy.wait_for_service("detection/get_object_detection", timeout=30.0)
+        except rospy.ROSException as error:
+            rospy.logwarn("RGB detector unavailable at startup: %s", error)
         self.arm_ready = self.move_placement_pose("all_neutral")
         if not self.arm_ready:
             rospy.logerr("Cannot reach initial pose")
             return
         self.load_wall_map()
-        if not self.execute_task1() or self.hand_state != "empty" or not self.arm_ready:
+        task1_result = self.execute_task1()
+        if task1_result == "motion_failed" or self.hand_state != "empty" or not self.arm_ready:
             rospy.logerr("Task 1 could not finish with an empty hand and safe arm pose")
             return
+        if task1_result == "observation_failed":
+            rospy.logwarn("Continuing to Task 2 with incomplete Task 1 observations")
         self.instruction_cursor = len(self.instruction_list)
         self.execute_task2a()
         self.execute_task2b()
