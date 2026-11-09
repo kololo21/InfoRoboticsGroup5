@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>実験ダッシュボード</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #1c2330; --muted: #667085; --line: #dfe3ea;
+  --accent: #2457d6; --accent-ink: #ffffff; --ok: #1a7f4b; --warn: #b26a00; --bad: #c0352b;
+  --ok-bg: #e4f4ea; --warn-bg: #fff1d6; --bad-bg: #fbe4e1; --code: #0f1623; --code-ink: #d7dde8;
+  --s0: #2457d6; --s1: #d9480f; --s2: #1a7f4b; --s3: #8a3ffc; --s4: #b8860b; --s5: #0e7490;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11151c; --card: #1a202b; --ink: #e6e9ef; --muted: #98a2b3; --line: #2b3342;
+    --accent: #6c97ff; --accent-ink: #0b1220; --ok: #5fd08f; --warn: #f0b24a; --bad: #ff8a80;
+    --ok-bg: #173826; --warn-bg: #3a2c10; --bad-bg: #3d1d1a; --code: #0a0e14; --code-ink: #cdd5e2;
+    --s0: #6c97ff; --s1: #ff9a62; --s2: #5fd08f; --s3: #b794ff; --s4: #e0b84a; --s5: #4fc3dc;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, "Hiragino Sans", "Yu Gothic UI", "Noto Sans JP", sans-serif; }
+header { padding: 18px 16px 6px; max-width: 1100px; margin: 0 auto; display: flex; gap: 12px;
+  align-items: baseline; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; }
+.sub { color: var(--muted); font-size: 13px; }
+main { max-width: 1100px; margin: 0 auto; padding: 8px 16px 48px; display: grid; gap: 14px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.stat { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.stat .k { color: var(--muted); font-size: 12px; }
+.stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; margin-right: 4px;
+  background: var(--bad-bg); color: var(--bad); }
+.chip.running { background: var(--ok-bg); color: var(--ok); }
+.chip.none { background: var(--line); color: var(--muted); }
+button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  padding: 6px 12px; border-radius: 7px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+select, input[type=text], input[type=number] { font: inherit; padding: 5px 8px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+input[type=number] { width: 72px; }
+label.chk { display: inline-flex; gap: 4px; align-items: center; margin-right: 6px; }
+.form { display: grid; gap: 10px; }
+.form .line { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.form .line > span.t { color: var(--muted); font-size: 13px; min-width: 56px; }
+progress { width: 220px; height: 10px; accent-color: var(--accent); }
+pre.log { background: var(--code); color: var(--code-ink); border-radius: 8px; padding: 10px 12px; margin: 10px 0 0;
+  max-height: 260px; overflow: auto; font: 12px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; white-space: nowrap; }
+td.num, th.num { text-align: right; }
+tr.res { cursor: pointer; }
+tr.res:hover { background: var(--bg); }
+tr.sel { background: var(--bg); }
+.lv { font-weight: 600; }
+.lv.Lv1 { color: var(--warn); } .lv.Lv2 { color: var(--ok); }
+.tablewrap { overflow-x: auto; }
+.detail { border-top: 2px solid var(--accent); margin-top: 12px; padding-top: 12px; display: grid; gap: 12px; }
+.bars div { display: grid; grid-template-columns: 190px 1fr 70px; gap: 8px; align-items: center; font-size: 13px; }
+.bars i { display: block; height: 10px; border-radius: 4px; background: var(--bad); opacity: .75; }
+.legend span { margin-right: 12px; font-size: 12px; }
+.legend b { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
+.muted { color: var(--muted); }
+.toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg);
+  padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.on { opacity: 1; }
+.banner { background: var(--bad-bg); color: var(--bad); border-radius: 8px; padding: 8px 12px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>実験ダッシュボード</h1>
+  <span class="sub" id="dir"></span>
+</header>
+<main>
+  <div class="banner" id="banner"></div>
+
+  <section>
+    <h2>環境</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">コンテナ</div><div class="v" id="containers">–</div></div>
+      <div class="stat"><div class="k">Seed(シミュレータ側)</div><div class="v" id="seed">–</div></div>
+      <div class="stat"><div class="k">現在のスコア</div><div class="v" id="score">–</div></div>
+      <div class="stat"><div class="k">ジョブ</div><div class="v" id="jobstate">なし</div></div>
+    </div>
+    <div class="row">
+      <button id="b-up">起動</button>
+      <button id="b-restart">シミュレータ再起動</button>
+      <button id="b-stop">停止</button>
+      <span class="muted">Seed</span>
+      <select id="seedsel"></select>
+      <button id="b-seed">Seedを切り替える(再起動あり)</button>
+      <span class="muted">|</span>
+      <a id="l-sim" target="_blank" rel="noopener">シミュレータ画面 :3000</a>
+      <a id="l-ide" target="_blank" rel="noopener">WebIDE :3001</a>
+    </div>
+  </section>
+
+  <section>
+    <h2>実験を実行</h2>
+    <div class="form">
+      <div class="line"><span class="t">Seed</span><span id="seeds"></span></div>
+      <div class="line">
+        <span class="t">回数</span><input type="number" id="repeat" min="1" max="20" value="3">
+        <span class="t">版</span>
+        <select id="variant">
+          <option value="main">統合版 wrs_main_node.py</option><option value="a">a</option>
+          <option value="b">b</option><option value="c">c</option>
+        </select>
+        <span class="t">検出器</span>
+        <select id="detector"><option value="">既定(版による)</option><option value="yolo">YOLO</option><option value="frcnn">Faster R-CNN</option></select>
+        <span class="t">ラベル</span><input type="text" id="label" size="16">
+      </div>
+      <div class="line">
+        <label class="chk"><input type="checkbox" id="headless" checked>画面なし(高速)</label>
+        <label class="chk"><input type="checkbox" id="interleave" checked>Seedを交互に実行</label>
+        <span class="t">1回の上限</span><input type="number" id="timeout" min="60" max="3600" value="900"><span class="muted">秒</span>
+        <button class="primary" id="b-run">実行</button>
+        <button class="danger" id="b-abort">中止</button>
+      </div>
+    </div>
+    <div id="jobbox" style="display:none">
+      <div class="row" style="margin-top:12px">
+        <progress id="prog" value="0" max="1"></progress><span id="progtxt" class="muted"></span>
+      </div>
+      <pre class="log" id="joblog"></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>結果 <span class="sub">合計 = 各Seed平均の和 / robust = 平均−ばらつきの和 / worst = 最低点の和 / n が3未満の差は誤差に近い</span></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>日時</th><th>ラベル</th><th>版 / 検出器</th><th>git</th><th class="num">n</th>
+          <th class="num">合計</th><th class="num">robust</th><th class="num">worst</th><th>Lv</th><th>Seed別 平均±ばらつき</th></tr></thead>
+        <tbody id="results"><tr><td colspan="10" class="muted">まだ結果がありません</td></tr></tbody>
+      </table>
+    </div>
+    <div id="detail"></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const SEEDS = ["86", "25", "1", "31", "36", "59"];
+const COLORS = ["var(--s0)", "var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)"];
+const KIND = {up: "起動中", stop: "停止中", restart_sim: "シミュレータ再起動中", seed: "Seed切替中", run: "実験実行中"};
+const $ = id => document.getElementById(id);
+let token = new URLSearchParams(location.search).get("token") || sessionStorage.getItem("token") || "";
+if (token) { sessionStorage.setItem("token", token); history.replaceState(null, "", location.pathname); }
+let jobRunning = false, lastJobKey = "", selectedName = null, resultsCache = [];
+
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); setTimeout(() => t.classList.remove("on"), 2600); }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
+function fmt(v, d = 1) { return v === null || v === undefined || isNaN(v) ? "–" : Number(v).toFixed(d); }
+
+async function api(path, body) {
+  const opt = {headers: {"X-Token": token}};
+  if (body) { opt.method = "POST"; opt.body = JSON.stringify(body); opt.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, opt);
+  let data = {}; try { data = await r.json(); } catch (e) {}
+  if (r.status === 403) { $("banner").style.display = "block";
+    $("banner").textContent = "token が違います。サーバーのターミナルに表示された URL(?token=...)から開き直してください。"; throw new Error("403"); }
+  return {ok: r.ok, status: r.status, data};
+}
+async function act(body, okMsg) {
+  const r = await api("/api/action", body);
+  toast(r.data.message || r.data.error || okMsg || "完了");
+  refresh();
+}
+
+/* ---- 環境 ---- */
+function renderStatus(s) {
+  $("dir").textContent = s.dir;
+  const c = s.containers || {}, names = ["xserver", "simulator", "workspace"];
+  $("containers").innerHTML = names.map(n => `<span class="chip ${c[n] === "running" ? "running" : (c[n] ? "" : "none")}" title="${n}">${n}</span>`).join("");
+  $("seed").textContent = s.seed || "–";
+  $("score").textContent = s.score === null || s.score === undefined ? "–" : fmt(s.score, 0);
+  const job = s.job; jobRunning = !!(job && job.running);
+  $("jobstate").textContent = jobRunning ? (KIND[job.kind] || job.kind) + ` ${job.elapsed}秒` : (job ? "完了" : "なし");
+  for (const id of ["b-up", "b-restart", "b-stop", "b-seed", "b-run"]) $(id).disabled = jobRunning;
+  $("b-abort").disabled = !jobRunning;
+  const box = $("jobbox");
+  if (job) {
+    box.style.display = "block";
+    const p = job.progress;
+    if (p) { $("prog").max = Math.max(1, p.total); $("prog").value = p.done;
+      $("progtxt").textContent = `${p.done} / ${p.total} 回完了` + (p.current && job.running ? ` (今: Seed ${p.current[0]} の ${p.current[1]} 回目)` : "")
+        + (job.exit !== null && job.exit !== undefined ? `  終了コード ${job.exit}` : ""); }
+    else { $("prog").max = 1; $("prog").value = job.running ? 0 : 1; $("progtxt").textContent = job.running ? "" : `終了コード ${job.exit}`; }
+    const log = $("joblog"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = job.log; if (atEnd) log.scrollTop = log.scrollHeight;
+    const key = job.kind + (job.out || "") + (job.running ? "r" : "d");
+    if (key !== lastJobKey) { lastJobKey = key; if (!job.running) loadResults(); }
+  } else box.style.display = "none";
+}
+async function refresh() {
+  try { const r = await api("/api/status"); if (r.ok) { $("banner").style.display = "none"; renderStatus(r.data); } } catch (e) {}
+}
+
+/* ---- 結果 ---- */
+function dateOf(name) { return `${name.slice(4, 6)}/${name.slice(6, 8)} ${name.slice(9, 11)}:${name.slice(11, 13)}`; }
+function labelOf(name) { return name.slice(16); }
+function seedText(ps) { return Object.keys(ps).sort((a, b) => b - a).map(k => `S${k}: ${fmt(ps[k].mean, 0)}±${fmt(ps[k].sd, 0)}`).join("  "); }
+async function loadResults() {
+  const r = await api("/api/results"); if (!r.ok) return;
+  resultsCache = r.data;
+  const tb = $("results");
+  if (!r.data.length) { tb.innerHTML = '<tr><td colspan="10" class="muted">まだ結果がありません</td></tr>'; return; }
+  tb.innerHTML = r.data.map(x => {
+    const m = x.meta || {};
+    const git = m.git_commit ? `${esc(m.git_branch)}@${esc(m.git_commit)}${m.git_dirty && m.git_dirty !== "0" ? "+" : ""}` : "–";
+    return `<tr class="res ${x.name === selectedName ? "sel" : ""}" data-n="${x.name}"><td>${dateOf(x.name)}</td><td>${esc(labelOf(x.name))}</td>
+      <td>${esc(m.variant || "–")} / ${esc(m.detector || "–")}</td><td class="muted">${git}</td><td class="num">${x.n}</td>
+      <td class="num"><b>${fmt(x.total)}</b></td><td class="num">${fmt(x.robust)}</td><td class="num">${fmt(x.worst, 0)}</td>
+      <td class="lv ${x.level}">${x.level}</td><td>${esc(seedText(x.per_seed))}</td></tr>`;
+  }).join("");
+  tb.querySelectorAll("tr.res").forEach(tr => tr.onclick = () => showDetail(tr.dataset.n));
+}
+function chart(runs) {
+  const W = 640, H = 210, L = 38, B = 22, T = 8, R = 8;
+  let tmax = 1, vmax = 10;
+  runs.forEach(r => r.timeline.forEach(([t, v]) => { tmax = Math.max(tmax, t); vmax = Math.max(vmax, v); }));
+  vmax = Math.ceil(vmax / 20) * 20;   // 目盛りが5の倍数になるように
+  const x = t => L + (W - L - R) * t / tmax, y = v => H - B - (H - B - T) * v / vmax;
+  const seedIdx = {}; let k = 0;
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="スコアの推移">`;
+  for (let i = 0; i <= 4; i++) { const v = vmax * i / 4;
+    svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${L - 4}" y="${y(v) + 4}" font-size="10" fill="var(--muted)" text-anchor="end">${Math.round(v)}</text>`; }
+  svg += `<text x="${W - R}" y="${H - 6}" font-size="10" fill="var(--muted)" text-anchor="end">シミュレーション時間 ${Math.round(tmax)}秒</text>`;
+  runs.forEach(r => {
+    if (!(r.seed in seedIdx)) seedIdx[r.seed] = k++;
+    const pts = r.timeline; if (pts.length < 2) return;
+    let d = `M${x(pts[0][0])},${y(pts[0][1])}`;
+    for (let i = 1; i < pts.length; i++) d += ` H${x(pts[i][0])} V${y(pts[i][1])}`;
+    svg += `<path d="${d}" fill="none" stroke="${COLORS[seedIdx[r.seed] % 6]}" stroke-width="1.8" opacity=".85"/>`;
+  });
+  svg += "</svg>";
+  const legend = Object.keys(seedIdx).map(s => `<span><b style="background:${COLORS[seedIdx[s] % 6]}"></b>Seed ${s}</span>`).join("");
+  return svg + `<div class="legend">${legend}</div>`;
+}
+function failureAgg(d) {
+  const sum = {}; (d.failures || []).forEach(f => sum[f.category] = (sum[f.category] || 0) + Number(f.count));
+  const nRuns = Math.max(1, d.runs.length);
+  return Object.entries(sum).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({k, v, avg: v / nRuns}));
+}
+function markdownRows(d) {
+  const m = d.meta || {}, date = dateOf(d.name).split(" ")[0];
+  const fails = failureAgg(d).slice(0, 3).map(f => `${f.k}(${f.avg.toFixed(1)}/回)`).join("、") || "–";
+  const tag = `${labelOf(d.name)} (${m.variant || "main"}, ${m.detector || "default"}${m.git_commit ? ", " + m.git_commit : ""})`;
+  return Object.keys(d.per_seed).sort((a, b) => b - a).map(s => {
+    const p = d.per_seed[s];
+    return `| ${date} | ${s} | ${tag} | – | – | – | ${fmt(p.mean, 0)} (n=${p.n}, ±${fmt(p.sd, 0)}) | ${fails} |`;
+  }).join("\n");
+}
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); }
+  catch (e) { const ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+  toast("コピーしました");
+}
+async function showDetail(name) {
+  selectedName = name; document.querySelectorAll("tr.res").forEach(tr => tr.classList.toggle("sel", tr.dataset.n === name));
+  const r = await api("/api/result?name=" + encodeURIComponent(name)); if (!r.ok) return;
+  const d = r.data, f = failureAgg(d), fmax = Math.max(1, ...f.map(x => x.v));
+  const m = d.meta || {};
+  $("detail").innerHTML = `<div class="detail">
+    <div class="row"><b>${esc(name)}</b><span class="muted">${esc(m.variant || "")} / ${esc(m.detector || "")} / ${esc(m.git_branch || "")}@${esc(m.git_commit || "")} ${m.git_dirty && m.git_dirty !== "0" ? "(未コミットの変更あり)" : ""}</span>
+      <button id="b-md">実行記録(Markdown)をコピー</button></div>
+    ${chart(d.runs)}
+    <div class="tablewrap"><table><thead><tr><th>Seed</th><th>回</th><th class="num">最終</th><th class="num">最大</th><th class="num">衝突</th><th class="num">見つからない</th><th class="num">終了コード</th><th class="num">秒</th><th></th></tr></thead><tbody>
+    ${d.runs.map(x => `<tr><td>${x.seed}</td><td>${x.run}</td><td class="num">${fmt(x.score_final, 0)}</td><td class="num">${fmt(x.score_max, 0)}</td><td class="num">${x.collisions}</td><td class="num">${x.not_found}</td><td class="num">${x.exit_code}</td><td class="num">${x.wall_sec}</td><td><button data-run="seed${x.seed}_run${x.run}">ログ</button></td></tr>`).join("")}
+    </tbody></table></div>
+    <div><b>失敗の内訳</b> <span class="muted">(全実行の合計。分類は analyze_failures.sh の PATTERNS)</span>
+      <div class="bars">${f.length ? f.map(x => `<div><span>${esc(x.k)}</span><i style="width:${100 * x.v / fmax}%"></i><span>${x.v} (${x.avg.toFixed(1)}/回)</span></div>`).join("") : '<span class="muted">検出された失敗はありません</span>'}</div></div>
+    <pre class="log" id="runlog" style="display:none"></pre></div>`;
+  $("b-md").onclick = () => copyText(markdownRows(d));
+  $("detail").querySelectorAll("button[data-run]").forEach(b => b.onclick = async () => {
+    const rl = await api(`/api/runlog?name=${encodeURIComponent(name)}&run=${b.dataset.run}`);
+    const pre = $("runlog"); pre.style.display = "block"; pre.textContent = rl.data.log || "(ログなし)"; pre.scrollTop = pre.scrollHeight; });
+}
+
+/* ---- フォーム ---- */
+$("seeds").innerHTML = SEEDS.map(s => `<label class="chk"><input type="checkbox" value="${s}" ${["86", "25"].includes(s) ? "checked" : ""}>${s}</label>`).join("");
+$("seedsel").innerHTML = ["86", "25"].concat(SEEDS.filter(s => !["86", "25"].includes(s))).map(s => `<option>${s}</option>`).join("");
+const now = new Date(), pad = n => String(n).padStart(2, "0");
+$("label").value = `${pad(now.getMonth() + 1)}${pad(now.getDate())}-run`;
+try { const saved = JSON.parse(localStorage.getItem("form") || "{}");
+  for (const k of ["repeat", "variant", "detector", "timeout"]) if (saved[k] !== undefined) $(k).value = saved[k];
+  for (const k of ["headless", "interleave"]) if (saved[k] !== undefined) $(k).checked = saved[k]; } catch (e) {}
+$("l-sim").href = `http://${location.hostname}:3000`; $("l-ide").href = `http://${location.hostname}:3001`;
+$("b-up").onclick = () => act({action: "up"});
+$("b-stop").onclick = () => { if (confirm("コンテナを停止します。よいですか?")) act({action: "stop"}); };
+$("b-restart").onclick = () => act({action: "restart_sim"});
+$("b-seed").onclick = () => act({action: "seed", seed: $("seedsel").value});
+$("b-abort").onclick = () => { if (confirm("実行中のジョブを中止します。")) act({action: "abort"}); };
+$("b-run").onclick = () => {
+  const seeds = [...$("seeds").querySelectorAll("input:checked")].map(i => i.value);
+  const body = {action: "run", seeds, repeat: +$("repeat").value, variant: $("variant").value, detector: $("detector").value,
+    label: $("label").value.trim(), headless: $("headless").checked, interleave: $("interleave").checked, timeout: +$("timeout").value};
+  try { localStorage.setItem("form", JSON.stringify({repeat: body.repeat, variant: body.variant, detector: body.detector,
+    timeout: body.timeout, headless: body.headless, interleave: body.interleave})); } catch (e) {}
+  act(body);
+};
+
+refresh(); loadResults();
+setInterval(() => refresh(), 2500);
+</script>
+</body>
+</html>
