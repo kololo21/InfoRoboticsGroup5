@@ -182,9 +182,37 @@ one_run() {  # $1=seed $2=run番号
   ros_sim 'rostopic echo -p /score' > "$rd/score_timeline.csv" 2>/dev/null &
   local spid=$!
   local t0; t0=$(date +%s)
+
+  # wrs_main が終わったら(正常終了でも、起動時のエラーで return した場合でも)、残っている検出器などの
+  # roslaunch を止めて、この回を終える。止めないと、start_all.sh は上限時間まで待ち続ける
+  # (以前、起動直後に終了した実行が、1500秒まるごと待った)
+  rm -f "$rd/.node_ended"
+  (
+    seen=0; waited=0
+    while [ "$waited" -lt "$TIMEOUT" ]; do
+      sleep 3; waited=$((waited + 3))
+      if ros_sim 'rosnode list 2>/dev/null | grep -q "^/wrs_main$"' >/dev/null 2>&1; then
+        seen=1
+      elif [ "$seen" = 1 ] || [ "$waited" -ge 240 ] \
+           || ros_sim 'L=$(ls -t /root/.ros/log/*/rosout.log 2>/dev/null | head -1); grep -q " /wrs_main " "$L"' >/dev/null 2>&1; then
+        # 出現後に消えた / 240秒たっても出てこない / 一瞬で終わって見逃したが、ログには残っている
+        sleep 3
+        if ! ros_sim 'rosnode list 2>/dev/null | grep -q "^/wrs_main$"' >/dev/null 2>&1; then
+          echo "seen=$seen" > "$rd/.node_ended"
+          dc exec -T workspace bash -c 'pkill -f start_all.sh; pkill -f roslaunch' >/dev/null 2>&1
+          break
+        fi
+      fi
+    done
+  ) &
+  local wpid=$!
   dc exec -T workspace bash -lc "timeout $TIMEOUT $START_CMD" > "$rd/run.log" 2>&1
   local code=$?
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
   local wall=$(( $(date +%s) - t0 ))
+  if [ -f "$rd/.node_ended" ]; then
+    echo "  wrs_main が終了したので、この回を終えました(${wall}秒)。ログの node.log を見てください"
+  fi
   sleep 2; kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
 
   # ノードの ROS ログ(rosout)を保存する。run.log は出力のバッファのため、実行が終わるまで見えないことがあり、

@@ -31,6 +31,7 @@ Python例外	Traceback|Exception
 置き場のセンサ観測不足	Missing or ambiguous sensor observations
 Task1失敗でTask2に進めず	Task 1 failed; stop before Task 2
 検出器のエラー	Error processing request|Invalid CUDA
+起動時の前提確認に失敗(depth/自己位置)	Cannot start without
 EOF
 )
 
