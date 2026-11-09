@@ -160,6 +160,16 @@ class App:
             return float(m.group(1)) if m else None
         return self.cached("score", 10, fn)
 
+    def node_tail(self, n=14):
+        """実行中のノード(wrs_main / 検出器)の ROS ログ(rosout)の末尾。run.log は終わるまで見えないことがある"""
+        def fn():
+            cmd = ("L=$(ls -t /root/.ros/log/*/rosout.log 2>/dev/null | head -1); "
+                   "grep -E ' /(wrs_main|frcnn_detector) ' \"$L\" "
+                   "| sed -E 's/\\[topics: [^]]*\\] ?//' | tail -%d" % n)
+            rc, out = self.dc("exec", "-T", "simulator", "bash", "-c", cmd, timeout=10)
+            return out if rc == 0 else ""
+        return self.cached("nodetail", 4, fn)
+
     # ---- ジョブ(同時に1つだけ) -----------------------------------------
     def start_job(self, kind, argv, params=None, shell_env=None):
         with self.lock:
@@ -212,6 +222,7 @@ class App:
                 if runs and rc is None:
                     tl = Path(m[-1]) / f"seed{runs[-1][0]}_run{runs[-1][1]}" / "score_timeline.csv"
                     info["live_score"] = last_score(tl)
+                    info["node_log"] = self.node_tail()
         return info
 
     # ---- 結果 ----------------------------------------------------------

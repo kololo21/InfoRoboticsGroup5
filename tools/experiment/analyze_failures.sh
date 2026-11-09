@@ -27,8 +27,10 @@ PATTERNS=$(cat <<'EOF'
 コンテナ停止(環境の問題)	is not running|No such container
 起動コマンドの失敗(環境の問題)	failed to run command|command not found|usage: .*start_all
 Python例外	Traceback|Exception
-配置の失敗(Task1)	Task 1 placement failed|Placement result:.*"success": false
+配置の失敗(Task1)	Task 1 placement failed|Placement failed for|Placement result:.*"success": false
+置き場のセンサ観測不足	Missing or ambiguous sensor observations
 Task1失敗でTask2に進めず	Task 1 failed; stop before Task 2
+検出器のエラー	Error processing request|Invalid CUDA
 EOF
 )
 
@@ -39,6 +41,9 @@ echo "seed,run,category,count" > "$OUTCSV"
 RUNS=$(find "$DIR" -maxdepth 1 -type d -name 'seed*_run*' | sort -V)
 [ -n "$RUNS" ] || { echo "seed*_run* が見つかりません: $DIR"; exit 1; }
 
+# 各実行のログを1つにまとめる(node.log があればそれを、なければ run.log を使う。二重に数えないため)
+plog() { for r in $RUNS; do if [ -s "$r/node.log" ]; then cat "$r/node.log"; else cat "$r/run.log" 2>/dev/null; fi; done; }
+
 echo "===== 失敗原因の集計: $DIR ====="
 printf "%-12s %7s %7s  %s\n" "run" "score" "秒" "検出された失敗(回数)"
 
@@ -46,20 +51,29 @@ for rd in $RUNS; do
   name=$(basename "$rd")
   seed=${name#seed}; seed=${seed%%_*}
   run=${name##*_run}
-  log="$rd/run.log"
-  [ -f "$log" ] || continue
+  log="$rd/run.log"; nlog="$rd/node.log"   # node.log = ROS ログ(rosout)。run.log と同じ行は二重に数えない
+  [ -f "$log" ] || [ -f "$nlog" ] || continue
+  [ -f "$log" ] || log=/dev/null
+  [ -f "$nlog" ] || nlog=/dev/null
 
   final=$(awk -F, 'NR>1 && $2!=""{v=$2} END{print (v==""?0:v)}' "$rd/score_timeline.csv" 2>/dev/null)
   wall=$(awk -F, -v s="$seed" -v r="$run" '$1==s && $2==r {print $8}' "$DIR/summary.csv")
   line=""
   while IFS=$'\t' read -r label re; do
     [ -z "$label" ] && continue
-    c=$(grep -ciE "$re" "$log")
+    c1=$(grep -ciE "$re" "$log"); c2=$(grep -ciE "$re" "$nlog")
+    c=$(( c1 > c2 ? c1 : c2 ))
     if [ "$c" -gt 0 ]; then
       line="$line [$label:$c]"
       echo "$seed,$run,$label,$c" >> "$OUTCSV"
     fi
   done <<< "$PATTERNS"
+  # 物体を離した(released: true)のに点が入っていない -> 置き場所・カテゴリの判定を疑う
+  p1=$(grep -c '"released": true' "$log"); p2=$(grep -c '"released": true' "$nlog")
+  placed=$(( p1 > p2 ? p1 : p2 ))
+  if [ "$placed" -gt 0 ] && awk -v f="$final" 'BEGIN{exit !(f+0==0)}'; then
+    line="$line [配置成功${placed}回なのに得点0]"; echo "$seed,$run,配置成功なのに得点0,$placed" >> "$OUTCSV"
+  fi
   # スコアが全く入らなかった
   awk -v f="$final" 'BEGIN{exit !(f+0==0)}' && { line="$line [得点0]"; echo "$seed,$run,得点0,1" >> "$OUTCSV"; }
   printf "%-12s %7s %7s %s\n" "S${seed}#${run}" "${final:-?}" "${wall:-?}" "${line:- なし}"
@@ -72,27 +86,27 @@ awk -F, 'NR>1{k=$1; c[k","$3]+=$4; if(!(k","$2 in seen)){seen[k","$2]=1; n[k]++}
 
 echo
 echo "----- 衝突した相手(多い順 上位8) -----"
-cat "$DIR"/seed*_run*/run.log 2>/dev/null \
+plog \
   | grep -oE "Collision Detected with [A-Za-z0-9_]+" | sed 's/Collision Detected with //' \
   | sort | uniq -c | sort -rn | head -8 | awk '{printf "   %-28s %d回\n",$2,$1}'
 
 echo
 echo "----- 配置に失敗した段階(Placement result の stage。多い順) -----"
-cat "$DIR"/seed*_run*/run.log 2>/dev/null \
+plog \
   | grep -E 'Placement result:.*"success": false' | grep -oE '"stage": "[a-z_]+"' \
   | sed 's/"stage": //; s/"//g' | sort | uniq -c | sort -rn | awk '{printf "   %-14s %d回\n",$2,$1}'
 
 echo
 echo "----- 失敗した物体(Task 1 placement failed for ○○。多い順 上位8) -----"
-cat "$DIR"/seed*_run*/run.log 2>/dev/null \
+plog \
   | grep -oE 'placement failed for [A-Za-z0-9_]+' | sed 's/placement failed for //' \
   | sort | uniq -c | sort -rn | head -8 | awk '{printf "   %-24s %d回\n",$2,$1}'
 
 echo
 echo "----- 未分類の ERROR/WARN(正規化して多い順 上位8) -----"
 KNOWN=$(echo "$PATTERNS" | cut -f2 | paste -sd'|')
-cat "$DIR"/seed*_run*/run.log 2>/dev/null \
-  | grep -E "\[ ?(ERROR|WARN|FATAL)" | grep -viE "$KNOWN" \
+plog \
+  | grep -E "\[ ?(ERROR|WARN|FATAL)|^[0-9.]+ (ERROR|WARN|FATAL) " | grep -viE "$KNOWN" \
   | sed -E 's/\[[0-9. ]+\]//g; s/[0-9]+(\.[0-9]+)?/N/g' \
   | sort | uniq -c | sort -rn | head -8 | cut -c1-140
 

@@ -12,6 +12,7 @@
 #   ./run_experiment.sh -G haruki            # GitHub の haruki ブランチの wrs_main_node_c.py を取得して実行
 #   ./run_experiment.sh -G haruki:src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_b.py
 #   ./run_experiment.sh -f ~/my_node.py      # 任意のファイル(例 C:\Users\...\wrs_main_node_c.py)を実行
+#   ./run_experiment.sh -K undesired         # 高速な動作確認: 接触判定ノードを止める(RTF約2倍。Task 2a の採点は無効)
 #   (-G / -f は wrs_main_node_local.py に置いて start_all.sh local で動かす。元のファイルは変えない)
 #
 # 前提: ~/sim_ws で docker compose up -d 済み。docker compose restart 以外は破壊的操作をしない。
@@ -26,14 +27,16 @@ RESTORE_SEED=86      # 終了後に戻すSeed(空なら戻さない)
 VARIANT=""           # 実行するノード: 空=統合版(wrs_main_node.py) / a / b / c
 DETECTOR_OPT=""      # 検出器: 空=start_all.sh の既定 / yolo / frcnn
 
-usage() { sed -n '2,20p' "$0"; exit 1; }
+usage() { sed -n '2,24p' "$0"; exit 1; }
 INTERLEAVE=0
 HEADLESS=1           # 1: 描画クライアント(gzclient)を止めて高速化。画面や動画が必要なら -g
 SRC_FILE=""          # -f: 任意のファイルから実行
 SRC_GITHUB=""        # -G: GitHub の ref[:path] から実行
 DEFAULT_NODE_PATH="src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_c.py"
-while getopts "s:n:t:d:l:r:v:D:f:G:igh" o; do
+MON_KILL=""          # -K: 止める採点・監視ノードの名前(正規表現)。高速な動作確認用。点数は一部付かなくなる
+while getopts "s:n:t:d:l:r:v:D:f:G:K:igh" o; do
   case "$o" in
+    K) MON_KILL="$OPTARG" ;;
     f) SRC_FILE="$OPTARG" ;;
     G) SRC_GITHUB="$OPTARG" ;;
     i) INTERLEAVE=1 ;;
@@ -46,6 +49,9 @@ while getopts "s:n:t:d:l:r:v:D:f:G:igh" o; do
   esac
 done
 
+if [ -n "$MON_KILL" ] && ! printf '%s' "$MON_KILL" | grep -qE '^[A-Za-z0-9_|.-]{1,80}$'; then
+  echo "ERROR: -K は英数字と _ | . - だけ(例: undesired または undesired|drawer)"; exit 1
+fi
 [ -n "$SRC_FILE" ] && [ -n "$SRC_GITHUB" ] && { echo "ERROR: -f と -G は同時に使えません"; exit 1; }
 [ -n "$SRC_FILE$SRC_GITHUB" ] && VARIANT=local   # -f / -G は wrs_main_node_local.py として実行する
 case "$VARIANT" in ""|main) VARIANT="" ;; a|b|c|local) ;; *) echo "ERROR: -v は a|b|c|main"; exit 1 ;; esac
@@ -119,6 +125,9 @@ fi
   echo "label=$LABEL"
   echo "variant=${VARIANT:-main}"
   echo "source=$SOURCE"
+  echo "monitors_stopped=${MON_KILL:-none}"
+  echo "node_file=$(basename "$CODE_FILE")"
+  echo "code_path=$CODE_FILE"
   [ -f "$OUT/code_snapshot.py" ] && echo "code_sha=$(sha256sum "$OUT/code_snapshot.py" | cut -c1-10)"
   echo "detector=${DETECTOR_OPT:-default}"
   echo "seeds=$SEEDS"
@@ -163,6 +172,10 @@ one_run() {  # $1=seed $2=run番号
   fi
   # 画面(gzclient)を止める。物理演算とセンサ(gzserver)・/score は止まらない。再起動で元に戻る
   [ "$HEADLESS" = 1 ] && ros_sim 'pkill -x gzclient' >/dev/null 2>&1
+  # 高速な動作確認: 重い採点・監視ノードを止める(例 -K undesired でRTFが約2倍。止めたノードの分は点が付かない)
+  if [ -n "$MON_KILL" ]; then
+    ros_sim "for n in \$(rosnode list | grep -E '_detector\$|undesired_contact|wrs_score_counter' | grep -v frcnn_detector | grep -E '$MON_KILL'); do rosnode kill \$n >/dev/null 2>&1; done" >/dev/null 2>&1
+  fi
   ros_sim 'rosservice call /gazebo/unpause_physics' >/dev/null 2>&1   # Playボタン相当
 
   # スコアの時系列を記録
@@ -174,11 +187,23 @@ one_run() {  # $1=seed $2=run番号
   local wall=$(( $(date +%s) - t0 ))
   sleep 2; kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
 
-  local final max col nf
+  # ノードの ROS ログ(rosout)を保存する。run.log は出力のバッファのため、実行が終わるまで見えないことがあり、
+  # 検出器のエラーなど別ノードのログも入らない。rosout にはリアルタイムで全ノードのログが残る
+  ros_sim 'L=$(ls -t /root/.ros/log/*/rosout.log 2>/dev/null | head -1); grep -E " /(wrs_main|frcnn_detector) " "$L" | sed -E "s/\[topics: [^]]*\] ?//"' \
+    > "$rd/node.log" 2>/dev/null
+
+  # 終了時の物体の位置と、置き場所ごとの判定器の数を保存する。「物体を離したのに0点」のとき、
+  # 実際にどこにあるか(置き場所に入っているか)と、採点側の数え方を後から突き合わせるため
+  ros_sim 'timeout 10 rostopic echo -n1 /gazebo/model_states' > "$rd/model_states.txt" 2>/dev/null
+  ros_sim 'for t in $(rostopic list | grep -E "_detector/count$"); do (echo "$t $(timeout 4 rostopic echo -n1 $t 2>/dev/null | head -1)") & done; wait' \
+    > "$rd/counters.txt" 2>/dev/null
+
+  local final max col nf src
+  src="$rd/run.log"; [ -s "$rd/node.log" ] && src="$rd/node.log"
   final=$(awk -F, 'NR>1 && $2!=""{v=$2} END{print (v==""?0:v)}' "$rd/score_timeline.csv")
   max=$(awk -F, 'NR>1 && $2!=""&&$2>m{m=$2} END{print m+0}' "$rd/score_timeline.csv")
-  col=$(grep -c "Collision Detected" "$rd/run.log")
-  nf=$(grep -ciE "Cannot find object|aborted" "$rd/run.log")
+  col=$(grep -c "Collision Detected" "$src")
+  nf=$(grep -ciE "Cannot find object|aborted" "$src")
   echo "  score=$final (max $max)  collisions=$col  not_found=$nf  exit=$code  ${wall}s"
   echo "$seed,$n,$final,$max,$col,$nf,$code,$wall,$rd" >> "$SUMMARY"
 }

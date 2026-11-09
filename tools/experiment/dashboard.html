@@ -141,6 +141,7 @@ tr.sel { background: var(--bg); }
         <label class="chk"><input type="checkbox" id="interleave" checked>Seedを交互に実行</label>
         <span class="t">1回の上限</span><input type="number" id="timeout" min="60" max="3600" value="900"><span class="muted">秒</span>
         <button class="primary" id="b-run">実行</button>
+        <b id="runfile" class="muted"></b>
         <button class="danger" id="b-abort">中止</button>
       </div>
     </div>
@@ -148,6 +149,8 @@ tr.sel { background: var(--bg); }
       <div class="row" style="margin-top:12px">
         <progress id="prog" value="0" max="1"></progress><span id="progtxt" class="muted"></span>
       </div>
+      <div class="muted" id="nodelabel" style="display:none;margin-top:10px">ノードのログ(ROS。リアルタイム)</div>
+      <pre class="log" id="nodelog" style="display:none;margin-top:4px"></pre>
       <pre class="log" id="joblog"></pre>
     </div>
   </section>
@@ -215,6 +218,9 @@ function renderStatus(s) {
     else { $("prog").max = 1; $("prog").value = job.running ? 0 : 1; $("progtxt").textContent = job.running ? "" : `終了コード ${job.exit}`; }
     const log = $("joblog"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
     log.textContent = job.log; if (atEnd) log.scrollTop = log.scrollHeight;
+    const nl = $("nodelog"), show = !!(job.running && job.node_log);
+    $("nodelabel").style.display = nl.style.display = show ? "" : "none";
+    if (show) { const end = nl.scrollTop + nl.clientHeight >= nl.scrollHeight - 30; nl.textContent = job.node_log; if (end) nl.scrollTop = nl.scrollHeight; }
     const key = job.kind + (job.out || "") + (job.running ? "r" : "d");
     if (key !== lastJobKey) { lastJobKey = key; if (!job.running) loadResults(); }
   } else box.style.display = "none";
@@ -236,7 +242,7 @@ async function loadResults() {
     const m = x.meta || {};
     const git = m.git_commit ? `${esc(m.git_branch)}@${esc(m.git_commit)}${m.git_dirty && m.git_dirty !== "0" ? "+" : ""}` : "–";
     return `<tr class="res ${x.name === selectedName ? "sel" : ""}" data-n="${x.name}"><td>${dateOf(x.name)}</td><td>${esc(labelOf(x.name))}</td>
-      <td title="${esc(m.source || "")}">${esc(m.variant || "–")} / ${esc(m.detector || "–")}${m.source && m.source !== "workspace" ? `<div class="muted">${esc(m.source.slice(0, 44))}</div>` : ""}</td><td class="muted">${git}</td><td class="num">${x.n}</td>
+      <td title="${esc(m.source || "")}"><b>${esc(m.node_file || m.variant || "–")}</b> / ${esc(m.detector || "–")}<div class="muted">sha ${esc(m.code_sha || "–")}</div>${m.source && m.source !== "workspace" ? `<div class="muted">${esc(m.source.slice(0, 44))}</div>` : ""}</td><td class="muted">${git}</td><td class="num">${x.n}</td>
       <td class="num"><b>${fmt(x.total)}</b></td><td class="num">${fmt(x.robust)}</td><td class="num">${fmt(x.worst, 0)}</td>
       <td class="lv ${x.level}">${x.level}</td><td>${esc(seedText(x.per_seed))}</td></tr>`;
   }).join("");
@@ -272,7 +278,7 @@ function failureAgg(d) {
 function markdownRows(d) {
   const m = d.meta || {}, date = dateOf(d.name).split(" ")[0];
   const fails = failureAgg(d).slice(0, 3).map(f => `${f.k}(${f.avg.toFixed(1)}/回)`).join("、") || "–";
-  const tag = `${labelOf(d.name)} (${m.variant || "main"}, ${m.detector || "default"}${m.git_commit ? ", " + m.git_commit : ""})`;
+  const tag = `${labelOf(d.name)} (${m.node_file || m.variant || "main"}, ${m.detector || "default"}${m.git_commit ? ", " + m.git_commit : ""}${m.code_sha ? ", sha " + m.code_sha : ""})`;
   return Object.keys(d.per_seed).sort((a, b) => b - a).map(s => {
     const p = d.per_seed[s];
     return `| ${date} | ${s} | ${tag} | – | – | – | ${fmt(p.mean, 0)} (n=${p.n}, ±${fmt(p.sd, 0)}) | ${fails} |`;
@@ -289,7 +295,7 @@ async function showDetail(name) {
   const d = r.data, f = failureAgg(d), fmax = Math.max(1, ...f.map(x => x.v));
   const m = d.meta || {};
   $("detail").innerHTML = `<div class="detail">
-    <div class="row"><b>${esc(name)}</b><span class="muted">${esc(m.variant || "")} / ${esc(m.detector || "")} / ${esc(m.git_branch || "")}@${esc(m.git_commit || "")} ${m.git_dirty && m.git_dirty !== "0" ? "(未コミットの変更あり)" : ""}</span>
+    <div class="row"><b>${esc(name)}</b><span class="muted">実行したファイル: ${esc(m.code_path || m.node_file || m.variant || "")} (sha ${esc(m.code_sha || "–")}) / ${esc(m.detector || "")} /${esc(m.git_branch || "")}@${esc(m.git_commit || "")} ${m.git_dirty && m.git_dirty !== "0" ? "(未コミットの変更あり)" : ""}</span>
       <button id="b-md">実行記録(Markdown)をコピー</button></div>
     ${chart(d.runs)}
     <div class="tablewrap"><table><thead><tr><th>Seed</th><th>回</th><th class="num">最終</th><th class="num">最大</th><th class="num">衝突</th><th class="num">見つからない</th><th class="num">終了コード</th><th class="num">秒</th><th></th></tr></thead><tbody>
@@ -314,8 +320,19 @@ try { const saved = JSON.parse(localStorage.getItem("form") || "{}");
   $("gh-ref").value = saved.github_ref || ""; $("gh-path").value = saved.github_path || ""; $("file-path").value = saved.file_path || "";
   for (const k of ["headless", "interleave"]) if (saved[k] !== undefined) $(k).checked = saved[k]; } catch (e) {}
 function showSource() { const s = $("source").value;
-  for (const k of ["workspace", "github", "file"]) $("src-" + k).style.display = k === s ? "" : "none"; }
-$("source").onchange = showSource; showSource();
+  for (const k of ["workspace", "github", "file"]) $("src-" + k).style.display = k === s ? "" : "none";
+  showRunFile(); }
+// 実行するファイルを、実行ボタンの近くに常に表示する(統合版と _c.py の取り違えを防ぐ)
+function showRunFile() {
+  const s = $("source").value; let t;
+  if (s === "workspace") { const v = $("variant").value; t = "作業ツリーの wrs_main_node" + (v === "main" ? "" : "_" + v) + ".py"; }
+  else if (s === "github") t = "GitHub " + ($("gh-ref").value || "(ref未入力)") + " の " + ($("gh-path").value || "wrs_main_node_c.py");
+  else t = $("file-path").value || "(パス未入力)";
+  $("runfile").textContent = "実行するファイル: " + t;
+}
+$("source").onchange = showSource;
+for (const id of ["variant", "gh-ref", "gh-path", "file-path"]) $(id).oninput = showRunFile;
+showSource();
 $("l-sim").href = `http://${location.hostname}:3000`; $("l-ide").href = `http://${location.hostname}:3001`;
 $("b-up").onclick = () => act({action: "up"});
 $("b-stop").onclick = () => { if (confirm("コンテナを停止します。よいですか?")) act({action: "stop"}); };

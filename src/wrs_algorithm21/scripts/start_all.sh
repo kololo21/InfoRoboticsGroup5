@@ -19,6 +19,12 @@ if [ -z "${DETECTOR:-}" ]; then
     wrs_main_node.py|wrs_main_node_c.py|wrs_main_node_local.py) DETECTOR=yolo ;;
     *) DETECTOR=frcnn ;;
   esac
+  # NVIDIA GPU のない環境(tools/local_cpu の CPU 環境など)では、Faster R-CNN 用の
+  # PyTorch が入っていないので YOLO を使う
+  if [ ! -e /dev/nvidiactl ] && ! command -v nvidia-smi >/dev/null 2>&1 && [ "${DETECTOR}" = "frcnn" ]; then
+    echo "[info] GPU がないので検出器を YOLO にします(DETECTOR=frcnn で明示すれば変わりません)" >&2
+    DETECTOR=yolo
+  fi
 fi
 if [ "${DETECTOR}" = "yolo" ]; then
   if [ ! -d /workspace/.yolo_env/ultralytics ] || \
