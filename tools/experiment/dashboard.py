@@ -313,7 +313,25 @@ class App:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", label):
             return False, "ラベルは英数字と - _ の30文字までです"
         argv = [str(self.script), "-d", str(self.dir), "-s", " ".join(seeds), "-n", str(repeat),
-                "-t", str(timeout), "-l", label, "-v", variant]
+                "-t", str(timeout), "-l", label]
+        # コードの取得元: workspace(作業ツリーの版) / github(ブランチ等の ref) / file(任意のファイル)
+        source = b.get("source", "workspace")
+        if source == "github":
+            ref, gpath = str(b.get("github_ref", "")), str(b.get("github_path", ""))
+            if not re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", ref) or ref.startswith("-"):
+                return False, "GitHub の ref(ブランチ名やコミット)が不正です"
+            if gpath and (not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}\.py", gpath) or ".." in gpath):
+                return False, "GitHub のファイルパスが不正です(.py のパス)"
+            argv += ["-G", ref + (":" + gpath if gpath else "")]
+        elif source == "file":
+            path = str(b.get("file_path", "")).strip()
+            if not path or len(path) > 300 or "\n" in path or path.startswith("-"):
+                return False, "ファイルのパスが不正です"
+            argv += ["-f", path]
+        elif source == "workspace":
+            argv += ["-v", variant]
+        else:
+            return False, "コードの取得元が不正です"
         if det:
             argv += ["-D", det]
         if b.get("interleave"):
@@ -321,7 +339,8 @@ class App:
         if not b.get("headless", True):
             argv.append("-g")
         env = {"START_CMD": self.start_cmd} if self.start_cmd else None
-        return self.start_job("run", argv, {"seeds": seeds, "repeat": repeat, "label": label}, env)
+        return self.start_job("run", argv, {"seeds": seeds, "repeat": repeat, "label": label,
+                                            "source": source}, env)
 
 
 class Handler(BaseHTTPRequestHandler):

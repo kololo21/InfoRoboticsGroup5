@@ -110,12 +110,28 @@ tr.sel { background: var(--bg); }
     <div class="form">
       <div class="line"><span class="t">Seed</span><span id="seeds"></span></div>
       <div class="line">
-        <span class="t">回数</span><input type="number" id="repeat" min="1" max="20" value="3">
-        <span class="t">版</span>
-        <select id="variant">
-          <option value="main">統合版 wrs_main_node.py</option><option value="a">a</option>
-          <option value="b">b</option><option value="c">c</option>
+        <span class="t">コード</span>
+        <select id="source">
+          <option value="workspace">作業ツリーのファイル</option>
+          <option value="github">GitHub のブランチ/コミット</option>
+          <option value="file">任意のファイル(パス指定)</option>
         </select>
+        <span id="src-workspace">
+          <select id="variant">
+            <option value="main">統合版 wrs_main_node.py</option><option value="a">a</option>
+            <option value="b">b</option><option value="c">c</option>
+          </select>
+        </span>
+        <span id="src-github" style="display:none">
+          <input type="text" id="gh-ref" size="14" placeholder="haruki"> :
+          <input type="text" id="gh-path" size="34" placeholder="(空 = wrs_main_node_c.py)">
+        </span>
+        <span id="src-file" style="display:none">
+          <input type="text" id="file-path" size="46" placeholder="C:\Users\...\wrs_main_node_c.py または /home/.../x.py">
+        </span>
+      </div>
+      <div class="line">
+        <span class="t">回数</span><input type="number" id="repeat" min="1" max="20" value="3">
         <span class="t">検出器</span>
         <select id="detector"><option value="">既定(版による)</option><option value="yolo">YOLO</option><option value="frcnn">Faster R-CNN</option></select>
         <span class="t">ラベル</span><input type="text" id="label" size="16">
@@ -220,7 +236,7 @@ async function loadResults() {
     const m = x.meta || {};
     const git = m.git_commit ? `${esc(m.git_branch)}@${esc(m.git_commit)}${m.git_dirty && m.git_dirty !== "0" ? "+" : ""}` : "–";
     return `<tr class="res ${x.name === selectedName ? "sel" : ""}" data-n="${x.name}"><td>${dateOf(x.name)}</td><td>${esc(labelOf(x.name))}</td>
-      <td>${esc(m.variant || "–")} / ${esc(m.detector || "–")}</td><td class="muted">${git}</td><td class="num">${x.n}</td>
+      <td title="${esc(m.source || "")}">${esc(m.variant || "–")} / ${esc(m.detector || "–")}${m.source && m.source !== "workspace" ? `<div class="muted">${esc(m.source.slice(0, 44))}</div>` : ""}</td><td class="muted">${git}</td><td class="num">${x.n}</td>
       <td class="num"><b>${fmt(x.total)}</b></td><td class="num">${fmt(x.robust)}</td><td class="num">${fmt(x.worst, 0)}</td>
       <td class="lv ${x.level}">${x.level}</td><td>${esc(seedText(x.per_seed))}</td></tr>`;
   }).join("");
@@ -294,8 +310,12 @@ $("seedsel").innerHTML = ["86", "25"].concat(SEEDS.filter(s => !["86", "25"].inc
 const now = new Date(), pad = n => String(n).padStart(2, "0");
 $("label").value = `${pad(now.getMonth() + 1)}${pad(now.getDate())}-run`;
 try { const saved = JSON.parse(localStorage.getItem("form") || "{}");
-  for (const k of ["repeat", "variant", "detector", "timeout"]) if (saved[k] !== undefined) $(k).value = saved[k];
+  for (const k of ["repeat", "variant", "detector", "timeout", "source"]) if (saved[k] !== undefined) $(k).value = saved[k];
+  $("gh-ref").value = saved.github_ref || ""; $("gh-path").value = saved.github_path || ""; $("file-path").value = saved.file_path || "";
   for (const k of ["headless", "interleave"]) if (saved[k] !== undefined) $(k).checked = saved[k]; } catch (e) {}
+function showSource() { const s = $("source").value;
+  for (const k of ["workspace", "github", "file"]) $("src-" + k).style.display = k === s ? "" : "none"; }
+$("source").onchange = showSource; showSource();
 $("l-sim").href = `http://${location.hostname}:3000`; $("l-ide").href = `http://${location.hostname}:3001`;
 $("b-up").onclick = () => act({action: "up"});
 $("b-stop").onclick = () => { if (confirm("コンテナを停止します。よいですか?")) act({action: "stop"}); };
@@ -305,9 +325,11 @@ $("b-abort").onclick = () => { if (confirm("実行中のジョブを中止しま
 $("b-run").onclick = () => {
   const seeds = [...$("seeds").querySelectorAll("input:checked")].map(i => i.value);
   const body = {action: "run", seeds, repeat: +$("repeat").value, variant: $("variant").value, detector: $("detector").value,
-    label: $("label").value.trim(), headless: $("headless").checked, interleave: $("interleave").checked, timeout: +$("timeout").value};
+    label: $("label").value.trim(), headless: $("headless").checked, interleave: $("interleave").checked, timeout: +$("timeout").value,
+    source: $("source").value, github_ref: $("gh-ref").value.trim(), github_path: $("gh-path").value.trim(), file_path: $("file-path").value.trim()};
   try { localStorage.setItem("form", JSON.stringify({repeat: body.repeat, variant: body.variant, detector: body.detector,
-    timeout: body.timeout, headless: body.headless, interleave: body.interleave})); } catch (e) {}
+    timeout: body.timeout, headless: body.headless, interleave: body.interleave, source: body.source,
+    github_ref: body.github_ref, github_path: body.github_path, file_path: body.file_path})); } catch (e) {}
   act(body);
 };
 

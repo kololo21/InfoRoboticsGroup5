@@ -9,6 +9,10 @@
 #   ./run_experiment.sh -g                   # 画面(Gazebo GUI)を残す。動画を撮るとき
 #   (既定は画面なし=headless。手元の測定でRTF 0.22 -> 0.36 に向上)
 #   ./run_experiment.sh -v c -D yolo         # wrs_main_node_c.py を YOLO で(-v は a|b|c|main)
+#   ./run_experiment.sh -G haruki            # GitHub の haruki ブランチの wrs_main_node_c.py を取得して実行
+#   ./run_experiment.sh -G haruki:src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_b.py
+#   ./run_experiment.sh -f ~/my_node.py      # 任意のファイル(例 C:\Users\...\wrs_main_node_c.py)を実行
+#   (-G / -f は wrs_main_node_local.py に置いて start_all.sh local で動かす。元のファイルは変えない)
 #
 # 前提: ~/sim_ws で docker compose up -d 済み。docker compose restart 以外は破壊的操作をしない。
 set -u
@@ -22,11 +26,16 @@ RESTORE_SEED=86      # 終了後に戻すSeed(空なら戻さない)
 VARIANT=""           # 実行するノード: 空=統合版(wrs_main_node.py) / a / b / c
 DETECTOR_OPT=""      # 検出器: 空=start_all.sh の既定 / yolo / frcnn
 
-usage() { sed -n '2,16p' "$0"; exit 1; }
+usage() { sed -n '2,20p' "$0"; exit 1; }
 INTERLEAVE=0
 HEADLESS=1           # 1: 描画クライアント(gzclient)を止めて高速化。画面や動画が必要なら -g
-while getopts "s:n:t:d:l:r:v:D:igh" o; do
+SRC_FILE=""          # -f: 任意のファイルから実行
+SRC_GITHUB=""        # -G: GitHub の ref[:path] から実行
+DEFAULT_NODE_PATH="src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_c.py"
+while getopts "s:n:t:d:l:r:v:D:f:G:igh" o; do
   case "$o" in
+    f) SRC_FILE="$OPTARG" ;;
+    G) SRC_GITHUB="$OPTARG" ;;
     i) INTERLEAVE=1 ;;
     g) HEADLESS=0 ;;
     v) VARIANT="$OPTARG" ;;
@@ -37,15 +46,26 @@ while getopts "s:n:t:d:l:r:v:D:igh" o; do
   esac
 done
 
-case "$VARIANT" in ""|main) VARIANT="" ;; a|b|c) ;; *) echo "ERROR: -v は a|b|c|main"; exit 1 ;; esac
+[ -n "$SRC_FILE" ] && [ -n "$SRC_GITHUB" ] && { echo "ERROR: -f と -G は同時に使えません"; exit 1; }
+[ -n "$SRC_FILE$SRC_GITHUB" ] && VARIANT=local   # -f / -G は wrs_main_node_local.py として実行する
+case "$VARIANT" in ""|main) VARIANT="" ;; a|b|c|local) ;; *) echo "ERROR: -v は a|b|c|main"; exit 1 ;; esac
 case "$DETECTOR_OPT" in ""|yolo|frcnn) ;; *) echo "ERROR: -D は yolo|frcnn"; exit 1 ;; esac
 # 実行コマンド(START_CMD を環境変数で渡せば上書きできる。動作テスト用)
 if [ -z "${START_CMD:-}" ]; then
-  START_CMD="${DETECTOR_OPT:+DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh${VARIANT:+ $VARIANT}"
+  START_CMD="${DETECTOR_OPT:+env DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh${VARIANT:+ $VARIANT}"
 fi
 CODE_FILE="${CODE_FILE:-workspace/src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node${VARIANT:+_$VARIANT}.py}"
 
 cd "$DIR" || { echo "ERROR: $DIR に移動できません"; exit 1; }
+
+# 同じシミュレータで実験を二重に走らせない(再起動し合って、どちらの結果も壊れるため)
+LOCK="$DIR/.run_experiment.lock"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "ERROR: すでに実験が動いています(PID $(cat "$LOCK"))。終わるのを待つか、止めてから実行してください"
+  exit 1
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT="$DIR/results/${STAMP}_${LABEL}"
 mkdir -p "$OUT"
@@ -64,12 +84,42 @@ for svc in xserver simulator workspace; do
   fi
 done
 
+GITDIR="$DIR/workspace"   # リポジトリのルート(src/ と tools/ がある場所)
+
+# -f / -G: 実行するノードを GitHub や任意のファイルから取得して wrs_main_node_local.py に置く
+SOURCE="workspace"
+if [ "$VARIANT" = local ]; then
+  LOCAL_NODE="$GITDIR/src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_local.py"
+  if [ -n "$SRC_GITHUB" ]; then
+    REF="${SRC_GITHUB%%:*}"; NPATH="$DEFAULT_NODE_PATH"
+    case "$SRC_GITHUB" in *:*) NPATH="${SRC_GITHUB#*:}" ;; esac
+    echo "GitHub から取得: $REF : $NPATH"
+    git -C "$GITDIR" fetch --quiet origin "$REF" || { echo "ERROR: GitHub から $REF を取得できません(権限・ブランチ名を確認)"; exit 1; }
+    git -C "$GITDIR" show "FETCH_HEAD:$NPATH" > "$LOCAL_NODE" || { echo "ERROR: $REF に $NPATH がありません"; exit 1; }
+    SOURCE="github:$REF:$NPATH@$(git -C "$GITDIR" rev-parse --short FETCH_HEAD)"
+  else
+    F="$SRC_FILE"
+    case "$F" in [A-Za-z]:*) command -v wslpath >/dev/null && F=$(wslpath -u "$F") ;; esac
+    [ -f "$F" ] || { echo "ERROR: ファイルがありません: $F"; exit 1; }
+    cp "$F" "$LOCAL_NODE" || exit 1
+    SOURCE="file:$SRC_FILE"
+  fi
+  chmod +x "$LOCAL_NODE"
+  # 文法エラーのファイルで長い実験を始めないよう、先に構文だけ確認する
+  if command -v python3 >/dev/null && ! python3 -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())" "$LOCAL_NODE" 2>/tmp/ast_err.$$; then
+    echo "ERROR: Python の構文エラーです:"; tail -3 /tmp/ast_err.$$; rm -f /tmp/ast_err.$$; exit 1
+  fi
+  rm -f /tmp/ast_err.$$
+  CODE_FILE="$LOCAL_NODE"
+fi
+
 # コードの版を記録(あとで「どの版が何点だったか」を追えるように)
 [ -f "$CODE_FILE" ] && cp "$CODE_FILE" "$OUT/code_snapshot.py"
-GITDIR="$DIR/workspace"   # リポジトリのルート(src/ と tools/ がある場所)
 {
   echo "label=$LABEL"
   echo "variant=${VARIANT:-main}"
+  echo "source=$SOURCE"
+  [ -f "$OUT/code_snapshot.py" ] && echo "code_sha=$(sha256sum "$OUT/code_snapshot.py" | cut -c1-10)"
   echo "detector=${DETECTOR_OPT:-default}"
   echo "seeds=$SEEDS"
   echo "repeat=$REPEAT"

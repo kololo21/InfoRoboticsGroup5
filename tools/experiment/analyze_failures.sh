@@ -25,6 +25,7 @@ PATTERNS=$(cat <<'EOF'
 タイムアウト	timed out|timeout|Timeout
 ノード異常終了	has died \[pid [0-9]+, exit code [1-9]
 コンテナ停止(環境の問題)	is not running|No such container
+起動コマンドの失敗(環境の問題)	failed to run command|command not found|usage: .*start_all
 Python例外	Traceback|Exception
 配置の失敗(Task1)	Task 1 placement failed|Placement result:.*"success": false
 Task1失敗でTask2に進めず	Task 1 failed; stop before Task 2

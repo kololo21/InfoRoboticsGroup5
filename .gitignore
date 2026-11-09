@@ -9,6 +9,9 @@ install/
 __pycache__/
 *.pyc
 
+# tools/experiment が GitHub や任意のファイルから置く一時ファイル
+src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_local.py
+
 # Editor
 .vscode
 
