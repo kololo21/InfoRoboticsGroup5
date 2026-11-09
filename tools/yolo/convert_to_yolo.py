@@ -16,6 +16,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 
@@ -190,14 +191,18 @@ def main():
     for split, part in (("val", val), ("train", train)):
         img_dir = os.path.join(args.out, "images", split)
         lbl_dir = os.path.join(args.out, "labels", split)
+        # 前回の出力（古いリンク・ラベル・水増し画像）を消してから作る。
+        # 残すと、番号がずれて画像とラベルが食い違ったり、消した画像へのリンクが残ったりする
+        for old_dir in (img_dir, lbl_dir):
+            if os.path.isdir(old_dir):
+                shutil.rmtree(old_dir)
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(lbl_dir, exist_ok=True)
         for i, (path, width, height, boxes) in enumerate(part):
             stem = "%s_%06d" % (split, i)
             ext = os.path.splitext(path)[1].lower()
             link = os.path.join(img_dir, stem + ext)
-            if not os.path.exists(link):
-                os.symlink(os.path.abspath(path), link)  # 画像はコピーせずリンク
+            os.symlink(os.path.abspath(path), link)  # 画像はコピーせずリンク
             lines = []
             for name, b_x, b_y, b_w, b_h in boxes:
                 idx = lookup.get(normalize(str(name)))

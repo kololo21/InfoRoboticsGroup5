@@ -114,10 +114,15 @@ def main():
     sources = sorted(p for p in glob.glob(os.path.join(img_dir, "*"))
                      if p.lower().endswith(IMAGE_EXTS))
     n_made = n_dropped = 0
+    missing = []
     for path in sources:
         stem, ext = os.path.splitext(os.path.basename(path))
         labels = read_labels(os.path.join(lbl_dir, stem + ".txt"))
-        image = Image.open(path).convert("RGB")
+        try:
+            image = Image.open(path).convert("RGB")
+        except (OSError, ValueError):  # 消した画像へのリンクなど。止めずに飛ばす
+            missing.append(path)
+            continue
         for k in range(args.copies):
             out, new_labels = augment_image(image, labels, args.max_angle, args.noise, rng)
             n_dropped += len(labels) - len(new_labels)
@@ -129,6 +134,9 @@ def main():
             n_made += 1
     print("source images: %d -> made %d copies (dropped boxes: %d)"
           % (len(sources), n_made, n_dropped))
+    if missing:
+        print("[warn] 読めない画像 %d 枚を飛ばした（例: %s）。convert_to_yolo.py からやり直すこと"
+              % (len(missing), missing[0]))
 
 
 if __name__ == "__main__":
