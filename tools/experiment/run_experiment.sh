@@ -13,6 +13,8 @@
 #   ./run_experiment.sh -G haruki:src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_b.py
 #   ./run_experiment.sh -f ~/my_node.py      # 任意のファイル(例 C:\Users\...\wrs_main_node_c.py)を実行
 #   ./run_experiment.sh -K undesired         # 高速な動作確認: 接触判定ノードを止める(RTF約2倍。Task 2a の採点は無効)
+#   ./run_experiment.sh -Q -v c              # 短縮確認: 1物体だけ 探す→つかむ→置く(_c.py は変更しない)。-q で引き出しも開ける
+#                                            # 結果は node.log の "QUICK RESULT: {...}" と、ダッシュボードに出る
 #   (-G / -f は wrs_main_node_local.py に置いて start_all.sh local で動かす。元のファイルは変えない)
 #
 # 前提: ~/sim_ws で docker compose up -d 済み。docker compose restart 以外は破壊的操作をしない。
@@ -27,15 +29,19 @@ RESTORE_SEED=86      # 終了後に戻すSeed(空なら戻さない)
 VARIANT=""           # 実行するノード: 空=統合版(wrs_main_node.py) / a / b / c
 DETECTOR_OPT=""      # 検出器: 空=start_all.sh の既定 / yolo / frcnn
 
-usage() { sed -n '2,24p' "$0"; exit 1; }
+usage() { sed -n '2,28p' "$0"; exit 1; }
 INTERLEAVE=0
 HEADLESS=1           # 1: 描画クライアント(gzclient)を止めて高速化。画面や動画が必要なら -g
 SRC_FILE=""          # -f: 任意のファイルから実行
 SRC_GITHUB=""        # -G: GitHub の ref[:path] から実行
 DEFAULT_NODE_PATH="src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node_c.py"
 MON_KILL=""          # -K: 止める採点・監視ノードの名前(正規表現)。高速な動作確認用。点数は一部付かなくなる
-while getopts "s:n:t:d:l:r:v:D:f:G:K:igh" o; do
+QUICK=0              # -Q: 短縮確認(1物体だけ 探す→つかむ→置く)。-q を足すと、先に引き出しも開ける
+QUICK_DRAWERS=0
+while getopts "s:n:t:d:l:r:v:D:f:G:K:Qqigh" o; do
   case "$o" in
+    Q) QUICK=1 ;;
+    q) QUICK=1; QUICK_DRAWERS=1 ;;
     K) MON_KILL="$OPTARG" ;;
     f) SRC_FILE="$OPTARG" ;;
     G) SRC_GITHUB="$OPTARG" ;;
@@ -56,9 +62,21 @@ fi
 [ -n "$SRC_FILE$SRC_GITHUB" ] && VARIANT=local   # -f / -G は wrs_main_node_local.py として実行する
 case "$VARIANT" in ""|main) VARIANT="" ;; a|b|c|local) ;; *) echo "ERROR: -v は a|b|c|main"; exit 1 ;; esac
 case "$DETECTOR_OPT" in ""|yolo|frcnn) ;; *) echo "ERROR: -D は yolo|frcnn"; exit 1 ;; esac
+# 短縮確認(-Q): 別ファイルの wrs_main_node_quick.py が、選んだノード(既定 c)のクラスを読み込んで、
+# 1物体だけ「探す→つかむ→置く」を本番と同じ関数で実行する。選んだノードのファイルは変更しない
+if [ "$QUICK" = 1 ]; then
+  [ -z "$VARIANT" ] && VARIANT=c   # 統合版 wrs_main_node.py は、短縮確認に必要な関数を持たない
+  if [ "$VARIANT" = a ] || [ "$VARIANT" = b ]; then
+    echo "ERROR: 短縮確認は c 系のノード(-v c、または -f / -G で渡した c 系のファイル)が対象です"; exit 1
+  fi
+fi
 # 実行コマンド(START_CMD を環境変数で渡せば上書きできる。動作テスト用)
 if [ -z "${START_CMD:-}" ]; then
-  START_CMD="${DETECTOR_OPT:+env DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh${VARIANT:+ $VARIANT}"
+  if [ "$QUICK" = 1 ]; then
+    START_CMD="env QUICK_BASE_NODE=wrs_main_node_${VARIANT}.py QUICK_DRAWERS=${QUICK_DRAWERS} ${DETECTOR_OPT:+DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh quick"
+  else
+    START_CMD="${DETECTOR_OPT:+env DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh${VARIANT:+ $VARIANT}"
+  fi
 fi
 CODE_FILE="${CODE_FILE:-workspace/src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node${VARIANT:+_$VARIANT}.py}"
 
@@ -126,6 +144,8 @@ fi
   echo "variant=${VARIANT:-main}"
   echo "source=$SOURCE"
   echo "monitors_stopped=${MON_KILL:-none}"
+  echo "quick=$QUICK"
+  echo "quick_drawers=$QUICK_DRAWERS"
   echo "node_file=$(basename "$CODE_FILE")"
   echo "code_path=$CODE_FILE"
   [ -f "$OUT/code_snapshot.py" ] && echo "code_sha=$(sha256sum "$OUT/code_snapshot.py" | cut -c1-10)"

@@ -9,14 +9,15 @@
 if [ $# -ge 1 ]; then
   case "$1" in
     a|b|c|local) NODE="wrs_main_node_$1.py" ;;
-    *) echo "usage: $0 [a|b|c|local]" >&2; exit 1 ;;
+    quick) NODE="wrs_main_node_quick.py" ;;   # 短縮確認: 1物体だけ 探す→つかむ→置く。環境変数 QUICK_BASE_NODE のノードのクラスを使う
+    *) echo "usage: $0 [a|b|c|local|quick]" >&2; exit 1 ;;
   esac
 else
   NODE="wrs_main_node.py"
 fi
 if [ -z "${DETECTOR:-}" ]; then
   case "${NODE}" in
-    wrs_main_node.py|wrs_main_node_c.py|wrs_main_node_local.py) DETECTOR=yolo ;;
+    wrs_main_node.py|wrs_main_node_c.py|wrs_main_node_local.py|wrs_main_node_quick.py) DETECTOR=yolo ;;
     *) DETECTOR=frcnn ;;
   esac
   # NVIDIA GPU のない環境(tools/local_cpu の CPU 環境など)では、Faster R-CNN 用の

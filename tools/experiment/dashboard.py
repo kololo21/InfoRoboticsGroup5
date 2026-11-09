@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import threading
@@ -105,6 +106,9 @@ class App:
         self.results = self.dir / "results"
         self.script = HERE / "run_experiment.sh"
         self.start_cmd = args.start_cmd
+        # NVIDIA GPU のない環境(手元の CPU 環境)か。画面の既定値を、短縮確認などに切り替えるのに使う
+        has_gpu = shutil.which("nvidia-smi") is not None or os.path.exists("/dev/nvidiactl")
+        self.cpu_env = {"cpu": True, "gpu": False}.get(args.env, not has_gpu)
         self.token = args.token or secrets.token_urlsafe(9)
         self.lan = args.lan
         self.lock = threading.Lock()
@@ -269,7 +273,14 @@ class App:
                     pts.append(last)
             except (OSError, ValueError):
                 pass
-            runs.append({**r, "timeline": pts})
+            quick = None   # 短縮確認の結果(node.log の "QUICK RESULT: {...}")
+            try:
+                for line in run_dir.joinpath("node.log").read_text(encoding="utf-8").splitlines():
+                    if "QUICK RESULT: " in line:
+                        quick = json.loads(line.split("QUICK RESULT: ", 1)[1])
+            except (OSError, ValueError):
+                pass
+            runs.append({**r, "timeline": pts, "quick": quick})
         fails = []
         try:
             with open(d / "failures.csv", encoding="utf-8") as f:
@@ -345,6 +356,9 @@ class App:
             return False, "コードの取得元が不正です"
         if det:
             argv += ["-D", det]
+        quick = b.get("quick", "")
+        if quick in ("quick", "drawers"):   # 短縮確認: 1物体だけ 探す→つかむ→置く(drawers なら引き出しも開ける)
+            argv.append("-q" if quick == "drawers" else "-Q")
         if b.get("interleave"):
             argv.append("-i")
         if not b.get("headless", True):
@@ -393,7 +407,8 @@ class Handler(BaseHTTPRequestHandler):
             sim_up = cont.get("simulator") == "running"
             score = job.get("live_score") if running else (a.idle_score() if sim_up else None)
             return self.send(200, {"containers": cont, "seed": a.current_seed() if sim_up else None,
-                                   "score": score, "job": job, "dir": str(a.dir)})
+                                   "score": score, "job": job, "dir": str(a.dir),
+                                   "cpu_env": a.cpu_env})
         if u.path == "/api/results":
             return self.send(200, a.list_results())
         if u.path == "/api/result":
@@ -424,6 +439,8 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--lan", action="store_true", help="同じネットワークの他のPCからも開けるようにする")
     p.add_argument("--token", help="固定のtoken(省略すると起動ごとにランダム)")
+    p.add_argument("--env", choices=["auto", "cpu", "gpu"], default="auto",
+                   help="環境の種類。auto は NVIDIA GPU の有無で判定。cpu だと画面の既定が短縮確認になる")
     p.add_argument("--start-cmd", help="動作テスト用: start_all.sh の代わりに実行するコマンド")
     args = p.parse_args()
     app = App(args)

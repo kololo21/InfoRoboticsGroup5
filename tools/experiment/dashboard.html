@@ -80,6 +80,7 @@ tr.sel { background: var(--bg); }
 <header>
   <h1>実験ダッシュボード</h1>
   <span class="sub" id="dir"></span>
+  <span class="chip running" id="cpubadge" style="display:none" title="NVIDIA GPU のない環境です。遅いので、既定を短縮確認(1物体だけ)にしています。範囲の選択で、フルに戻せます">CPU環境</span>
 </header>
 <main>
   <div class="banner" id="banner"></div>
@@ -137,6 +138,12 @@ tr.sel { background: var(--bg); }
         <span class="t">ラベル</span><input type="text" id="label" size="16">
       </div>
       <div class="line">
+        <span class="t">範囲</span>
+        <select id="quick">
+          <option value="">フル(Task 1→2a→2b)</option>
+          <option value="quick">短縮確認: 1物体だけ(探す→つかむ→置く)</option>
+          <option value="drawers">短縮確認: 引き出し＋1物体</option>
+        </select>
         <label class="chk"><input type="checkbox" id="headless" checked>画面なし(高速)</label>
         <label class="chk"><input type="checkbox" id="interleave" checked>Seedを交互に実行</label>
         <span class="t">1回の上限</span><input type="number" id="timeout" min="60" max="3600" value="900"><span class="muted">秒</span>
@@ -198,7 +205,20 @@ async function act(body, okMsg) {
 }
 
 /* ---- 環境 ---- */
+let cpuDefaultsApplied = false;
+function applyCpuDefaults(s) {   // GPU のない環境では、遅いので、既定を短縮確認(1物体だけ)にする
+  if (cpuDefaultsApplied || !s.cpu_env) return;
+  cpuDefaultsApplied = true;
+  $("cpubadge").style.display = "";
+  let saved = null; try { saved = localStorage.getItem("form"); } catch (e) {}
+  if (saved) return;   // 自分で選んだ設定があれば、それを優先する
+  $("source").value = "workspace"; $("variant").value = "c"; $("detector").value = "yolo";
+  $("quick").value = "quick"; $("repeat").value = 1; $("timeout").value = 900;
+  $("headless").checked = true; showSource();
+  $("seeds").querySelectorAll("input").forEach(i => { i.checked = i.value === "86"; });   // 短縮確認は Seed 86 だけ
+}
 function renderStatus(s) {
+  applyCpuDefaults(s);
   $("dir").textContent = s.dir;
   const c = s.containers || {}, names = ["xserver", "simulator", "workspace"];
   $("containers").innerHTML = names.map(n => `<span class="chip ${c[n] === "running" ? "running" : (c[n] ? "" : "none")}" title="${n}">${n}</span>`).join("");
@@ -301,6 +321,10 @@ async function showDetail(name) {
     <div class="tablewrap"><table><thead><tr><th>Seed</th><th>回</th><th class="num">最終</th><th class="num">最大</th><th class="num">衝突</th><th class="num">見つからない</th><th class="num">終了コード</th><th class="num">秒</th><th></th></tr></thead><tbody>
     ${d.runs.map(x => `<tr><td>${x.seed}</td><td>${x.run}</td><td class="num">${fmt(x.score_final, 0)}</td><td class="num">${fmt(x.score_max, 0)}</td><td class="num">${x.collisions}</td><td class="num">${x.not_found}</td><td class="num">${x.exit_code}</td><td class="num">${x.wall_sec}</td><td><button data-run="seed${x.seed}_run${x.run}">ログ</button></td></tr>`).join("")}
     </tbody></table></div>
+    ${d.runs.some(x => x.quick) ? `<div><b>短縮確認の結果</b> <span class="muted">(1物体だけ。指の間隔が 0 付近なら、何も持てていない)</span>
+      <div class="tablewrap"><table><thead><tr><th>Seed</th><th>物体</th><th class="num">つかんだ直後の指の間隔[m]</th><th>置けたか</th><th class="num">スコア</th><th class="num">シミュ秒</th><th>エラー</th></tr></thead><tbody>
+      ${d.runs.filter(x => x.quick).map(x => { const q = x.quick; return `<tr><td>${x.seed}</td><td>${esc(q.label || "–")}</td><td class="num">${q.finger_gap_after_pick ?? "–"}</td><td>${q.placed === undefined ? "–" : (q.placed ? "はい" : "いいえ")}</td><td class="num">${q.score ?? "–"}</td><td class="num">${q.elapsed_sim_sec ?? "–"}</td><td>${esc(q.error || "")}</td></tr>`; }).join("")}
+      </tbody></table></div></div>` : ""}
     <div><b>失敗の内訳</b> <span class="muted">(全実行の合計。分類は analyze_failures.sh の PATTERNS)</span>
       <div class="bars">${f.length ? f.map(x => `<div><span>${esc(x.k)}</span><i style="width:${100 * x.v / fmax}%"></i><span>${x.v} (${x.avg.toFixed(1)}/回)</span></div>`).join("") : '<span class="muted">検出された失敗はありません</span>'}</div></div>
     <pre class="log" id="runlog" style="display:none"></pre></div>`;
@@ -343,6 +367,7 @@ $("b-run").onclick = () => {
   const seeds = [...$("seeds").querySelectorAll("input:checked")].map(i => i.value);
   const body = {action: "run", seeds, repeat: +$("repeat").value, variant: $("variant").value, detector: $("detector").value,
     label: $("label").value.trim(), headless: $("headless").checked, interleave: $("interleave").checked, timeout: +$("timeout").value,
+    quick: $("quick").value,
     source: $("source").value, github_ref: $("gh-ref").value.trim(), github_path: $("gh-path").value.trim(), file_path: $("file-path").value.trim()};
   try { localStorage.setItem("form", JSON.stringify({repeat: body.repeat, variant: body.variant, detector: body.detector,
     timeout: body.timeout, headless: body.headless, interleave: body.interleave, source: body.source,
