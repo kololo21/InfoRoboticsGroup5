@@ -743,7 +743,10 @@ class WrsMainController(object):
             raise ValueError("Unrecognized placement label: {}".format(label))
         if category in ("drawer_tools", "drawer_shape"):
             return self.select_drawer_place(label, category)
-        self.ensure_sensor_placements(category, destinations[category])
+        # センサで推定した位置に置く方式（4d2378b）は、置き場所の上で離せないことがあるので止めている。
+        # 置き場所の設定がないトレイ・コンテナ行きは例外になり、Task 1 側で引き出し（開いていれば）か bin_b に入れる
+        if self.USE_SENSOR_PLACEMENT:
+            self.ensure_sensor_placements(category, destinations[category])
         targets = getattr(self, "placement_targets", {})
         candidates = [(place, pose) for place, pose in destinations[category]
                       if place in self.coordinates["positions"]
@@ -967,6 +970,7 @@ class WrsMainController(object):
     #   引き出しの箱は奥行き 0.42m（map の y 方向）・幅 0.30m・高さ 0.227m → 前面は y = -0.39
     # 授業のシミュレータで値がずれていたら、ここの数字だけ直す（Gazebo で引き出しをクリックして確認）
     # ------------------------------------------------------------------
+    USE_SENSOR_PLACEMENT = False            # True: トレイ・コンテナの位置を深度センサで推定して置く（4d2378b）
     USE_DRAWER = True                       # False にすると引き出しを使わない（今までどおり bin_b へ）
     DRAWER_STANDPOINT = [0.2, 0.25, -90]    # 引き出しの正面に立つ位置（開けた引き出しに当たらない距離）
     DRAWER_HANDLE_X = 0.2                   # 取っ手の x
@@ -1103,10 +1107,9 @@ class WrsMainController(object):
                     rospy.logwarn("Failed to obtain grasp coordinate.")
                     continue
 
-                # ----------------------------------------------------
-                # 改善点: 中間姿勢 change_pose("grasp_on_table") を削除
-                # grasp_from_side 内のアプローチ移動で直接把持動作を行う
-                # ----------------------------------------------------
+                # 把持姿勢へ移動してから把持する（week1 の 49344b3 と同じ）。
+                # 中間姿勢を省くと、見下ろす姿勢から手が直接向かうので物体を蹴ってしまう
+                self.change_pose("grasp_on_table")
                 grasp_success = self.exec_graspable_method(grasp_pos, label)
 
                 self.change_pose("all_neutral")
@@ -1332,45 +1335,17 @@ class WrsMainController(object):
         self.grasp_from_front_side(grasp_pos)
         self.change_pose("all_neutral")
 
-        # 2人の間をスライドして渡す（もう1人の前から始めて、target_person の前で離す）
+        # target_personの前に持っていく
         if target_person not in self.PERSON_WAYPOINTS:
             rospy.logwarn("unknown person [%s]. use default [%s].", target_person,
                           self.DEFAULT_PERSON)
             target_person = self.DEFAULT_PERSON
-        end = self.PERSON_WAYPOINTS[target_person]
-        start = "person_a" if end == "person_b" else "person_b"
         self.change_pose("look_at_near_floor")
-        self.goto_name(start)
+        self.goto_name(self.PERSON_WAYPOINTS[target_person])
         self.change_pose("deliver_to_human")
-        self.slide_base_to(self.coordinates["positions"][end])
         rospy.sleep(10.0)
         gripper.command(1)
         self.change_pose("all_neutral")
-
-    TASK2B_SLIDE_SPEED = 0.1   # 人の前をスライドする速さ [m/s]
-
-    def slide_base_to(self, waypoint):
-        """62401738 いしい
-        向きを waypoint の角度に保ったまま、waypoint (x, y, yaw[deg]) まで横に直進する（腕は出したまま）。
-        tf が取れなければ move_base（goto_pos）で移動する。
-        """
-        pose = self.get_robot_pose()
-        if pose is None:
-            self.goto_pos(waypoint)
-            return
-        dist0 = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
-        end_time = rospy.Time.now() + rospy.Duration(dist0 / self.TASK2B_SLIDE_SPEED * 2.0 + 5.0)
-        while not rospy.is_shutdown() and rospy.Time.now() < end_time:
-            pose = self.get_robot_pose()
-            if pose is None:
-                break
-            if math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < self.TASK2A_GOAL_TOL:
-                break
-            vel_x, vel_y, yaw_rate = self.calc_base_velocity(
-                pose, waypoint[:2], waypoint[2], self.TASK2B_SLIDE_SPEED)
-            omni_base.cmd_vel(vel_x, vel_y, yaw_rate)
-            rospy.sleep(self.TASK2A_CONTROL_DT)
-        self.stop_base()
 
     @classmethod
     def is_task2a_obstacle(cls, pos):
@@ -1708,27 +1683,23 @@ class WrsMainController(object):
         omni_base.cmd_vel(0.0, 0.0, 0.0)
 
     @classmethod
-    def calc_base_velocity(cls, pose, target, yaw_deg=None, max_speed=None):
+    def calc_base_velocity(cls, pose, target):
         """62401738 いしい
         今の姿勢 pose (x, y, yaw) から target (x, y) へ直進するための速度指令を計算する。
-        - 位置: map 座標での誤差に比例した速度（最大 max_speed、省略時 TASK2A_MAX_SPEED）で、目標へ一直線に向かう
-        - 向き: yaw_deg（省略時 TASK2A_YAW）を保つ（全方向台車なので、向きを変えずに横にも進める）
+        - 位置: map 座標での誤差に比例した速度（最大 TASK2A_MAX_SPEED）で、目標へ一直線に向かう
+        - 向き: TASK2A_YAW を保つ（全方向台車なので、向きを変えずに横にも進める）
         map 座標の速度をロボット座標に回転して (vx, vy, w[deg/s]) を返す。
         """
-        if yaw_deg is None:
-            yaw_deg = cls.TASK2A_YAW
-        if max_speed is None:
-            max_speed = cls.TASK2A_MAX_SPEED
         err_x, err_y = target[0] - pose[0], target[1] - pose[1]
         dist = math.hypot(err_x, err_y)
-        speed = min(max_speed, cls.TASK2A_GAIN * dist)
+        speed = min(cls.TASK2A_MAX_SPEED, cls.TASK2A_GAIN * dist)
         map_vx = err_x / dist * speed if dist > 0 else 0.0
         map_vy = err_y / dist * speed if dist > 0 else 0.0
         cos_y, sin_y = math.cos(pose[2]), math.sin(pose[2])
         robot_vx = cos_y * map_vx + sin_y * map_vy
         robot_vy = -sin_y * map_vx + cos_y * map_vy
-        yaw_err = math.atan2(math.sin(math.radians(yaw_deg) - pose[2]),
-                             math.cos(math.radians(yaw_deg) - pose[2]))
+        yaw_err = math.atan2(math.sin(math.radians(cls.TASK2A_YAW) - pose[2]),
+                             math.cos(math.radians(cls.TASK2A_YAW) - pose[2]))
         yaw_rate = max(-30.0, min(30.0, math.degrees(cls.TASK2A_YAW_GAIN * yaw_err)))
         return robot_vx, robot_vy, yaw_rate
 
