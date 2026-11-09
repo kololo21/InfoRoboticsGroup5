@@ -114,6 +114,13 @@ def main():
     sources = sorted(p for p in glob.glob(os.path.join(img_dir, "*"))
                      if p.lower().endswith(IMAGE_EXTS))
     n_made = n_dropped = 0
+    # images/train はリンク（convert_to_yolo.py が元画像へ張る）なので、元画像が消えていると開けない。
+    # そういう画像は水増しせずに飛ばす（データセットを作り直すなら convert_to_yolo.py をもう一度実行）
+    missing = [p for p in sources if not os.path.exists(p)]
+    if missing:
+        print("skip %d images whose source file is missing (e.g. %s -> %s)"
+              % (len(missing), os.path.basename(missing[0]), os.path.realpath(missing[0])))
+    sources = [p for p in sources if os.path.exists(p)]
     for path in sources:
         stem, ext = os.path.splitext(os.path.basename(path))
         labels = read_labels(os.path.join(lbl_dir, stem + ".txt"))
