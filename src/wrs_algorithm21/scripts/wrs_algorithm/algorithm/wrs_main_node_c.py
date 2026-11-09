@@ -12,7 +12,7 @@ import time
 import rospy
 import rospkg
 import tf2_ros
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.srv import GetPlan
 from actionlib_msgs.msg import GoalStatus
@@ -68,6 +68,9 @@ class WrsMainController(object):
             "/message", String, self.instruction_cb, queue_size=10)
         self.detection_sub = rospy.Subscriber(
             "/detect_msg", String, self.detection_cb, queue_size=10)
+        # シミュレータの得点（画面左上の数字）。置いた後に増えたかで、置けたかを確かめる
+        self.score = None
+        self.score_sub = rospy.Subscriber("/score", Float32, self.score_cb, queue_size=10)
 
     @staticmethod
     def get_path(pathes, package="wrs_algorithm"):
@@ -95,6 +98,12 @@ class WrsMainController(object):
         """
         rospy.loginfo("instruction received. [%s]", msg.data)
         self.instruction_list.append(msg.data)
+
+    def score_cb(self, msg):
+        """62401738 いしい
+        /score（シミュレータの合計得点）を覚えておく。
+        """
+        self.score = float(msg.data)
 
     def detection_cb(self, msg):
         """サンプルのまま（担当なし）
@@ -1005,6 +1014,7 @@ class WrsMainController(object):
                     ("align", lambda: self.align_hand_over(
                         place, self.placement_targets[place]["x"],
                         self.placement_targets[place]["y"])),
+                    ("lower", lambda: self.lower_tall_object(place, label)),
                     ("release", lambda: gripper.command(1))])
             else:
                 stages.append(("place", lambda: self.drawer_pose(into_pose)))
@@ -1030,6 +1040,7 @@ class WrsMainController(object):
         finally:
             record["elapsed_seconds"] = round(time.monotonic() - started, 3)
             rospy.loginfo("Placement result: %s", json.dumps(record, sort_keys=True))
+            self.log_drawer_poses("placing at {}".format(place))
 
     def pull_out_trofast(self, x, y, z, yaw, pitch, roll):
         """サンプルのまま（担当なし）
@@ -1211,8 +1222,10 @@ class WrsMainController(object):
         指定しないとき（引き出しを引く）は y が着いたら止まる（11/9: 置くときに x が 6cm ずれたまま離していた）。
         """
         self.drawer_slipped = False
+        self.base_stalled = False
         rate = rospy.Rate(20)
         deadline = rospy.Time.now() + rospy.Duration(timeout)
+        window = []   # 直近の (時刻, 手の位置, 指令した速さ)。進んでいないかを見る
         try:
             while not rospy.is_shutdown() and rospy.Time.now() < deadline:
                 hand = self.lookup_xyz("hand_palm_link", frame)
@@ -1223,6 +1236,12 @@ class WrsMainController(object):
                 remain_x = keep_x - hand[0]
                 if abs(remain) < 0.005 and (x_tol is None or abs(remain_x) < x_tol):
                     return True
+                if self.is_base_stalled(window, hand):
+                    # 手が何かに当たって進まない（取っ手に押し付けている・引き出しが止まった）。
+                    # 押し続けると腕を伸ばしたまま車体が後ろに傾く（11/9 07:59 上段）ので、ここで止める
+                    rospy.logwarn("hand is not moving (%.3f m left); stop the base", remain)
+                    self.base_stalled = True
+                    return False
                 if watch_grip:
                     gap = self.finger_gap()
                     if gap is not None and gap < self.slip_threshold():
@@ -1238,12 +1257,49 @@ class WrsMainController(object):
                 vel_x = math.cos(yaw) * vx_map + math.sin(yaw) * vy_map
                 vel_y = -math.sin(yaw) * vx_map + math.cos(yaw) * vy_map
                 omni_base.cmd_vel(vel_x, vel_y, 0)
+                window.append((rospy.Time.now().to_sec(), hand, math.hypot(vx_map, vy_map)))
                 rate.sleep()
             return False
         finally:
             for _ in range(3):
                 omni_base.cmd_vel(0, 0, 0)
                 rospy.sleep(0.05)
+
+    # 引いた後に手を抜くとき下がる距離。指先は板の前面から DRAWER_GRASP_DEPTH 奥にあるので、
+    # それより 4cm 多く下がれば板から抜ける（以前は 0.12。台車の後ろの床の物に近づきすぎていた）
+    DRAWER_RETREAT = 0.07
+    DRAWER_OPEN_GAP = 0.08   # 開いたとみなす指先の間隔（取っ手の板の幅 6.6cm より広い）
+
+    def open_gripper_checked(self):
+        """62401738 いしい
+        ハンドを開き、指先の間隔が取っ手の板より広くなったか確かめる。開かなければもう一度開く。
+        指の間隔が取れないとき（tf がない）は、開いたものとして True を返す。
+        """
+        for _ in range(2):
+            gripper.command(1)
+            gap = self.finger_gap()
+            if gap is None or gap >= self.DRAWER_OPEN_GAP:
+                return True
+            rospy.logwarn("gripper still closed after open command (gap %.3f)", gap)
+        return False
+
+    STALL_WINDOW = 1.5     # 進んでいるかを見る時間 [s]
+    STALL_MIN_CMD = 0.02   # この時間に指令した距離がこれ以上のときだけ判定する [m]
+    STALL_RATIO = 0.3      # 実際に動いた距離が指令の 3 割未満なら、当たって進んでいない
+
+    def is_base_stalled(self, window, hand):
+        """62401738 いしい
+        window（直近の 時刻・手の位置・指令した速さ）から、台車に指令しているのに手が進んでいないかを判定する。
+        """
+        now = rospy.Time.now().to_sec()
+        while window and now - window[0][0] > self.STALL_WINDOW:
+            window.pop(0)
+        if len(window) < 2 or now - window[0][0] < self.STALL_WINDOW * 0.8:
+            return False
+        commanded = sum(speed * (b[0] - a[0]) for a, b, speed in
+                        ((window[i], window[i + 1], window[i][2]) for i in range(len(window) - 1)))
+        moved = math.hypot(hand[0] - window[0][1][0], hand[1] - window[0][1][1])
+        return commanded > self.STALL_MIN_CMD and moved < commanded * self.STALL_RATIO
 
     def slip_threshold(self):
         """62401738 いしい
@@ -1430,10 +1486,8 @@ class WrsMainController(object):
         （成功した回は引き終わりまで指の間隔が 0.06 前後のまま、失敗した回は 0.01 まで閉じていた）。
         そこで、足りなければ取っ手の今の位置からもう一度つかんで、残りを引く（DRAWER_PULL_TRIES 回まで）。
         """
-        yaw, pitch, roll = self.DRAWER_HAND_RPY
         if pull is None:
             pull = self.DRAWERS[level]["pull"]
-        gap_min = self.DRAWER_FINGER_GAP_RANGE[0]
         self.drawer_face0 = getattr(self, "drawer_face0", {})
         self.drawer_opened = getattr(self, "drawer_opened", {})
         second = total is not None and level in self.drawer_face0
@@ -1470,30 +1524,44 @@ class WrsMainController(object):
                 hand = self.grasp_drawer_handle(level, knob)
             if hand is None:
                 break
-            pos_x, grasp_y, pos_z = hand
+            pos_x, grasp_y, _ = hand
             remain = hand_goal_y - grasp_y   # 実際に引く量（決めた所より先へは引かない）
             if remain < 0.03:
                 gripper.command(1)
                 break
+            # 引く先・手を抜く先を、つかんだ時点で odom 座標に直して固定する。
+            # map（AMCL）のまま引くと、引き出しのそばで自己位置が飛んだ分（最大 16cm）だけ
+            # 余計に引いてしまい、引きすぎ・引きずりになっていた。odom は車輪の回転なので飛ばない。
+            frame = "map"
+            pull_goal = (pos_x, hand_goal_y)
+            back_goal = (pos_x, hand_goal_y + self.DRAWER_RETREAT)
+            odom_pull = self.map_to_odom(*pull_goal)
+            odom_back = self.map_to_odom(*back_goal)
+            if odom_pull is not None and odom_back is not None:
+                frame, pull_goal, back_goal = "odom", odom_pull, odom_back
             if (not self.move_hand_by_base(
-                    hand_goal_y, pos_x, timeout=remain / self.DRAWER_PULL_SPEED * 3 + 5,
-                    watch_grip=True)
+                    pull_goal[1], pull_goal[0], timeout=remain / self.DRAWER_PULL_SPEED * 3 + 5,
+                    watch_grip=True, frame=frame)
                     and not self.drawer_slipped):
-                # 外れていないのに台車で引けなかったときだけ、全身の IK で引いてみる
-                rospy.logwarn("base pull did not finish; pull with whole body IK")
-                whole_body.move_end_effector_pose(
-                    pos_x, hand_goal_y, pos_z, yaw, pitch, roll)
+                # 以前はここで全身 IK で引き直していたが、IK は台車を回したり余計に動かしたりして
+                # 引き出しを引きずる・引きすぎる原因になるので、引けた所で止める
+                rospy.logwarn("base pull did not finish; stop pulling here")
+            slipped = self.drawer_slipped   # 手を抜く移動で上書きされるので、先に覚えておく
             gap_end = self.finger_gap()
-            gripper.command(1)
-            # 手を抜く（開いた引き出しにぶつからないよう、台車で後ろへ下がる）
-            if not self.move_hand_by_base(hand_goal_y + 0.12, pos_x, timeout=8):
-                whole_body.move_end_effector_pose(
-                    pos_x, hand_goal_y + 0.12, pos_z, yaw, pitch, roll)
+            if not self.open_gripper_checked():
+                # 指が開かないまま下がると引き出しごと引きずるので、下がらずに諦める
+                rospy.logerr("gripper did not open on the %s drawer handle; stop", level)
+                break
+            # 手を抜く（指先が取っ手の板の手前に出るだけ下がる。下がりすぎると後ろの床の物を蹴る）
+            self.move_hand_by_base(back_goal[1], back_goal[0], timeout=8, frame=frame)
             rospy.loginfo("%s drawer: finger gap at end of pull %s", level, gap_end)
             # 腕を上げてから（開いた引き出しの前で腕を下ろさない）、取っ手がどこまで来たかをカメラで確かめる
             self.drawer_pose("all_neutral")
             self.look_at_drawer(level)
-            seen = self.detect_drawer_knob(level, knob[1] + remain, z_tol=0.10, y_tol=0.25)
+            # 途中で外れたときは、引き出しはほとんど動いていないので元の位置のまわりを探す
+            # （11/9 08:26 下段: 引けた先 -0.065 ± 0.25 を探し、元の -0.33 にある取っ手を見落とした）
+            expect_y = knob[1] if slipped else knob[1] + remain
+            seen = self.detect_drawer_knob(level, expect_y, z_tol=0.10, y_tol=0.25)
             if seen is not None:
                 knob = seen
                 opened = seen[1] - face0
@@ -1503,8 +1571,9 @@ class WrsMainController(object):
             rospy.loginfo("%s drawer opened %.3f m (goal %.2f)", level, opened, pull)
             if opened >= pull * 0.8:
                 break
-            if seen is None:
+            if seen is None and not slipped:
                 break  # 取っ手の位置が分からないので、もう一度つかみに行けない
+            # 外れて取っ手も見えないときは、最後に分かっている位置（knob のまま）でつかみ直す
             self.go_to_drawer(level)  # 立ち位置に戻ってつかみ直す
         if opened >= pull * 0.5:
             self.drawer_opened = getattr(self, "drawer_opened", {})
@@ -1554,12 +1623,15 @@ class WrsMainController(object):
             # 下段を全開（0.30）→ 上段を半分（0.20）の順。
             # 上段を先に開けると、下段へ腕を下ろすときに開いた上段に引っかかる（11/9 の実行）。
             # 下段が出ていると全身 IK では上段に届かないので、上段は決まった姿勢 + 台車でつかむ。
-            self.go_to_drawer("bottom")
-            opened["bottom"] = self.pull_drawer("bottom")
-            self.go_to_drawer("top")
-            opened["top"] = self.pull_drawer("top")
-            self.go_to_drawer("left")
-            opened["left"] = self.pull_drawer("left")
+            end = float(rospy.get_param("~drawer_end_sec", self.DRAWER_END_SEC))
+            for level in ("bottom", "top", "left"):
+                if self.elapsed_since_start() > end:
+                    # 引き出しに時間を使いすぎると Task 1・2 の時間がなくなるので、残りは開けない
+                    rospy.logwarn("drawer time is up; skip the %s drawer", level)
+                    continue
+                self.go_to_drawer(level)
+                opened[level] = self.pull_drawer(level)
+                self.log_drawer_poses("pulling the {} drawer".format(level))
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
             rospy.logerr("drawer error: %s", error)
         finally:
@@ -1584,6 +1656,30 @@ class WrsMainController(object):
         if not self.drawers_open:
             rospy.logwarn("could not open the drawers. use bin_b instead.")
         return self.drawers_open
+
+    DRAWER_MODELS = {"trofast_1": "left", "trofast_2": "bottom", "trofast_3": "top"}
+    DRAWER_CLOSED_X = -2.7   # 閉じているときの引き出しの world x（前へ引くと増える）
+
+    def log_drawer_poses(self, when):
+        """62401738 いしい
+        デバッグ用: Gazebo の引き出しの位置（どれだけ出ているか）をログに出すだけ。動作の判断には使わない。
+        11/9 08:26〜08:32 の実行で下段が棚から抜けて床に落ちていたが、どの動作で抜けたかがログから分からなかった。
+        ~log_drawer_poses を False にすると出さない。
+        """
+        if not rospy.get_param("~log_drawer_poses", True):
+            return
+        from gazebo_msgs.msg import ModelStates
+        try:
+            states = rospy.wait_for_message("/gazebo/model_states", ModelStates, timeout=2.0)
+        except rospy.ROSException:
+            return
+        parts = []
+        for name, level in sorted(self.DRAWER_MODELS.items()):
+            if name in states.name:
+                pos = states.pose[states.name.index(name)].position
+                parts.append("{} {:+.3f} (y {:.2f}, z {:.2f})".format(
+                    level, pos.x - self.DRAWER_CLOSED_X, pos.y, pos.z))
+        rospy.loginfo("[debug] drawers after %s: %s", when, ", ".join(parts))
 
     def register_drawer_place(self, place, drop, level):
         """62401738 いしい
@@ -1671,6 +1767,34 @@ class WrsMainController(object):
             self.placement_alternates[place] = [
                 x - self.DRAWER_HAND_LEFT, y + self.DRAWER_HAND_FORWARD + 0.10, -90.0]
         self.placement_targets = targets
+
+    # 背の高い物の高さ [m]（YCB の寸法）。真ん中をつかんでいるので、底は指先より高さの半分だけ下にある。
+    # 容器の上 0.71 で離すと、底が縁（0.51）より上から落ちて倒れ、外へこぼれていた（11/9 windex_bottle）。
+    TALL_OBJECTS = {
+        "windex_bottle": 0.27, "bleach_cleanser": 0.25, "chips_can": 0.25, "pitcher_base": 0.24,
+        "cracker_box": 0.21, "mustard_bottle": 0.19, "sugar_box": 0.18, "master_chef_can": 0.14,
+    }
+    PLACE_FLOOR_Z = 0.40       # 容器・トレイの底の高さ（机の天面）
+    RELEASE_CLEARANCE = 0.03   # 物の底を床からどれだけ浮かせて離すか
+
+    def lower_tall_object(self, place, label):
+        """62401738 いしい
+        背の高い物は、容器の真上で位置を合わせた後に腕をまっすぐ下ろし、底を床の近くまで入れてから離す。
+        それ以外の物は何もしない（True）。
+        """
+        height = self.TALL_OBJECTS.get(label)
+        if height is None:
+            return True
+        tips_z = self.PLACE_FLOOR_Z + height / 2.0 + self.RELEASE_CLEARANCE
+        joints = dict(self.poses[self.release_pose_for(place)])
+        lift = max(0.0, min(joints["arm_lift_joint"], tips_z - self.RELEASE_TIPS_Z0))
+        if lift >= joints["arm_lift_joint"] - 0.01:
+            return True
+        rospy.loginfo("lower %s into %s: arm_lift %.3f -> %.3f",
+                      label, place, joints["arm_lift_joint"], lift)
+        joints["arm_lift_joint"] = lift
+        self.move_joints(joints)
+        return True  # 下ろせなくても、その高さで離す（持ったまま次へ行かない）
 
     def release_pose_for(self, place):
         """62401738 いしい
@@ -1800,20 +1924,223 @@ class WrsMainController(object):
 
     def put_in_fallback(self, label):
         """62401738 いしい
-        正しい置き場所に置けなかった物体を置く。
-        2 段の引き出し（上段）→ 横の引き出し → bin_b の順に試す。
+        正しい置き場所に置けなかった物体を、week1 と同じく bin_b に入れる（持ったまま次の物を取りに行かない）。
+        以前は先に引き出しへ入れていたが、食べ物・台所用品が工具の引き出しに入って「置き場所が違う」状態になり、
+        しかも引き出しは位置合わせが難しく、開いた引き出しのそばを何度も通ることになった。
+        引き出しに入れても bin_b に入れても、カテゴリ違いの点（10 点）は同じなので、確実な bin_b にする。
         """
-        places = getattr(self, "drawer_places", {})
-        tried = getattr(self, "last_placement_result", {}).get("place")
-        for place in (self.DRAWER_PLACE_NAME, self.DRAWER_LEFT_PLACE_NAME):
-            if place not in places or place == tried:
-                continue  # 開いていない引き出しと、今失敗した所は飛ばす
-            if self.put_in_place(place, places[place], label=label):
-                return True
-            if getattr(self, "last_placement_result", {}).get("released", False):
-                return False  # 手を離した後の失敗。もう持っていないので bin_b へは行かない
-        # 引き出しに置けなければ、week1 と同じく bin_b に入れる（持ったまま次の物を取りに行かない）
         return self.put_in_place("bin_b_place", "put_in_bin", label=label)
+
+    # 時間配分（実行開始 run_start からの秒数。rospy の時刻なのでシミュレータの時間）。
+    # Task 1 は物がなくなるまで続ける（全部取る）。それでも終わらないときだけ、ここで打ち切って Task 2 へ行く。
+    # 11/9 08:30 は 10 分で打ち切っていたが、シミュレータの時間は実時間の約 2 倍の速さで進んでいて、
+    # 実時間 5 分・3 個で Task 2a へ行ってしまった。Task 2a・2b はシミュレータの時間で 3〜4 分かかる。
+    TASK1_END_SEC = 16 * 60      # これを過ぎたら Task 1 をやめる（~task1_end_sec で変更）
+    TASK1_MIN_CYCLE_SEC = 60     # 物体 1 個（探す・つかむ・置く）にかかる時間の目安
+    DRAWER_END_SEC = 6 * 60      # 引き出しを開けるのはここまで（~drawer_end_sec で変更。3 つで約 4 分）
+
+    def elapsed_since_start(self):
+        """62401738 いしい
+        run() を始めてからの秒数。run() を通さずに呼ばれたときは、初めて呼ばれた時から数える。
+        """
+        if getattr(self, "run_start", None) is None:
+            self.run_start = rospy.Time.now()
+        return (rospy.Time.now() - self.run_start).to_sec()
+
+    def task1_time_left(self):
+        """62401738 いしい
+        Task 1 に使える残りの秒数。
+        """
+        end = float(rospy.get_param("~task1_end_sec", self.TASK1_END_SEC))
+        return end - self.elapsed_since_start()
+
+    # ------------------------------------------------------------------
+    # 点数が入るまで置き直す（/score が増えたかで確かめる）
+    #   正しい置き場所に PLACE_TRIES 回 → だめならボックス（Bin B / Bin A）に BIN_TRIES 回まで。
+    #   離したのに点が増えなければ、足元に落ちた同じ物を探して拾い直してから次を試す。
+    # ------------------------------------------------------------------
+    PLACE_TRIES = 2
+    BIN_TRIES = 3
+    BIN_PLACES = ("bin_b_place", "bin_a_place")
+    SCORE_WAIT = 5.0        # 離してから点が入るまで待つ時間 [s]（物が落ち着くまで）
+    SCORE_MIN_GAIN = 5.0    # これ以上増えたら入ったとみなす（1 個 10 点。衝突の減点 ×0.5 でも 5 点）
+    REPICK_HEAD_TILT = -0.9  # 落とした物を探すときの頭の下向き [rad]
+    # 拾い直しは置き場所の前（ロボットは -y 向き）で行う。手の向きは引き出しの取っ手と同じ（-y 向きで確認済み）
+    REPICK_HAND_RPY = (-90, 100, 0)
+
+    def score_available(self):
+        """62401738 いしい
+        /score を使って点数を確かめられるか（~use_score_feedback が False なら使わない）。
+        """
+        return bool(rospy.get_param("~use_score_feedback", True)) and self.score is not None
+
+    def wait_for_score(self, before):
+        """62401738 いしい
+        得点が before から SCORE_MIN_GAIN 以上増えるのを SCORE_WAIT 秒まで待つ。増えたら True。
+        """
+        deadline = rospy.Time.now() + rospy.Duration(self.SCORE_WAIT)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.score is not None and self.score - before >= self.SCORE_MIN_GAIN:
+                rospy.loginfo("score %.1f -> %.1f", before, self.score)
+                return True
+            rospy.sleep(0.2)
+        rospy.logwarn("score did not increase (%.1f -> %s)", before, self.score)
+        return False
+
+    def try_place(self, label, place=None):
+        """62401738 いしい
+        持っている物を 1 回置き、点が入ったか確かめる。
+        place が None なら正しい置き場所（put_object_by_label）、そうでなければその場所（ボックス）。
+        戻り値は (点が入ったか, まだ持っているか)。
+        """
+        before = self.score
+        if place is None:
+            self.put_object_by_label(label)
+        else:
+            self.put_in_place(place, "put_in_bin", label=label)
+        released = getattr(self, "last_placement_result", {}).get("released", False)
+        if not released:
+            return False, True
+        return self.wait_for_score(before), False
+
+    def place_until_scored(self, label):
+        """62401738 いしい
+        点数が入るまで置き直す。正しい置き場所に PLACE_TRIES 回、だめならボックスに BIN_TRIES 回。
+        落としたときは拾い直す（拾えなければあきらめる）。点が入ったら True。
+        """
+        if not self.score_available():
+            # 得点が分からないときは今までどおり（置けなければ bin_b）
+            if self.put_object_by_label(label):
+                return True
+            if not getattr(self, "last_placement_result", {}).get("released", False):
+                return self.put_in_fallback(label)
+            return False
+        plan = [None] * self.PLACE_TRIES + [
+            self.BIN_PLACES[i % len(self.BIN_PLACES)] for i in range(self.BIN_TRIES)]
+        holding = True
+        for attempt, place in enumerate(plan):
+            if self.task1_time_left() < -60 and not holding:
+                break  # Task 2 の時間に食い込んでいるので、落ちた物はあきらめる
+            if not holding and not self.repick_dropped(label):
+                rospy.logwarn("cannot find dropped %s; give up", label)
+                return False
+            rospy.loginfo("place %s: try %d/%d at %s", label, attempt + 1, len(plan),
+                          place or "its category place")
+            scored, holding = self.try_place(label, place)
+            if scored:
+                return True
+        if holding:
+            # 全部だめでも持ったまま次へ行かない（次の探索地点で落として物を蹴る）
+            self.put_in_place(self.BIN_PLACES[0], "put_in_bin", label=label)
+        return False
+
+    def repick_dropped(self, label):
+        """62401738 いしい
+        置き場所の前で下を見て、落とした label の物を探して拾う。拾えたら True。
+        ロボットは置き場所の方（-y）を向いている前提。向きが違えば拾わない。
+        """
+        yaw = self.base_yaw()
+        if yaw is None or abs(math.degrees(yaw) + 90) > 30:
+            rospy.logwarn("not facing -y (yaw %s); cannot re-pick here", yaw)
+            return False
+        self.drawer_pose("all_neutral")
+        self.move_joints({"head_pan_joint": 0.0, "head_tilt_joint": self.REPICK_HEAD_TILT})
+        rospy.sleep(0.5)
+        objs = [obj for obj in self.get_latest_detection().bboxes
+                if self.normalize_placement_label(obj.label) == label]
+        best = self.get_most_graspable_obj(objs)
+        if best is None:
+            return False
+        pos = self.get_grasp_coordinate(best["bbox"])
+        if pos is None:
+            return False
+        rospy.loginfo("re-pick %s at (%.2f, %.2f, %.2f)", label, pos.x, pos.y, pos.z)
+        yaw_h, pitch, roll = self.REPICK_HAND_RPY
+        # 手前（+y、ロボット側）から差し込む。手のひらは物の中心より HAND_PALM_OFFSET 手前
+        self.grasp_from_side(pos.x, pos.y + self.HAND_PALM_OFFSET, pos.z,
+                             yaw_h, pitch, roll, "+y")
+        gap = self.finger_gap()
+        self.drawer_pose("all_neutral")
+        if gap is not None and gap < 0.01:
+            rospy.logwarn("re-pick of %s missed (gap %.3f)", label, gap)
+            gripper.command(1)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # 取り直し（検出 → 把持を、その場で GRASP_TRIES 回まで）
+    # ------------------------------------------------------------------
+    GRASP_TRIES = 3
+    GRASP_EMPTY_GAP = 0.005    # 閉じた後の指の間隔がこれ未満なら、何もつかんでいない（空で閉じると 0.001 未満）
+    # 薄くて、つかめていても指の間隔がほぼ 0 になる物は、空振りの判定をしない
+    THIN_LABELS = {"credit_card_blank", "fork", "spoon", "plate", "large_marker", "small_marker"}
+    GRASP_AVOID_DIST = 0.08    # 家具に当たった物体の位置から、これ以内の物は同じ物とみなして避ける [m]
+
+    def furniture_hits(self):
+        """62401738 いしい
+        これまでに受け取った、家具（wrc_*。Task 2a の障害物以外）との衝突メッセージの数。
+        """
+        return len([msg for msg in self.detection_list
+                    if "Collision" in msg and "wrc_" in msg and "task2a" not in msg])
+
+    def pick_here(self, plc, pose):
+        """62401738 いしい
+        今いる探索地点で物体を検出してつかむ。失敗したら検出し直して GRASP_TRIES 回まで取り直す。
+        - 空振り（閉じた指の間隔が GRASP_EMPTY_GAP 未満）: 物が動いたかもしれないので検出し直す
+        - つかみに行く途中で机などに当たった物: その位置を覚え、次からは別の物を選ぶ
+          （同じ物に何度も手を伸ばして机にぶつけ続けない）
+        戻り値は (つかんだ物のラベル or None, 状態)。状態は "ok" / "none"（物がない）/ "failed"。
+        """
+        self.grasp_avoid = getattr(self, "grasp_avoid", [])
+        for attempt in range(self.GRASP_TRIES):
+            if attempt > 0:
+                self.change_pose(pose)
+                gripper.command(1)
+            objs = list(self.get_latest_detection().bboxes)
+            target, grasp_pos = None, None
+            while objs:
+                obj = self.get_most_graspable_obj(objs)
+                if obj is None:
+                    break
+                objs.remove(obj["bbox"])
+                pos = self.get_grasp_coordinate(obj["bbox"])
+                if pos is None:
+                    continue
+                if any(math.hypot(pos.x - a_x, pos.y - a_y) < self.GRASP_AVOID_DIST
+                       for a_x, a_y in self.grasp_avoid):
+                    rospy.loginfo("skip %s at (%.2f, %.2f): hit furniture before",
+                                  obj["label"], pos.x, pos.y)
+                    continue
+                target, grasp_pos = obj, pos
+                break
+            if target is None:
+                return None, ("none" if attempt == 0 else "failed")
+            label = target["label"]
+            rospy.loginfo("pick %s at %s: try %d/%d", label, plc, attempt + 1, self.GRASP_TRIES)
+            hits_before = self.furniture_hits()
+            if not self.exec_graspable_method(grasp_pos, label):
+                # 手の届かない所の物（つかみに行っていない）。次からは選ばない
+                self.grasp_avoid.append((grasp_pos.x, grasp_pos.y))
+                self.change_pose("all_neutral")
+                continue
+            gap = self.finger_gap()
+            hit = self.furniture_hits() > hits_before
+            self.change_pose("all_neutral")
+            self.log_drawer_poses("picking {} at {}".format(label, plc))
+            empty = (gap is not None and gap < self.GRASP_EMPTY_GAP
+                     and label not in self.THIN_LABELS)
+            if not empty:
+                if hit:
+                    rospy.logwarn("hit furniture while picking %s, but holding it", label)
+                return label, "ok"
+            gripper.command(1)
+            if hit:
+                # 机などに当たって取れなかった物は、次から選ばない
+                self.grasp_avoid.append((grasp_pos.x, grasp_pos.y))
+                rospy.logwarn("hit furniture and missed %s; avoid it from now on", label)
+            else:
+                rospy.logwarn("missed %s (finger gap %.3f); detect again", label, gap)
+        return None, "failed"
 
     def execute_task1(self):
         """62408993 Masami Sakuma
@@ -1833,21 +2160,20 @@ class WrsMainController(object):
         max_attempts_per_place = 12
         attempt_count = [0] * len(hsr_position)
 
-        start_time = rospy.Time.now()
-        time_limit = 14 * 60
-
-        # 物を持つ前に引き出しを開けておく（下段 → 上段を大きく）
+        # 物を持つ前に引き出しを開けておく（run() で開けていれば何もしない）
         self.open_drawers()
 
         rospy.loginfo("Start searching objects.")
 
-        while not all(count >= 2 for count in empty_count):
-            elapsed = (rospy.Time.now() - start_time).to_sec()
-            if elapsed >= time_limit:
-                rospy.logwarn("Task1 time limit is approaching. Stop searching.")
-                break
-
+        time_up = False
+        while not time_up and not all(count >= 2 for count in empty_count):
             for i, (plc, pose) in enumerate(hsr_position):
+                # 次の物体を取りに行く前に、Task 2 の時間が残るか確かめる（1 個の途中では止めない）
+                if self.task1_time_left() < self.TASK1_MIN_CYCLE_SEC:
+                    rospy.logwarn("Task 1 time is up (%.0f s left). Go to Task 2.",
+                                  self.task1_time_left())
+                    time_up = True
+                    break
                 if empty_count[i] >= 2 or attempt_count[i] >= max_attempts_per_place:
                     empty_count[i] = 2
                     continue
@@ -1856,50 +2182,27 @@ class WrsMainController(object):
                 self.change_pose(pose)
                 gripper.command(1)
 
-                detected_objs = self.get_latest_detection()
-                graspable_obj = self.get_most_graspable_obj(detected_objs.bboxes)
                 attempt_count[i] += 1
-
-                if graspable_obj is None:
+                # 検出 → 把持。失敗（空振り・家具に当たった）したら、その場で検出し直して取り直す（pick_here）
+                label, status = self.pick_here(plc, pose)
+                if status == "none":
                     empty_count[i] += 1
                     rospy.loginfo("No object at %s (%d/2)", plc, empty_count[i])
                     continue
-
                 empty_count[i] = 0
-                label = graspable_obj["label"]
-                grasp_bbox = graspable_obj["bbox"]
-
-                rospy.loginfo("Selected object: %s", label)
-
-                grasp_pos = self.get_grasp_coordinate(grasp_bbox)
-                if grasp_pos is None:
-                    rospy.logwarn("Failed to obtain grasp coordinate.")
+                if label is None:
+                    rospy.logwarn("Could not grasp any object at %s. Try other places.", plc)
                     continue
 
-                # ----------------------------------------------------
-                # 改善点: 中間姿勢 change_pose("grasp_on_table") を削除
-                # grasp_from_side 内のアプローチ移動で直接把持動作を行う
-                # ----------------------------------------------------
-                grasp_success = self.exec_graspable_method(grasp_pos, label)
-
-                self.change_pose("all_neutral")
-
-                # 把持に失敗（空振り）した場合は搬送動作を行わず再試行
-                if not grasp_success:
-                    rospy.logwarn("Could not grasp object: %s. Retrying loop.", label)
-                    continue
-
-                # B担当の配置処理へラベルを渡す（ラベル→置き場所の対応・移動・配置）
-                if self.put_object_by_label(label):
-                    placed.append(label)
-                elif not getattr(self, "last_placement_result", {}).get("released", False):
-                    # まだ持っている（引き出し行きは未実装・置き場所が分からない など）。
-                    # 持ったまま次へ進むと次の探索地点で落とすので、引き出し（開いていれば）か Bin B に入れる
-                    rospy.logwarn("Placement failed for %s; put it in the fallback place", label)
-                    if self.put_in_fallback(label):
-                        placed.append(label + "(fallback)")
+                # 点数が入るまで置き直す（正しい置き場所に 2 回 → だめならボックス）。
+                # 置き場所の決め方・置く動作は B の put_object_by_label / put_in_place を使う
+                label = self.normalize_placement_label(label)
+                if self.place_until_scored(label):
+                    placed.append("{}({})".format(
+                        label, getattr(self, "last_placement_result", {}).get("place")))
 
         rospy.loginfo("#### finish Task 1 ####")
+        self.log_drawer_poses("Task 1")
         rospy.loginfo("Placed objects (%d): %s", len(placed), ", ".join(placed))
 
     # ------------------------------------------------------------------
@@ -1913,8 +2216,13 @@ class WrsMainController(object):
     # ロボット中心の経路と障害物中心の最小距離 [m]
     # = HSR 半径 0.22 + 物体の半径（最大 0.1 程度）+ 自己位置・追従のずれの余裕 0.13
     TASK2A_SAFE_DIST = 0.45
-    # A* で試す安全距離（広い順）。最小 0.32 = 半径 0.22 + 物体 0.05 + 余裕 0.05（> TASK2A_DANGER_DIST）
-    TASK2A_SAFE_DISTS = (0.45, 0.38, 0.32)
+    # A* で試す安全距離（広い順）。0.32 = 半径 0.22 + 物体 0.05 + 余裕 0.05（> TASK2A_DANGER_DIST）
+    # 最後の 0.28 は、ほかに道がないときだけ使う（接触は 0.26〜0.27。11/9 08:31 は lego と foam_brick の
+    # 間が 0.58m しかなく、0.32 では道がないので壁の角を削って回り込み、枠に当たった）
+    TASK2A_SAFE_DISTS = (0.45, 0.38, 0.32, 0.28)
+    TASK2A_NARROW_DIST = 0.32         # これより狭い安全距離では、格子を細かくし、見張りの距離も詰める
+    TASK2A_GRID_FINE = 0.025          # 狭い所を探すときの格子 [m]（5cm では隙間の真ん中が格子に乗らない）
+    TASK2A_DANGER_MARGIN = 0.015      # 狭い道のときの見張りの距離 = 安全距離 - これ
     TASK2A_MERGE_DIST = 0.15  # これより近い検出は同じ障害物とみなす [m]
     TASK2B_WAIT_SEC = 10.0    # 棚の前で指示文を待つ最大時間 [s]
     TASK2B_DETECT_RETRY = 3   # 対象物体が見つからないときに検出をやり直す回数
@@ -2282,7 +2590,7 @@ class WrsMainController(object):
             self.add_obstacle(obstacles, (pos.x, pos.y))
 
     @classmethod
-    def plan_path_astar(cls, start, goal, obstacles, safe_dist):
+    def plan_path_astar(cls, start, goal, obstacles, safe_dist, grid=None):
         """62401738 いしい
         TASK2A_GRID 間隔の格子の上で、start から goal までの経路を A* で探す。
         - 障害物から safe_dist 未満の格子は通れない（start の格子だけは例外）
@@ -2291,7 +2599,7 @@ class WrsMainController(object):
         - 8近傍で移動し、ヒューリスティックはゴールまでの直線距離
         経路（(x, y) のリスト）を返す。見つからなければ None。
         """
-        res = cls.TASK2A_GRID
+        res = grid or cls.TASK2A_GRID
         x_min, x_max = cls.TASK2A_PLAN_X
         y_min, y_max = cls.TASK2A_PLAN_Y
         n_x = int(round((x_max - x_min) / res)) + 1
@@ -2322,6 +2630,12 @@ class WrsMainController(object):
                 dists = [math.hypot(p_x - o_x, p_y - o_y) for o_x, o_y in obstacles]
                 clearance_cache[cell] = min(dists) if dists else float("inf")
             return clearance_cache[cell]
+
+        def near_wall(cell):
+            """62401738 いしい
+            格子が地図の壁から TASK2A_WALL_SAFE 未満か（台車が壁・扉の枠に当たる）
+            """
+            return cls.wall_clearance(to_xy(cell)) < cls.TASK2A_WALL_SAFE
 
         start_cell, goal_cell = to_cell(start), to_cell(goal)
         if clearance(goal_cell) < safe_dist:
@@ -2359,7 +2673,7 @@ class WrsMainController(object):
                     if not (0 <= nxt[0] < n_x and 0 <= nxt[1] < n_y):
                         continue
                     clr = clearance(nxt)
-                    if clr < safe_dist:
+                    if clr < safe_dist or (nxt != goal_cell and near_wall(nxt)):
                         continue
                     step = math.hypot(d_x, d_y) * res
                     penalty = cls.TASK2A_CLEAR_WEIGHT * max(0.0, cls.TASK2A_SOFT_DIST - clr)
@@ -2375,8 +2689,55 @@ class WrsMainController(object):
         """62401738 いしい
         線分の上をロボットが通ったとき、すべての障害物から safe_dist 以上離れているか
         """
-        return all([cls.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
-                    for obs in obstacles])
+        if not all([cls.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
+                    for obs in obstacles]):
+            return False
+        # 地図の壁（部屋の境目の枠など）にも近づかない
+        return all(cls.dist_point_to_segment(wall, seg_start, seg_end) >= cls.TASK2A_WALL_SAFE
+                   for wall in cls.task2a_walls)
+
+    # 地図（/static_map）の壁。Task 2a の範囲の占有セルの中心を入れておく（load_task2a_walls）。
+    # 11/9 08:31、A* が部屋の境目の壁の端（x 2.05, y 2.1〜2.2）をかすめる斜めの経路を選び、
+    # 台車が wrc_frame に当たった。床の物だけでなく壁も避ける。
+    task2a_walls = []
+    TASK2A_WALL_SAFE = 0.32   # 壁の中心から台車の中心まで（半径 0.22 + セルの半分 0.025 + 余裕）
+
+    @classmethod
+    def wall_clearance(cls, point):
+        """62401738 いしい
+        point から一番近い壁（地図の占有セル）までの距離。壁が読めていなければ無限大。
+        """
+        if not cls.task2a_walls:
+            return float("inf")
+        return min(math.hypot(point[0] - w_x, point[1] - w_y) for w_x, w_y in cls.task2a_walls)
+
+    def load_task2a_walls(self):
+        """62401738 いしい
+        /static_map から Task 2a の経路を探す範囲（の少し外まで）の壁を読み込む。読めなければ壁なしで続ける。
+        """
+        from nav_msgs.srv import GetMap
+        try:
+            rospy.wait_for_service("/static_map", timeout=5.0)
+            grid = rospy.ServiceProxy("/static_map", GetMap)().map
+        except (rospy.ROSException, rospy.ServiceException) as error:
+            rospy.logwarn("cannot read /static_map: %s (walls are not avoided)", error)
+            return
+        info = grid.info
+        margin = self.TASK2A_WALL_SAFE + 0.1
+        x_lo, x_hi = self.TASK2A_PLAN_X[0] - margin, self.TASK2A_PLAN_X[1] + margin
+        y_lo, y_hi = self.TASK2A_PLAN_Y[0] - margin, self.TASK2A_PLAN_Y[1] + margin
+        walls = []
+        for j in range(info.height):
+            y = info.origin.position.y + (j + 0.5) * info.resolution
+            if not y_lo <= y <= y_hi:
+                continue
+            row = j * info.width
+            for i in range(info.width):
+                x = info.origin.position.x + (i + 0.5) * info.resolution
+                if x_lo <= x <= x_hi and grid.data[row + i] > 50:
+                    walls.append((x, y))
+        type(self).task2a_walls = walls
+        rospy.loginfo("task2a: %d wall cells from the map", len(walls))
 
     @classmethod
     def simplify_path(cls, path, obstacles, safe_dist):
@@ -2403,10 +2764,15 @@ class WrsMainController(object):
         障害物の間が狭いときだけ詰めて通る。どれでも経路がなければ None。
         """
         for safe_dist in cls.TASK2A_SAFE_DISTS:
-            path = cls.plan_path_astar(current, goal, obstacles, safe_dist)
+            narrow = safe_dist < cls.TASK2A_NARROW_DIST
+            path = cls.plan_path_astar(current, goal, obstacles, safe_dist,
+                                       cls.TASK2A_GRID_FINE if narrow else None)
             if path is None:
                 rospy.logwarn("A*: no path with safe_dist=%.2f", safe_dist)
                 continue
+            # 狭い道を選んだときは、移動中に止まる距離も詰める（0.30 のままだと隙間の手前で止まる）
+            cls.task2a_danger = (safe_dist - cls.TASK2A_DANGER_MARGIN if narrow
+                                 else cls.TASK2A_DANGER_DIST)
             corners = cls.simplify_path(path, obstacles, safe_dist)
             rospy.loginfo("A* path: %s",
                           " -> ".join(["({:.2f}, {:.2f})".format(p[0], p[1]) for p in corners]))
@@ -2517,7 +2883,7 @@ class WrsMainController(object):
         for obs_x, obs_y in obstacles:
             now = math.hypot(obs_x - pose[0], obs_y - pose[1])
             nxt = math.hypot(obs_x - next_x, obs_y - next_y)
-            if nxt < cls.TASK2A_DANGER_DIST and nxt < now:
+            if nxt < getattr(cls, "task2a_danger", cls.TASK2A_DANGER_DIST) and nxt < now:
                 return True
         return False
 
@@ -2811,6 +3177,7 @@ class WrsMainController(object):
         退かせなかったときだけ A* で避ける（execute_avoid_blocks）。
         """
         rospy.loginfo("#### start Task 2a ####  detector: %s", self.get_detector_type())
+        self.load_task2a_walls()
         self.change_pose("look_at_near_floor")
         gripper.command(0)
         self.goto_name("standby_2a")
@@ -2899,6 +3266,7 @@ class WrsMainController(object):
         """
         if not self.wait_for_controllers():
             return  # 腕も台車も動かないので、何もせずに終わる（シミュレータを再起動する）
+        self.run_start = rospy.Time.now()  # 時間配分（引き出し・Task 1 の打ち切り）はここから数える
         self.change_pose("all_neutral")
         if not rospy.get_param("~use_known_placements", True):
             self.prescan_containers()  # 引き出しを開ける前に容器を見ておく（開けた後だと写り込む）
