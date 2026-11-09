@@ -1,0 +1,2 @@
+run: wrs_main_node_c.py / detector: yolo
+[33m[ WARN] [1794189538.968255319]: Skipping virtual joint 'world_joint' because its child frame 'base_footprint' does not match the URDF frame 'odom'[0m

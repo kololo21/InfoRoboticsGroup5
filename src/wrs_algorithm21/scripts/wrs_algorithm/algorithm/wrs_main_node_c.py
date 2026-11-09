@@ -50,6 +50,7 @@ class WrsMainController(object):
         self.coordinates = self.load_json(self.get_path(["config", "coordinates.json"]))
         self.poses = self.load_json(self.get_path(["config", "poses.json"]))
         self.load_placement_overrides()
+        self.register_known_placements()
 
         # ROS通信関連の初期化
         tf_from_bbox_srv_name = "set_tf_from_bbox"
@@ -140,13 +141,62 @@ class WrsMainController(object):
     def change_pose(self, name):
         """サンプルのまま（担当なし）
         指定された姿勢名に遷移する
+        （B版の MoveIt で計画する方式は、腕が遠回りして物に当たるので week1 の直接指令に戻した）
         """
         if name in self.poses.keys():
             rospy.loginfo("change pose to [%s]", name)
-            return whole_body.move_to_joint_positions(self.poses[name])
+            return self.move_joints(self.poses[name])
 
         rospy.logerr("unknown pose name [%s]", name)
         return False
+
+    @staticmethod
+    def move_joints(joints, timeout=10.0):
+        """62401738 いしい
+        whole_body.move_to_joint_positions と同じ直接指令（腕・頭の trajectory controller）で動かす。
+        whole_body 側は get_result()（結果のメッセージ）を GoalStatus.SUCCEEDED（整数）と比べているので、
+        腕が動けても必ず False を返す。そのため上段の引き出しで「cannot take the drawer grasp pose」になり、
+        配置でも transport / place / retreat の段階で失敗扱いになって物を置かずに中断していた（11/9）。
+        ここでは get_state() で成功を判定する。
+        """
+        import actionlib
+        from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+        groups = (
+            ("/hsrb/arm_trajectory_controller/follow_joint_trajectory",
+             ("arm_lift_joint", "arm_flex_joint", "arm_roll_joint",
+              "wrist_flex_joint", "wrist_roll_joint")),
+            ("/hsrb/head_trajectory_controller/follow_joint_trajectory",
+             ("head_pan_joint", "head_tilt_joint")),
+        )
+        clients = []
+        for action_name, names in groups:
+            point = JointTrajectoryPoint()
+            trajectory = JointTrajectory()
+            for name in names:
+                if name in joints:
+                    trajectory.joint_names.append(name)
+                    point.positions.append(joints[name])
+                    point.velocities.append(0.0)
+            if not trajectory.joint_names:
+                continue
+            point.time_from_start = rospy.Duration(1.0)
+            trajectory.points = [point]
+            client = actionlib.SimpleActionClient(action_name, FollowJointTrajectoryAction)
+            if not client.wait_for_server(rospy.Duration(5.0)):
+                rospy.logerr("joint controller unavailable: %s", action_name)
+                return False
+            client.send_goal(FollowJointTrajectoryGoal(trajectory=trajectory))
+            clients.append(client)
+        success = True
+        for client in clients:
+            if not client.wait_for_result(rospy.Duration(timeout)):
+                client.cancel_goal()
+                success = False
+            elif client.get_state() != GoalStatus.SUCCEEDED:
+                success = False
+        return success
 
     def check_positions(self):
         """サンプルのまま（担当なし）
@@ -165,14 +215,11 @@ class WrsMainController(object):
         return res.bboxes
 
     def get_grasp_coordinate(self, bbox):
-        """サンプルのまま（担当なし）
+        """62418450 向井悠人（B版から取り込み）
         BBox情報から把持座標を取得する
         """
-        # BBox情報からtfを生成して、座標を取得
-        self.tf_from_bbox_clt.call(
-            SetTransformFromBBoxRequest(bbox=bbox, frame=self.GRASP_TF_NAME))
-        rospy.sleep(1.0)  # tfが安定するのを待つ
-        return self.get_relative_coordinate("map", self.GRASP_TF_NAME).translation
+        # B版から取り込み: tf が取れないときは None を返す（呼び出し側で再試行）
+        return self.get_bbox_position(bbox)
 
     @classmethod
     def get_most_graspable_bbox(cls, obj_list):
@@ -638,13 +685,20 @@ class WrsMainController(object):
             targets.pop(place, None)
             self.coordinates["positions"].pop(place, None)
         self.sensor_placement_names = set()
-        observations = self.observe_placement_containers()
-        found = [item for item in observations if item["kind"] == category]
         maximum = 2 if category == "tray" else 1
-        if not found or len(found) > maximum:
-            raise ValueError("Missing or ambiguous sensor observations for {}".format(category))
-        base = self.tf_buffer.lookup_transform(
-            "map", "base_footprint", rospy.Time(0), rospy.Duration(2.0)).transform.translation
+        # 最初（引き出しを開ける前）に見ておいた結果があれば、それを使う。
+        # 引き出しを開けた後に見ると、開いた引き出しが写り込んで容器を見分けられなくなる。
+        scan = getattr(self, "container_scan", None)
+        found = [item for item in scan["observations"] if item["kind"] == category] if scan else []
+        if found and len(found) <= maximum:
+            base = scan["base"]
+        else:
+            observations = self.observe_placement_containers()
+            found = [item for item in observations if item["kind"] == category]
+            if not found or len(found) > maximum:
+                raise ValueError("Missing or ambiguous sensor observations for {}".format(category))
+            base = self.tf_buffer.lookup_transform(
+                "map", "base_footprint", rospy.Time(0), rospy.Duration(2.0)).transform.translation
         distance = float(rospy.get_param("~placement_standoff", 0.65))
         clearance = float(rospy.get_param("~placement_release_clearance", 0.18))
         hover = float(rospy.get_param("~placement_hover_distance", 0.12))
@@ -657,13 +711,37 @@ class WrsMainController(object):
             norm = math.hypot(dx, dy)
             if norm < 0.1:
                 raise ValueError("Observation viewpoint is too close to container center")
+            # 真正面（-y 向き）から、put_in_drawer_high の指先が容器の中心に来る位置に立つ
+            self.poses.update(self.DRAWER_RELEASE_POSES)
             self.coordinates["positions"][place] = [
-                item["x"] + distance * dx / norm, item["y"] + distance * dy / norm,
-                math.degrees(math.atan2(-dy, -dx))]
+                item["x"] - self.DRAWER_HAND_LEFT, item["y"] + self.DRAWER_HAND_FORWARD, -90.0]
             targets[place] = {"x": item["x"], "y": item["y"],
                               "z": item["rim_z"] + clearance, "hover": hover}
+            # 真正面に行けないとき用の、観測した位置の方から近づく位置（week1 の計算）
+            if not hasattr(self, "placement_alternates"):
+                self.placement_alternates = {}
+            self.placement_alternates[place] = [
+                item["x"] + distance * dx / norm, item["y"] + distance * dy / norm,
+                math.degrees(math.atan2(-dy, -dx))]
             self.sensor_placement_names.add(place)
             rospy.loginfo("Sensor placement %s: %s", place, json.dumps(item, sort_keys=True))
+
+    def prescan_containers(self):
+        """62401738 いしい
+        引き出しを開ける前（手が空で、引き出しが写り込まないうち）に容器・トレイを見ておく。
+        結果は ensure_sensor_placements が使う。失敗しても、置くときに今までどおり見直す。
+        """
+        try:
+            observations = self.observe_placement_containers()
+            base = self.tf_buffer.lookup_transform(
+                "map", "base_footprint", rospy.Time(0), rospy.Duration(2.0)).transform.translation
+        except Exception as error:  # 見られなくても Task 1 は続ける
+            rospy.logwarn("container prescan failed: %s", error)
+            return False
+        self.container_scan = {"observations": observations, "base": base}
+        rospy.loginfo("container prescan: %s",
+                      ", ".join(sorted(item["kind"] for item in observations)) or "nothing")
+        return True
 
     def move_over_container(self, place, hover=False, linear=False):
         """62418450 向井悠人
@@ -862,6 +940,25 @@ class WrsMainController(object):
             return False
         return True
 
+    def navigate_with_alternate(self, place):
+        """62401738 いしい
+        place へ移動する。行けなければ（開いた引き出しが邪魔など）容器の真正面の位置から近づく。
+        """
+        alternate = getattr(self, "placement_alternates", {}).get(place)
+        use_front = getattr(self, "placement_use_front", set())
+        if alternate is not None and place in use_front:
+            # 前に行けなかった容器は、最初から真正面の位置へ行く（失敗する移動で時間を使わない）
+            self.coordinates["positions"][place] = list(alternate)
+            return self.navigate_for_placement(place)
+        if self.navigate_for_placement(place):
+            return True
+        if alternate is None:
+            return False
+        rospy.logwarn("cannot reach %s; approach from the front %s", place, alternate)
+        self.placement_use_front = use_front | {place}
+        self.coordinates["positions"][place] = list(alternate)
+        return self.navigate_for_placement(place)
+
     def put_object_by_label(self, label):
         """62418450 向井悠人
         A側で把持成功を確認した後、検出器に依存せずラベルを受け取る。
@@ -894,18 +991,30 @@ class WrsMainController(object):
             if (place not in self.coordinates["positions"] or not self.poses.get("all_neutral")
                     or (not use_target and not self.poses.get(into_pose))):
                 return False
-            stages = [("transport", lambda: self.move_placement_pose("all_neutral")),
-                      ("navigate", lambda: self.navigate_for_placement(place))]
+            # 姿勢変更は MoveIt で計画し、計画できなければ直接指令で動かす（drawer_pose）。
+            # 11/9 06:32 の実行では、windex_bottle を持ったまま all_neutral を MoveIt で計画できず、
+            # どこにも置けないまま次の物を取りに行って物を蹴っていた。
+            stages = [("transport", lambda: self.drawer_pose("all_neutral")),
+                      ("navigate", lambda: self.navigate_with_alternate(place))]
             if use_target:
+                # 容器・トレイ: 全身 IK（move_over_container）は手が届かず失敗していた（06:32 container_a）。
+                # 引き出しと同じく、決まった腕の姿勢にしてから台車で手を容器の真上に合わせて離す。
                 stages.extend([
-                    ("above_container", lambda: self.move_over_container(place, hover=True)),
-                    ("lower", lambda: self.move_over_container(place, linear=True)),
-                    ("release", lambda: gripper.command(1)),
-                    ("lift", lambda: self.move_over_container(place, hover=True, linear=True))])
+                    ("locate", lambda: self.locate_place_target(place)),
+                    ("place", lambda: self.drawer_pose(self.release_pose_for(place))),
+                    ("align", lambda: self.align_hand_over(
+                        place, self.placement_targets[place]["x"],
+                        self.placement_targets[place]["y"])),
+                    ("release", lambda: gripper.command(1))])
             else:
-                stages.extend([("place", lambda: self.move_placement_pose(into_pose)),
-                               ("release", lambda: gripper.command(1))])
-            stages.append(("retreat", lambda: self.move_placement_pose("all_neutral")))
+                stages.append(("place", lambda: self.drawer_pose(into_pose)))
+                if place in getattr(self, "drawer_places", {}):
+                    # 引き出し: move_base も自己位置も 5cm ほどずれるので、置く直前に開いた取っ手を見て
+                    # 落とす位置を決め直し、台車を少しずつ動かして手をその真上に合わせる
+                    stages.insert(-1, ("locate", lambda: self.locate_drawer_drop(place)))
+                    stages.append(("align", lambda: self.align_hand_over_drawer(place)))
+                stages.append(("release", lambda: gripper.command(1)))
+            stages.append(("retreat", lambda: self.drawer_pose("all_neutral")))
             for stage, action in stages:
                 record["stage"] = stage
                 rospy.loginfo("Placement %s: %s", place, stage)
@@ -959,87 +1068,751 @@ class WrsMainController(object):
         self.change_pose("all_neutral")
 
     # ------------------------------------------------------------------
-    # 引き出し（上段を下段に重ねてダブルスコアを狙う）
-    # 座標は公開版 WRS ワールド（tmc_wrs_gazebo の wrs2020.world）から求めた map 座標。
+    # 引き出し（3 つとも開ける）
+    # 座標はシミュレータ（Gazebo のモデル位置・trofast_knob モデル・得点判定のパラメータ）から取った値。
     #   ロボット初期位置 world(-2.1, 1.2, yaw -90°) が map 原点なので
     #   map_x = 1.2 - world_y,  map_y = world_x + 2.1
-    #   下段 trofast_2: world(-2.7, 1.0, z 0.10) → map(0.2, -0.6)、上段 trofast_3: z 0.36
-    #   引き出しの箱は奥行き 0.42m（map の y 方向）・幅 0.30m・高さ 0.227m → 前面は y = -0.39
-    # 授業のシミュレータで値がずれていたら、ここの数字だけ直す（Gazebo で引き出しをクリックして確認）
+    #   trofast_1（横の 1 段だけ）world(-2.7, 0.67, z 0.10) → 取っ手 map(0.53, 前面 -0.355, z 0.28)
+    #   trofast_2（2 段の下）    world(-2.7, 1.00, z 0.10) → 取っ手 map(0.20, 前面 -0.355, z 0.28)
+    #   trofast_3（2 段の上）    world(-2.7, 1.00, z 0.36) → 取っ手 map(0.20, 前面 -0.355, z 0.54)
+    #   取っ手（T 字のつまみ）はモデル原点から前へ 0.24・上へ 0.18、板の裏の軸は前面から 1〜3cm 奥
+    # 得点判定（*_detector の box_pose / box_size）は各引き出しの箱に付いていて、箱と一緒に動く
+    #   中心 (0, 0, 0.125)・大きさ 0.35 x 0.21 x 0.25
+    #   tools_in_drawertop = trofast_2, tools_in_drawerbottom = trofast_3, shapeitems_in_drawerleft = trofast_1
+    # 引き具合: 上段を半分（0.20）、下段を全開（0.30）、横を 0.25。
+    #   両方の判定に重ねるダブルスコア（下段 0.30・上段 0.36 で上段を傾ける）は、上段を引きすぎて
+    #   抜け落ちたり斜めに引いて失敗したりしたのでやめた（11/9）。
+    # 11/9 のロボットでの確認で分かったこと
+    #   - 手のひら y=-0.29 では指先が板の前面に当たるだけ → 指先を板の裏の軸まで入れる
+    #   - 自己位置が数 cm ずれる → 頭の深度カメラで取っ手を見つけ、その位置へ手を出す
+    #     （点群も手の目標も同じ map 座標なので、自己位置のずれが打ち消される）
+    #   - gripper.command(0)（MoveIt）は指が取っ手に触れていると閉じない → 力で握る grasp アクションを使う
     # ------------------------------------------------------------------
     USE_DRAWER = True                       # False にすると引き出しを使わない（今までどおり bin_b へ）
-    DRAWER_STANDPOINT = [0.2, 0.25, -90]    # 引き出しの正面に立つ位置（開けた引き出しに当たらない距離）
-    DRAWER_HANDLE_X = 0.2                   # 取っ手の x
-    DRAWER_HANDLE_Y = -0.29                 # 取っ手をつかむ手先の y（サンプル pull_out_trofast の値）
-    DRAWER_HANDLE_Z = {"bottom": 0.29, "top": 0.55}  # 取っ手の高さ = 箱の底 + 0.19（要実測）
-    DRAWER_HAND_RPY = (-90, 100, 0)         # 取っ手をつかむ手の向き（サンプルの push_in_trofast と同じ）
-    # 引き出す距離。下段は普通に、上段は大きく引き出して前に傾け、下段の判定範囲に重ねる
-    DRAWER_PULL = {"bottom": 0.20, "top": 0.32}
-    # 物体を落とす位置: 上段（開けた後 y -0.49〜-0.07）と下段（開けた後 y -0.61〜-0.19）が重なる所
-    DRAWER_DROP = {"x": 0.2, "y": -0.33, "z": 0.70, "hover": 0.10}
-    DRAWER_PLACE_NAME = "drawer_top_place"
-
-    def pull_drawer(self, level):
+    DRAWER_STANDPOINTS = {                  # 引き出しの正面に立つ位置
+        "drawer_standpoint": [0.2, 0.28, -90],
+        "drawer_left_standpoint": [0.53, 0.28, -90],
+    }
+    DRAWERS = {
+        # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
+        "bottom": {"x": 0.20, "z": 0.28, "pull": 0.30, "tilt": -0.85, "stand": "drawer_standpoint"},
+        "top": {"x": 0.20, "z": 0.54, "pull": 0.20, "tilt": -0.6, "stand": "drawer_standpoint"},
+        "left": {"x": 0.53, "z": 0.28, "pull": 0.25, "tilt": -0.85,
+                 "stand": "drawer_left_standpoint"},
+    }
+    DRAWER_KNOB_FACE_Y = -0.355             # 取っ手の板の前面の y（3 つとも同じ）
+    DRAWER_FINGER_REACH = 0.063             # 手のひら(hand_palm_link)から指先までの前後距離（実測）
+    # 指先を板の前面からどれだけ奥へ入れるか。取っ手は「板（幅 6.6cm・厚さ 1cm）→ 軸（太さ 3cm・長さ 2cm）
+    # → 根元の円板（直径 6.8cm）」の順に並ぶ。0.022 では指の腹が板の両端をはさみ（閉じた後の間隔 0.06 前後）、
+    # 摩擦だけで引くので途中で外れた。指先を根元の円板の手前（3cm）まで入れ、指の腹で軸をはさんで
+    # 板の裏に引っかける（閉じた後の間隔は軸の太さ 0.03 前後になるはず）。
+    DRAWER_GRASP_DEPTH = 0.030
+    DRAWER_APPROACH = 0.15                  # 差し込む前に手を止める、取っ手の手前の距離
+    DRAWER_HAND_RPY = (-90, 100, 0)         # 取っ手をつかむ手の向き（シミュレータで到達を確認済み）
+    DRAWER_Z_RETRY = (0.0, 0.012, -0.012)   # つかめなかったときに高さを少しずらして試す
+    DRAWER_GRASP_EFFORT = -1.0              # grasp アクションで握る強さ（負で閉じる。-0.5 では途中で外れた）
+    DRAWER_GRASP_EFFORT_SAFE = -0.5         # -1.0 で閉じなかったときに使う強さ（04:26 に 3 つとも開いた値）
+    DRAWER_PULL_TRIES = 3                   # 途中で外れたときに、つかみ直して引く回数
+    DRAWER_PULL_SPEED = 0.04                # 台車で引くときの速さ [m/s]（ゆっくり引いて外れにくくする）
+    # 引いている途中で指の間隔が「つかんだ直後の 6 割」かつ 0.025 未満になったら外れた（すぐ止める）。
+    # 11/9 の記録: 外れた回は 0.005〜0.016 まで閉じた。外れなかった回は 0.035 以上を保った。
+    DRAWER_SLIP_GAP = 0.025
+    DRAWER_SLIP_RATIO = 0.6
+    # 閉じた後の指先の間隔: これ未満なら空振り、これより大きければ閉じていない（取っ手は 3〜6.6cm）
+    DRAWER_FINGER_GAP_RANGE = (0.015, 0.09)
+    # 物体を落とす位置（指先の map 座標 x, y）と、そのときの腕の姿勢
+    # 引き出しの近くでは全身 IK（move_over_container）を使わない。
+    #   11/9 のシミュレータ確認で、全身 IK は台車を前に出して開いた引き出しにぶつかり、
+    #   手が目標から 20cm ずれた（自己位置も 20cm ずれた）。
+    # 代わりに week1 の bin と同じ「決まった腕の姿勢 + 台車の位置合わせ」で置く。
+    #   put_in_bin（腕を前に水平）の指先は、台車から前へ 0.632・左へ 0.078・高さ 0.51（MoveIt の FK で計算）
+    #   put_in_drawer_high は arm_lift を 0.2 上げた同じ姿勢で、指先の高さ 0.71
+    DRAWER_HAND_FORWARD = 0.632
+    DRAWER_HAND_LEFT = 0.078
+    DRAWER_RELEASE_POSES = {
+        "put_in_drawer_high": {"arm_lift_joint": 0.2, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
+                               "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
+                               "head_tilt_joint": 0.0, "head_pan_joint": 0.0},
+    }
+    DRAWER_DROP = {
+        # 上段を半分（0.20）: 棚から出ている所は y -0.39〜-0.19。その真ん中、縁の高さ 0.59
+        "top": (0.2, -0.29, "put_in_drawer_high"),
+        # 下段を全開（0.30）、上段が閉じているとき: 棚から出ている所 y -0.39〜-0.09 の真ん中、縁の高さ 0.33
+        # （上段も開いていると下段は上段の下に隠れるので、上段が開かなかったときだけ使う）
+        "bottom": (0.2, -0.24, "put_in_bin"),
+        # 横の引き出し 0.25: 棚の前面（y -0.39）より手前の空いている所、縁の高さ 0.33
+        "left": (0.53, -0.26, "put_in_bin"),
+    }
+    DRAWER_PLACE_NAME = "drawer_top_place"      # 工具（2 段の引き出し）
+    DRAWER_LEFT_PLACE_NAME = "drawer_left_place"  # 形のもの（横の引き出し）
+    def lookup_xyz(self, child, frame="map"):
         """62401738 いしい
-        level（"bottom" / "top"）の引き出しを DRAWER_PULL[level] だけ引き出す。
-        pull_out_trofast と同じ動き（手前から差し込む → つかむ → 手前に引く → 離す）。
+        frame（既定は map）座標での child フレームの位置 (x, y, z) を返す。取れなければ None。
+        """
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                frame, child, rospy.Time(0), rospy.Duration(1.0)).transform.translation
+            return trans.x, trans.y, trans.z
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+
+    def finger_gap(self):
+        """62401738 いしい
+        左右の指先の間隔 [m]。閉じても間隔が残っていれば何かをつかんでいる。取れなければ None。
+        """
+        left = self.lookup_xyz("hand_l_finger_tip_frame")
+        right = self.lookup_xyz("hand_r_finger_tip_frame")
+        if left is None or right is None:
+            return None
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
+
+    def base_yaw(self, frame="map"):
+        """62401738 いしい
+        frame（既定は map）座標での台車の向き [rad]。取れなければ None。
+        """
+        try:
+            rot = self.tf_buffer.lookup_transform(
+                frame, "base_footprint", rospy.Time(0), rospy.Duration(1.0)).transform.rotation
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        return math.atan2(2 * (rot.w * rot.z + rot.x * rot.y),
+                          1 - 2 * (rot.y * rot.y + rot.z * rot.z))
+
+    def map_to_odom(self, x, y):
+        """62401738 いしい
+        map 座標の点 (x, y) を、今の自己位置推定で odom 座標に変換する。取れなければ None。
+        odom は台車の車輪の回転から計算するので、AMCL の自己位置のように急に飛ばない。
+        11/9 の実行では、引き出しや長机のそば（レーザーに見える物が少ない）で自己位置が 16cm ずれ、
+        しかも位置合わせの途中で推定が変わって、置く位置がずれた。
+        置く直前に見つけた目標を odom に直し、odom の中で手を合わせる。
+        """
+        try:
+            t = self.tf_buffer.lookup_transform(
+                "odom", "map", rospy.Time(0), rospy.Duration(1.0)).transform
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        q = t.rotation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        return (t.translation.x + math.cos(yaw) * x - math.sin(yaw) * y,
+                t.translation.y + math.sin(yaw) * x + math.cos(yaw) * y)
+
+    def move_hand_by_base(self, target_y, keep_x, timeout, watch_grip=False, x_tol=None,
+                          frame="map"):
+        """62401738 いしい
+        腕は止めたまま台車だけを動かし、手のひらを map の y = target_y まで真っすぐ運ぶ。
+        全身 IK で引くと台車が回ってしまうことがあるので、引き出しは台車でまっすぐ引く。
+        台車の向きが -90° でなくても、map の +y 方向へ動くように速度を変換する。
+        watch_grip=True のときは指の間隔を見張り、取っ手から外れたらその場で止まる
+        （外れたまま下がり続けない。self.drawer_slipped が True になる）。
+        x_tol を指定したとき（物を置く位置合わせ）は、x も keep_x から x_tol 以内に入るまで動く。
+        指定しないとき（引き出しを引く）は y が着いたら止まる（11/9: 置くときに x が 6cm ずれたまま離していた）。
+        """
+        self.drawer_slipped = False
+        rate = rospy.Rate(20)
+        deadline = rospy.Time.now() + rospy.Duration(timeout)
+        try:
+            while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+                hand = self.lookup_xyz("hand_palm_link", frame)
+                yaw = self.base_yaw(frame)
+                if hand is None or yaw is None:
+                    return False
+                remain = target_y - hand[1]
+                remain_x = keep_x - hand[0]
+                if abs(remain) < 0.005 and (x_tol is None or abs(remain_x) < x_tol):
+                    return True
+                if watch_grip:
+                    gap = self.finger_gap()
+                    if gap is not None and gap < self.slip_threshold():
+                        rospy.logwarn("slipped off the drawer handle (gap %.3f, %.3f m left)",
+                                      gap, remain)
+                        self.drawer_slipped = True
+                        return False
+                speed = self.DRAWER_PULL_SPEED
+                vy_map = max(-speed, min(speed, 2.0 * remain))
+                vx_max = 0.03 if x_tol is None else speed
+                vx_map = max(-vx_max, min(vx_max, 2.0 * remain_x))
+                # map 座標の速度 → 台車座標の速度
+                vel_x = math.cos(yaw) * vx_map + math.sin(yaw) * vy_map
+                vel_y = -math.sin(yaw) * vx_map + math.cos(yaw) * vy_map
+                omni_base.cmd_vel(vel_x, vel_y, 0)
+                rate.sleep()
+            return False
+        finally:
+            for _ in range(3):
+                omni_base.cmd_vel(0, 0, 0)
+                rospy.sleep(0.05)
+
+    def slip_threshold(self):
+        """62401738 いしい
+        指の間隔がこれより小さくなったら取っ手から外れたとみなす値（つかんだ直後の間隔から決める）。
+        """
+        grip = getattr(self, "drawer_grip_gap", None) or self.DRAWER_SLIP_GAP
+        return min(self.DRAWER_SLIP_GAP, grip * self.DRAWER_SLIP_RATIO)
+
+    def close_gripper_on_handle(self):
+        """62401738 いしい
+        力で握る grasp アクションでハンドを閉じる。
+        gripper.command(0) は MoveIt で計画するので、指が取っ手に触れていると「衝突」とみなされて閉じない。
+        アクションが使えなければ gripper.command(0) で閉じる。
+        """
+        import actionlib
+        from tmc_control_msgs.msg import GripperApplyEffortAction, GripperApplyEffortGoal
+
+        client = actionlib.SimpleActionClient(
+            "/hsrb/gripper_controller/grasp", GripperApplyEffortAction)
+        if not client.wait_for_server(rospy.Duration(3.0)):
+            rospy.logwarn("grasp action is not available; close with MoveIt")
+            return gripper.command(0)
+        client.send_goal(GripperApplyEffortGoal(effort=self.DRAWER_GRASP_EFFORT))
+        client.wait_for_result(rospy.Duration(5.0))
+        rospy.sleep(0.5)
+        gap = self.finger_gap()
+        if gap is not None and gap > self.DRAWER_FINGER_GAP_RANGE[1]:
+            # 強く握る指令が受け付けられず開いたままなら、04:26 と同じ強さでもう一度閉じる
+            rospy.logwarn("gripper did not close with effort %.1f; retry with %.1f",
+                          self.DRAWER_GRASP_EFFORT, self.DRAWER_GRASP_EFFORT_SAFE)
+            client.send_goal(GripperApplyEffortGoal(effort=self.DRAWER_GRASP_EFFORT_SAFE))
+            client.wait_for_result(rospy.Duration(5.0))
+            rospy.sleep(0.5)
+        return True
+
+    def look_at_drawer(self, level, fold_arm=True):
+        """62401738 いしい
+        腕を下ろして（カメラの前からどけて）、頭を level の取っ手の方へ向ける。
+        物を持っているとき（fold_arm=False）は腕はそのまま（all_neutral で上に上げてある）。
+        """
+        if fold_arm:
+            whole_body.move_to_go()
+        head = whole_body.HEAD_CMD
+        head.set_joint_value_target(
+            {"head_pan_joint": 0.0, "head_tilt_joint": self.DRAWERS[level]["tilt"]})
+        try:
+            ok = bool(head.go(wait=True))
+        finally:
+            head.stop()
+        rospy.sleep(0.5)
+        return ok
+
+    def detect_drawer_knob(self, level, face_y, z_tol=0.04, y_tol=0.10):
+        """62401738 いしい
+        頭の深度カメラの点群から level の取っ手を探し、(x, 板の前面の y, z) を返す。
+        予想位置のまわりで、引き出しの前面より 1.5〜7cm 手前に飛び出した点のかたまりを取っ手とみなす。
+        見つからなければ None。
+        """
+        import numpy as np
+
+        x0, z0 = self.DRAWERS[level]["x"], self.DRAWERS[level]["z"]
+        found = []
+        stamp = rospy.Time.now()
+        for _ in range(2):
+            try:
+                points, stamp = self.read_placement_cloud(stamp)
+            except Exception as error:  # 点群が来なければ決め打ち座標を使う
+                rospy.logwarn("no depth cloud for the drawer: %s", error)
+                return None
+            box = points[(np.abs(points[:, 0] - x0) < 0.10)
+                         & (np.abs(points[:, 2] - z0) < z_tol)
+                         & (np.abs(points[:, 1] - face_y) < y_tol + 0.05)]
+            if len(box) < 30:
+                continue
+            # 一番点が多い y（1cm 刻み）を引き出しの前面とみなし、そこから手前に飛び出した点を取る
+            bins = np.round(box[:, 1] / 0.01).astype(int)
+            values, counts = np.unique(bins, return_counts=True)
+            panel_y = values[np.argmax(counts)] * 0.01
+            knob = box[(box[:, 1] > panel_y + 0.015) & (box[:, 1] < panel_y + 0.07)]
+            if len(knob) < 10:
+                continue
+            found.append((float(np.median(knob[:, 0])), float(np.percentile(knob[:, 1], 90)),
+                          float(np.median(knob[:, 2]))))
+        if not found:
+            return None
+        x, y, z = [float(np.mean(v)) for v in zip(*found)]
+        rospy.loginfo("%s drawer knob seen at (%.3f, %.3f, %.3f)", level, x, y, z)
+        if abs(x - x0) > 0.08 or abs(z - z0) > z_tol or abs(y - face_y) > y_tol:
+            rospy.logwarn("knob position is too far from the expected one; ignore it")
+            return None
+        return x, y, z
+
+    # 上段の取っ手を、全身 IK を使わずにつかむための腕の姿勢（MoveIt の FK で計算）。
+    #   arm_lift 0.1・arm_flex -1.20・wrist_flex -0.37（手先が水平に前を向く）で、
+    #   手のひらは台車から前へ 0.603・左へ 0.075・高さ 0.548（指は左右に開く）。
+    #   arm_lift を 1 増やすと手のひらの高さも 1 上がる。
+    # 下段を全開にすると台車が近づけず、全身 IK では上段に手が届かなかった（05:43）。
+    # この姿勢なら台車の前端は棚から 0.06 で、全開の下段（前端 -0.055）に当たらない。
+    DRAWER_POSE_GRASP = {"arm_flex_joint": -1.20, "arm_roll_joint": 0.0,
+                         "wrist_flex_joint": -0.37, "wrist_roll_joint": 0.0}
+    DRAWER_POSE_LIFT0 = 0.1      # このときの arm_lift
+    DRAWER_POSE_PALM_Z = 0.548   # そのときの手のひらの高さ
+    DRAWER_POSE_FORWARD = 0.603  # 手のひらの前への距離
+    DRAWER_POSE_LEFT = 0.075     # 手のひらの左への距離
+
+    def grasp_drawer_handle_by_pose(self, level, knob):
+        """62401738 いしい
+        腕を決まった姿勢（手先が水平に前）にし、台車を前に進めて手を取っ手に差し込んでつかむ。
+        全身 IK を使わないので、下段が開いていても上段に手が届く。つかめたら (手の x, 手の y, 手の z)。
+        """
+        gap_min, gap_max = self.DRAWER_FINGER_GAP_RANGE
+        pos_x, face_y, knob_z = knob
+        grasp_y = face_y - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH
+        for dz in self.DRAWER_Z_RETRY:
+            lift = self.DRAWER_POSE_LIFT0 + (knob_z + dz - self.DRAWER_POSE_PALM_Z)
+            lift = max(0.0, min(0.6, lift))
+            rospy.loginfo("grasp %s drawer handle by pose (hand x=%.3f y=%.3f, lift %.3f)",
+                          level, pos_x, grasp_y, lift)
+            gripper.command(1)
+            # 取っ手の手前 DRAWER_APPROACH の所に手が来る位置まで、腕をたたんだまま台車で下がる/進む
+            self.drawer_pose("all_neutral")
+            self.coordinates["positions"]["drawer_pose_approach"] = [
+                pos_x - self.DRAWER_POSE_LEFT,
+                grasp_y + self.DRAWER_APPROACH + self.DRAWER_POSE_FORWARD, -90.0]
+            self.navigate_for_placement("drawer_pose_approach")
+            joints = dict(self.DRAWER_POSE_GRASP, arm_lift_joint=lift)
+            if not self.move_joints(joints):
+                rospy.logwarn("cannot take the drawer grasp pose")
+                continue
+            # 台車を前に進めて、手を取っ手に差し込む
+            self.move_hand_by_base(grasp_y, pos_x, timeout=10)
+            self.close_gripper_on_handle()
+            gap = self.finger_gap()
+            rospy.loginfo("finger gap after closing: %s", gap)
+            hand = self.lookup_xyz("hand_palm_link")
+            if gap is not None and gap_min <= gap <= gap_max and hand is not None:
+                self.drawer_grip_gap = gap
+                return pos_x, grasp_y, hand[2]
+            rospy.logwarn("did not grasp the %s drawer handle (gap %s); retry", level, gap)
+            gripper.command(1)
+            self.move_hand_by_base(grasp_y + self.DRAWER_APPROACH, pos_x, timeout=8)
+        return None
+
+    def grasp_drawer_handle(self, level, knob):
+        """62401738 いしい
+        knob（x, 板の前面の y, z）の取っ手をつかむ。つかめたら (手の x, 手の y, 手の z) を返す。
+        つかめなければ高さを少しずつずらして試し、だめなら None。
         """
         yaw, pitch, roll = self.DRAWER_HAND_RPY
-        pos_x, pos_y = self.DRAWER_HANDLE_X, self.DRAWER_HANDLE_Y
-        pos_z = self.DRAWER_HANDLE_Z[level]
-        pull = self.DRAWER_PULL[level]
-        rospy.loginfo("pull %s drawer %.2f m", level, pull)
-        gripper.command(1)
-        if not whole_body.move_end_effector_pose(
-                pos_x, pos_y + self.TROFAST_Y_OFFSET, pos_z, yaw, pitch, roll):
+        gap_min, gap_max = self.DRAWER_FINGER_GAP_RANGE
+        pos_x, face_y, knob_z = knob
+        grasp_y = face_y - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH
+        self.drawer_pose("grasp_on_table")
+        for dz in self.DRAWER_Z_RETRY:
+            pos_z = knob_z + dz
+            rospy.loginfo("grasp %s drawer handle (hand x=%.3f y=%.3f z=%.3f)",
+                          level, pos_x, grasp_y, pos_z)
+            gripper.command(1)
+            if not whole_body.move_end_effector_pose(
+                    pos_x, grasp_y + self.DRAWER_APPROACH, pos_z, yaw, pitch, roll):
+                rospy.logwarn("cannot reach the front of the %s drawer handle", level)
+                continue
+            if not whole_body.move_end_effector_pose(pos_x, grasp_y, pos_z, yaw, pitch, roll):
+                rospy.logwarn("cannot insert the hand to the %s drawer handle", level)
+                continue
+            self.close_gripper_on_handle()
+            gap = self.finger_gap()
+            rospy.loginfo("finger gap after closing: %s", gap)
+            if gap is not None and gap_min <= gap <= gap_max:
+                self.drawer_grip_gap = gap
+                return pos_x, grasp_y, pos_z
+            rospy.logwarn("did not grasp the %s drawer handle (gap %s); retry", level, gap)
+            gripper.command(1)
+            whole_body.move_end_effector_pose(
+                pos_x, grasp_y + self.DRAWER_APPROACH, pos_z, yaw, pitch, roll)
+        return None
+
+    def pull_drawer(self, level, pull=None, total=None):
+        """62401738 いしい
+        level（"bottom" / "top" / "left"）の引き出しを pull [m] だけ引き出す。
+        取っ手を深度カメラで見つける → つかむ → 台車でまっすぐ下がって引く → 離す → 手を抜く
+        → もう一度取っ手を見て、どこまで開いたか確かめる。
+        11/9 の実行では、つかみ方しだいで引いている途中に指が外れることがあった
+        （成功した回は引き終わりまで指の間隔が 0.06 前後のまま、失敗した回は 0.01 まで閉じていた）。
+        そこで、足りなければ取っ手の今の位置からもう一度つかんで、残りを引く（DRAWER_PULL_TRIES 回まで）。
+        """
+        yaw, pitch, roll = self.DRAWER_HAND_RPY
+        if pull is None:
+            pull = self.DRAWERS[level]["pull"]
+        gap_min = self.DRAWER_FINGER_GAP_RANGE[0]
+        self.drawer_face0 = getattr(self, "drawer_face0", {})
+        self.drawer_opened = getattr(self, "drawer_opened", {})
+        second = total is not None and level in self.drawer_face0
+        # 2 回目は、取っ手は 1 回目に開けた分だけ手前にある
+        expected = (self.drawer_face0[level] + self.drawer_opened.get(level, 0.0) if second
+                    else self.DRAWER_KNOB_FACE_Y)
+        self.look_at_drawer(level)
+        knob = (self.detect_drawer_knob(level, expected, z_tol=0.10, y_tol=0.15) if second
+                else self.detect_drawer_knob(level, expected))
+        if knob is None:
+            rospy.logwarn("%s drawer knob not seen; use the expected position", level)
+            knob = (self.DRAWERS[level]["x"], expected, self.DRAWERS[level]["z"])
+        face0 = knob[1]                 # 閉じているときの取っ手の位置
+        if second:
+            # 2 回目: 閉じていたときの位置から合計 total 引いた所までにする
+            face0 = self.drawer_face0[level]
+            pull = total
+        else:
+            self.drawer_face0[level] = face0
+        goal = face0 + pull             # 引き終わりの取っ手の位置
+        # 手を引く先は「最初の取っ手の位置 + pull」で固定する（つかみ直しても、これより先へは引かない）。
+        # 上段は傾くと取っ手が下がって見え、開いた量を少なく測る。測った量で引き足すと
+        # 引き出しが抜けて落ちた（11/9 06:00）ので、引く先は測った量に頼らない。
+        hand_goal_y = face0 - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH + pull
+        tries = self.DRAWER_PULL_TRIES   # 上段も半分だけなので傾かない。外れたらつかみ直す
+        opened = 0.0
+        for attempt in range(tries):
+            remain = goal - knob[1]
+            rospy.loginfo("pull %s drawer: try %d, %.3f m left", level, attempt + 1, remain)
+            if level == "top":
+                # 上段は下段を開けた後なので、全身 IK ではなく決まった姿勢 + 台車でつかむ
+                hand = self.grasp_drawer_handle_by_pose(level, knob)
+            else:
+                hand = self.grasp_drawer_handle(level, knob)
+            if hand is None:
+                break
+            pos_x, grasp_y, pos_z = hand
+            remain = hand_goal_y - grasp_y   # 実際に引く量（決めた所より先へは引かない）
+            if remain < 0.03:
+                gripper.command(1)
+                break
+            if (not self.move_hand_by_base(
+                    hand_goal_y, pos_x, timeout=remain / self.DRAWER_PULL_SPEED * 3 + 5,
+                    watch_grip=True)
+                    and not self.drawer_slipped):
+                # 外れていないのに台車で引けなかったときだけ、全身の IK で引いてみる
+                rospy.logwarn("base pull did not finish; pull with whole body IK")
+                whole_body.move_end_effector_pose(
+                    pos_x, hand_goal_y, pos_z, yaw, pitch, roll)
+            gap_end = self.finger_gap()
+            gripper.command(1)
+            # 手を抜く（開いた引き出しにぶつからないよう、台車で後ろへ下がる）
+            if not self.move_hand_by_base(hand_goal_y + 0.12, pos_x, timeout=8):
+                whole_body.move_end_effector_pose(
+                    pos_x, hand_goal_y + 0.12, pos_z, yaw, pitch, roll)
+            rospy.loginfo("%s drawer: finger gap at end of pull %s", level, gap_end)
+            # 腕を上げてから（開いた引き出しの前で腕を下ろさない）、取っ手がどこまで来たかをカメラで確かめる
+            self.drawer_pose("all_neutral")
+            self.look_at_drawer(level)
+            seen = self.detect_drawer_knob(level, knob[1] + remain, z_tol=0.10, y_tol=0.25)
+            if seen is not None:
+                knob = seen
+                opened = seen[1] - face0
+            elif gap_end is not None and gap_end >= self.slip_threshold():
+                # 取っ手は見えなかったが、最後までつかんでいた → 引けたとみなす
+                opened = pull
+            rospy.loginfo("%s drawer opened %.3f m (goal %.2f)", level, opened, pull)
+            if opened >= pull * 0.8:
+                break
+            if seen is None:
+                break  # 取っ手の位置が分からないので、もう一度つかみに行けない
+            self.go_to_drawer(level)  # 立ち位置に戻ってつかみ直す
+        if opened >= pull * 0.5:
+            self.drawer_opened = getattr(self, "drawer_opened", {})
+            self.drawer_opened[level] = opened
+            return True
+        rospy.logwarn("%s drawer did not open (%.3f m)", level, opened)
+        return False
+
+    def drawer_pose(self, name):
+        """62401738 いしい
+        引き出しのそばでの姿勢変更。開いた引き出しに腕をぶつけないよう MoveIt で計画して動かし、
+        計画できなければ直接指令で動かす（引き出しがうまく開いた 04:26 の実行と同じ動かし方）。
+        Task 1 の他の場所では week1 と同じ直接指令（change_pose）を使う。
+        """
+        if self.move_placement_pose(name):
+            return True
+        return self.change_pose(name)
+
+    def go_to_drawer(self, level):
+        """62401738 いしい
+        腕をたたんで level の引き出しの正面へ移動する。戻れなくても全身 IK が台車を動かして手を伸ばす。
+        """
+        self.drawer_pose("all_neutral")
+        stand = self.DRAWERS[level]["stand"]
+        if not self.navigate_for_placement(stand):
+            rospy.logwarn("cannot reach %s; try the %s drawer from here", stand, level)
             return False
-        if not whole_body.move_end_effector_pose(pos_x, pos_y, pos_z, yaw, pitch, roll):
-            return False
-        gripper.command(0)
-        moved = whole_body.move_end_effector_pose(pos_x, pos_y + pull, pos_z, yaw, pitch, roll)
-        gripper.command(1)
-        whole_body.move_end_effector_pose(
-            pos_x, pos_y + pull + 0.1, pos_z, yaw, pitch, roll)  # 手を抜く
-        return bool(moved)
+        return True
 
     def open_drawers(self):
         """62401738 いしい
-        下段を先に開け、次に上段を大きく開ける（上段が前に傾いて下段の判定範囲と重なる）。
-        両方開いたら、上段の重なる位置を置き場所 DRAWER_PLACE_NAME として登録する。
+        2 段の下段を全開（0.30）→ 上段を半分（0.20）→ 横の引き出し（0.25）の順に開ける。
+        開いた引き出しに物体を落とす位置を登録する（工具: DRAWER_PLACE_NAME、形のもの: DRAWER_LEFT_PLACE_NAME）。
         """
+        if getattr(self, "drawers_attempted", False):
+            return getattr(self, "drawers_open", False)
+        self.drawers_attempted = True
         self.drawers_open = False
-        if not self.USE_DRAWER:
+        if not rospy.get_param("~use_drawer", self.USE_DRAWER):
             return False
-        self.change_pose("all_neutral")
-        self.goto_pos(self.DRAWER_STANDPOINT)
-        self.change_pose("grasp_on_table")
-        opened = self.pull_drawer("bottom") and self.pull_drawer("top")
-        self.change_pose("all_neutral")
-        if not opened:
+        rospy.loginfo("#### open drawers ####")
+        gripper.command(1)  # 手を空にしてから始める（物を持ったまま引かない）
+        for name, pos in self.DRAWER_STANDPOINTS.items():
+            self.coordinates["positions"][name] = list(pos)
+        opened = {}
+        try:
+            # 下段を全開（0.30）→ 上段を半分（0.20）の順。
+            # 上段を先に開けると、下段へ腕を下ろすときに開いた上段に引っかかる（11/9 の実行）。
+            # 下段が出ていると全身 IK では上段に届かないので、上段は決まった姿勢 + 台車でつかむ。
+            self.go_to_drawer("bottom")
+            opened["bottom"] = self.pull_drawer("bottom")
+            self.go_to_drawer("top")
+            opened["top"] = self.pull_drawer("top")
+            self.go_to_drawer("left")
+            opened["left"] = self.pull_drawer("left")
+        except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
+            rospy.logerr("drawer error: %s", error)
+        finally:
+            gripper.command(1)
+            self.drawer_pose("all_neutral")
+        rospy.loginfo("drawer result: %s  opened [m]: %s", json.dumps(opened, sort_keys=True),
+                      json.dumps({k: round(v, 3) for k, v in getattr(self, "drawer_opened", {}).items()}))
+
+        # 工具の置き場所（2 段の引き出し）
+        drop, level = None, None
+        # 工具は上段に入れる。下段は上段の下に隠れて上から落とせないので、上段が開かなかったときだけ使う
+        if opened.get("top"):
+            drop, level = self.DRAWER_DROP["top"], "top"
+        elif opened.get("bottom"):
+            drop, level = self.DRAWER_DROP["bottom"], "bottom"
+        if drop is not None:
+            self.register_drawer_place(self.DRAWER_PLACE_NAME, drop, level)
+        # 形のものの置き場所（横の引き出し）
+        if opened.get("left"):
+            self.register_drawer_place(self.DRAWER_LEFT_PLACE_NAME, self.DRAWER_DROP["left"], "left")
+        self.drawers_open = any(opened.values())
+        if not self.drawers_open:
             rospy.logwarn("could not open the drawers. use bin_b instead.")
-            return False
-        self.coordinates["positions"][self.DRAWER_PLACE_NAME] = list(self.DRAWER_STANDPOINT)
-        self.placement_targets[self.DRAWER_PLACE_NAME] = dict(self.DRAWER_DROP)
-        self.drawers_open = True
+        return self.drawers_open
+
+    def register_drawer_place(self, place, drop, level):
+        """62401738 いしい
+        指先を drop（x, y）に持っていける台車の位置（引き出しの方を向く）と、離すときの腕の姿勢を登録する。
+        put_in_place は bin と同じ「移動 → 姿勢 → 離す」で置く（placement_targets には入れない）。
+        """
+        x, y, pose = drop
+        # ロボットは -y 向き（yaw -90°）: 前は map の -y、左は map の +x
+        self.coordinates["positions"][place] = [
+            x - self.DRAWER_HAND_LEFT, y + self.DRAWER_HAND_FORWARD, -90]
+        self.poses.update(self.DRAWER_RELEASE_POSES)
+        self.placement_targets.pop(place, None)
+        if not hasattr(self, "drawer_places"):
+            self.drawer_places = {}
+        self.drawer_places[place] = pose
+        if not hasattr(self, "drawer_drops"):
+            self.drawer_drops = {}
+        self.drawer_drops[place] = (x, y)
+        # 落とす位置を「開いた取っ手からのずれ」としても覚えておく（置く直前に取っ手を見て合わせる）
+        opened = getattr(self, "drawer_opened", {}).get(level, self.DRAWERS[level]["pull"])
+        knob = (self.DRAWERS[level]["x"], self.DRAWER_KNOB_FACE_Y + opened)
+        if not hasattr(self, "drawer_drop_refs"):
+            self.drawer_drop_refs = {}
+        self.drawer_drop_refs[place] = (level, opened, x - knob[0], y - knob[1])
+        rospy.loginfo("drawer place %s: stand at (%.3f, %.3f), release with %s",
+                      place, self.coordinates["positions"][place][0],
+                      self.coordinates["positions"][place][1], pose)
+
+    def locate_drawer_drop(self, place):
+        """62401738 いしい
+        開いた引き出しの取っ手を深度カメラで見て、落とす位置 drawer_drops[place] を取っ手の位置から決め直す。
+        取っ手も手も同じ（ずれた）map 座標で測るので、自己位置のずれが打ち消される。
+        見えなければ決めてある位置のまま。物を持っているので腕はたたまない。
+        """
+        level, opened, off_x, off_y = self.drawer_drop_refs[place]
+        self.look_at_drawer(level, fold_arm=False)
+        knob = self.detect_drawer_knob(level, self.DRAWER_KNOB_FACE_Y + opened, z_tol=0.10,
+                                       y_tol=0.15)
+        if knob is None:
+            rospy.logwarn("opened %s drawer knob not seen; use the planned drop point", level)
+            self.lock_target(place, *self.drawer_drops[place])
+            return True
+        old = self.drawer_drops[place]
+        self.drawer_drops[place] = (knob[0] + off_x, knob[1] + off_y)
+        self.lock_target(place, *self.drawer_drops[place])
+        rospy.loginfo("drop point for %s: (%.3f, %.3f) -> (%.3f, %.3f) from the knob",
+                      place, old[0], old[1], self.drawer_drops[place][0], self.drawer_drops[place][1])
         return True
+
+    DRAWER_PALM_TO_TIPS = 0.058   # 腕を前に水平に出した姿勢での、手のひらから指先までの距離（FK）
+
+    CONTAINER_RELEASE_POSE = "put_in_drawer_high"   # 容器の上で離す腕の姿勢（指先の高さ 0.71）
+
+    # 長机の上の容器・トレイの中心（指先を合わせる map 座標 x, y）と、離すときの指先の高さ z。
+    # Gazebo のモデル位置から計算（map_x = 1.2 - world_y, map_y = world_x + 2.1。家具は Seed で変わらない）。
+    #   机の天面 0.40。容器の縁 0.51 → 指先 0.71、トレイの縁 0.43 → 指先 0.61（落とす高さを小さくして転がり出さない）
+    # 11/9 までの記録では、センサでの容器探し（ensure_sensor_placements）が見つからない・2 つ見えるなどで
+    # select_destination に失敗し、Food / Kitchen items が 1 つも正しい場所に入っていなかった。
+    # 見つかった回も中心が 6cm ずれていた（推定 x 1.039、実際 1.10）。bin と同じく決まった位置を使う。
+    KNOWN_PLACEMENTS = {
+        "container_a_place": (1.10, -0.60, 0.71),   # Container A（大きい方、sim の名前は wrc_container_b）
+        "container_b_place": (1.40, -0.60, 0.71),   # Container B（小さい方、wrc_container_a）
+        "tray_b_place": (1.65, -0.60, 0.61),        # wrc_tray_2
+        "tray_a_place": (1.95, -0.60, 0.61),        # wrc_tray_1
+    }
+    RELEASE_TIPS_Z0 = 0.51   # put_in_bin（arm_lift 0）の指先の高さ。arm_lift を上げた分だけ上がる
+
+    def register_known_placements(self):
+        """62401738 いしい
+        容器・トレイを決まった位置で登録する（ROS パラメータで実測値が与えられた所はそちらを使う）。
+        台車は -y 向きで、put_in_bin と同じ形の腕の指先が中心の真上に来る位置に立つ。
+        """
+        if not rospy.get_param("~use_known_placements", True):
+            return
+        targets = getattr(self, "placement_targets", {})
+        for place, (x, y, z) in self.KNOWN_PLACEMENTS.items():
+            if place in targets:
+                continue
+            self.coordinates["positions"][place] = [
+                x - self.DRAWER_HAND_LEFT, y + self.DRAWER_HAND_FORWARD, -90.0]
+            targets[place] = {"x": x, "y": y, "z": z, "hover": 0.12}
+            # move_base で着けなかったときは 10cm 手前に立つ（最後の位置合わせは台車の速度指令で行う）
+            if not hasattr(self, "placement_alternates"):
+                self.placement_alternates = {}
+            self.placement_alternates[place] = [
+                x - self.DRAWER_HAND_LEFT, y + self.DRAWER_HAND_FORWARD + 0.10, -90.0]
+        self.placement_targets = targets
+
+    def release_pose_for(self, place):
+        """62401738 いしい
+        place の上で離すときの腕の姿勢名。指先の高さが目標の z になるよう arm_lift を決める。
+        """
+        z = self.placement_targets[place]["z"]
+        lift = max(0.0, min(0.5, z - self.RELEASE_TIPS_Z0))
+        name = "release_{}".format(place)
+        self.poses[name] = {"arm_lift_joint": lift, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
+                            "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
+                            "head_tilt_joint": 0.0, "head_pan_joint": 0.0}
+        return name
+
+    # 置く直前にカメラで探す容器・トレイの種類（detect_container_rims の kind）
+    PLACE_KINDS = {"container_a_place": "container_a", "container_b_place": "container_b",
+                   "tray_a_place": "tray", "tray_b_place": "tray"}
+    PLACE_SEARCH_RADIUS = 0.25   # 予想位置からこれ以上離れた容器は別の物とみなす（自己位置のずれは最大 0.2）
+
+    def lock_target(self, place, x, y):
+        """62401738 いしい
+        map 座標の目標 (x, y) を今の odom 座標に直して覚える（位置合わせは odom の中で行う）。
+        """
+        self.locked_targets = getattr(self, "locked_targets", {})
+        odom = self.map_to_odom(x, y)
+        if odom is None:
+            self.locked_targets.pop(place, None)
+        else:
+            self.locked_targets[place] = odom
+
+    def locate_place_target(self, place):
+        """62401738 いしい
+        容器・トレイの前に着いたら頭のカメラで見て、予想位置の近くにある同じ種類の容器の中心を目標にする。
+        カメラの点群も手の位置も同じ（ずれた）自己位置で測るので、自己位置のずれが打ち消される。
+        見つからなければ決めてある位置のまま。物を持っているので腕は動かさない。
+        """
+        import numpy as np
+
+        target = self.placement_targets[place]
+        kind = self.PLACE_KINDS.get(place)
+        x, y = target["x"], target["y"]
+        if kind is not None:
+            head = whole_body.HEAD_CMD
+            head.set_joint_value_target({"head_pan_joint": 0.0, "head_tilt_joint": -0.8})
+            try:
+                head.go(wait=True)
+            finally:
+                head.stop()
+            rospy.sleep(0.5)
+            found = []
+            stamp = rospy.Time.now()
+            for _ in range(2):
+                try:
+                    points, stamp = self.read_placement_cloud(stamp)
+                except Exception as error:  # 点群が来なければ決めてある位置を使う
+                    rospy.logwarn("no depth cloud at %s: %s", place, error)
+                    break
+                near = points[(np.abs(points[:, 0] - x) < 0.40) & (np.abs(points[:, 1] - y) < 0.35)]
+                for item in self.detect_container_rims(near):
+                    dist = math.hypot(item["x"] - x, item["y"] - y)
+                    if item["kind"] == kind and dist < self.PLACE_SEARCH_RADIUS:
+                        found.append((dist, item["x"], item["y"]))
+            if found:
+                _, best_x, best_y = min(found)
+                same = [(fx, fy) for _, fx, fy in found
+                        if math.hypot(fx - best_x, fy - best_y) < 0.05]
+                seen_x = sum(v[0] for v in same) / len(same)
+                seen_y = sum(v[1] for v in same) / len(same)
+                rospy.loginfo("%s seen at (%.3f, %.3f); planned (%.3f, %.3f)",
+                              place, seen_x, seen_y, x, y)
+                x, y = seen_x, seen_y
+            else:
+                rospy.logwarn("%s not seen; use the planned position (%.3f, %.3f)", place, x, y)
+        self.lock_target(place, x, y)
+        return True
+
+    def align_tips_over(self, place, x, y):
+        """62401738 いしい
+        腕の姿勢はそのまま台車だけ動かし、指先を目標の真上に合わせる（台車の向きによらない）。
+        目標は locate で odom 座標に直したもの（なければ map の (x, y) を今 odom に直す）。
+        odom の中で合わせるので、途中で自己位置の推定が変わっても手の行き先はずれない。
+        合わせきれなくても、その場で離す。
+        """
+        locked = getattr(self, "locked_targets", {}).get(place)
+        if locked is None:
+            self.lock_target(place, x, y)
+            locked = getattr(self, "locked_targets", {}).get(place)
+        frame = "odom" if locked is not None else "map"
+        tips = locked if locked is not None else (x, y)
+        yaw = self.base_yaw(frame)
+        if yaw is None:
+            return True
+        palm_x = tips[0] - self.DRAWER_PALM_TO_TIPS * math.cos(yaw)
+        palm_y = tips[1] - self.DRAWER_PALM_TO_TIPS * math.sin(yaw)
+        if not self.move_hand_by_base(palm_y, palm_x, timeout=12, x_tol=0.01, frame=frame):
+            rospy.logwarn("could not align the hand over %s; release here", place)
+        hand = self.lookup_xyz("hand_palm_link", frame)
+        if hand is not None:
+            rospy.loginfo("release over %s (%s): palm (%.3f, %.3f, %.3f), target tips (%.3f, %.3f)",
+                          place, frame, hand[0], hand[1], hand[2], tips[0], tips[1])
+        getattr(self, "locked_targets", {}).pop(place, None)
+        return True
+
+    def align_hand_over(self, place, x, y):
+        """62401738 いしい
+        容器・トレイの上に指先を合わせる（align_tips_over）。
+        """
+        return self.align_tips_over(place, x, y)
+
+    def align_hand_over_drawer(self, place):
+        """62401738 いしい
+        引き出しの落とす位置（drawer_drops[place]）の真上に指先を合わせる（align_tips_over）。
+        """
+        x, y = self.drawer_drops[place]
+        return self.align_tips_over(place, x, y)
 
     def select_drawer_place(self, label, category):
         """62401738 いしい
-        引き出し行きの物体（Tools / Shape items）の置き場所を返す。
-        開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
+        引き出し行きの物体の置き場所を返す。工具は 2 段の引き出し、形のもの（Shape items）は横の引き出し。
+        その引き出しが開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
         """
-        if not getattr(self, "drawers_open", False):
-            raise ValueError("Drawers are not open for {} ({})".format(label, category))
-        rospy.loginfo("place %s (%s) at %s", label, category, self.DRAWER_PLACE_NAME)
-        return self.DRAWER_PLACE_NAME, None
+        place = self.DRAWER_PLACE_NAME if category == "drawer_tools" else self.DRAWER_LEFT_PLACE_NAME
+        places = getattr(self, "drawer_places", {})
+        if place not in places:
+            raise ValueError("Drawer for {} ({}) is not open".format(label, category))
+        rospy.loginfo("place %s (%s) at %s", label, category, place)
+        return place, places[place]
 
     def put_in_fallback(self, label):
         """62401738 いしい
         正しい置き場所に置けなかった物体を置く。
-        引き出しが開いていれば上段の重なる位置（判定2つ分）、開いていなければ bin_b（10点）。
+        2 段の引き出し（上段）→ 横の引き出し → bin_b の順に試す。
         """
-        if getattr(self, "drawers_open", False):
-            return self.put_in_place(self.DRAWER_PLACE_NAME, None, label=label)
+        places = getattr(self, "drawer_places", {})
+        tried = getattr(self, "last_placement_result", {}).get("place")
+        for place in (self.DRAWER_PLACE_NAME, self.DRAWER_LEFT_PLACE_NAME):
+            if place not in places or place == tried:
+                continue  # 開いていない引き出しと、今失敗した所は飛ばす
+            if self.put_in_place(place, places[place], label=label):
+                return True
+            if getattr(self, "last_placement_result", {}).get("released", False):
+                return False  # 手を離した後の失敗。もう持っていないので bin_b へは行かない
+        # 引き出しに置けなければ、week1 と同じく bin_b に入れる（持ったまま次の物を取りに行かない）
         return self.put_in_place("bin_b_place", "put_in_bin", label=label)
 
     def execute_task1(self):
@@ -1332,17 +2105,14 @@ class WrsMainController(object):
         self.grasp_from_front_side(grasp_pos)
         self.change_pose("all_neutral")
 
-        # 2人の間をスライドして渡す（もう1人の前から始めて、target_person の前で離す）
+        # target_personの前に持っていく（week1 に戻した。スライドして渡す方式はうまくいかなかった）
         if target_person not in self.PERSON_WAYPOINTS:
             rospy.logwarn("unknown person [%s]. use default [%s].", target_person,
                           self.DEFAULT_PERSON)
             target_person = self.DEFAULT_PERSON
-        end = self.PERSON_WAYPOINTS[target_person]
-        start = "person_a" if end == "person_b" else "person_b"
         self.change_pose("look_at_near_floor")
-        self.goto_name(start)
+        self.goto_name(self.PERSON_WAYPOINTS[target_person])
         self.change_pose("deliver_to_human")
-        self.slide_base_to(self.coordinates["positions"][end])
         rospy.sleep(10.0)
         gripper.command(1)
         self.change_pose("all_neutral")
@@ -1948,7 +2718,8 @@ class WrsMainController(object):
         return [best["x"], target_y, cls.TASK2A_YAW]
 
     # 障害物を持って退かす（Task 2a）。把持している物体との接触は衝突にならない
-    TASK2A_MODE = "grasp"                 # "grasp": 持って退かす / "avoid": A* で避ける（従来）
+    # week1 と同じ "avoid" に戻した（"grasp" は 11/9 の実行で wrc_frame にぶつかった）
+    TASK2A_MODE = "avoid"                 # "grasp": 持って退かす / "avoid": A* で避ける（week1）
     TASK2A_GRASP_STANDOFF = 0.45          # 障害物の手前で止まる距離 [m]（> TASK2A_DANGER_DIST）
     TASK2A_GRASP_MAX = 5                  # 退かす障害物の数の上限
     TASK2A_MATCH_DIST = 0.25              # 近づいて見直したとき、同じ障害物とみなす距離 [m]
@@ -2088,12 +2859,50 @@ class WrsMainController(object):
         # 指定したオブジェクトを指定した配達先へ（見つからなくても何かを届けて20点を狙う）
         self.deliver_to_target(target_obj, target_person)
 
+    REQUIRED_CONTROLLERS = ("arm_trajectory_controller", "head_trajectory_controller")
+
+    def wait_for_controllers(self, timeout=120.0):
+        """62401738 いしい
+        シミュレータのコントローラ（腕・頭）が running になるまで待つ。
+        起動直後や起動に失敗したシミュレータでは、指令を出しても腕も台車も動かない
+        （MoveIt は CONTROL_FAILED、move_base は計画できても動かない）ので、先に確認する。
+        """
+        from controller_manager_msgs.srv import ListControllers
+
+        name = "/hsrb/controller_manager/list_controllers"
+        deadline = time.monotonic() + timeout
+        missing = list(self.REQUIRED_CONTROLLERS)
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            try:
+                rospy.wait_for_service(name, timeout=5.0)
+                states = {c.name: c.state for c in rospy.ServiceProxy(name, ListControllers)().controller}
+                missing = [c for c in self.REQUIRED_CONTROLLERS if states.get(c) != "running"]
+                if not missing:
+                    if states.get("omni_base_controller", "running") != "running":
+                        rospy.logwarn("omni_base_controller is %s: the base may not move",
+                                      states.get("omni_base_controller"))
+                    rospy.loginfo("controllers are running")
+                    return True
+                rospy.loginfo("waiting for controllers: %s",
+                              ", ".join("{}={}".format(c, states.get(c, "none")) for c in missing))
+            except (rospy.ROSException, rospy.ServiceException) as error:
+                rospy.logwarn("cannot list controllers: %s", error)
+            time.sleep(3.0)
+        rospy.logerr("controllers did not start (%s). The robot cannot move: "
+                     "restart the simulator.", ", ".join(missing))
+        return False
+
     def run(self):
         """62418450 向井悠人
         全てのタスクを実行する（Task 1 → Task 2a → Task 2b）。
         Task 2b の指示文は棚の前に行くと届くので、2a を先に実行する。
         """
+        if not self.wait_for_controllers():
+            return  # 腕も台車も動かないので、何もせずに終わる（シミュレータを再起動する）
         self.change_pose("all_neutral")
+        if not rospy.get_param("~use_known_placements", True):
+            self.prescan_containers()  # 引き出しを開ける前に容器を見ておく（開けた後だと写り込む）
+        self.open_drawers()  # 手が空のうちに引き出しを開ける
         self.execute_task1()
         self.execute_task2a()
         self.execute_task2b()

@@ -17,6 +17,9 @@ __pycache__/
 
 # YOLO (python3.8 libs, datasets, training runs)
 .yolo_env/
+# SAM 3 (python3.12 + torch, tools/yolo/sam3_autolabel.py 用)
+.sam3_env/
+.sam3_build/
 datasets/
 runs/
 *.pt
