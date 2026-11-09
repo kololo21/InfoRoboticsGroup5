@@ -5,24 +5,43 @@ WRS環境内でロボットを動作させるためのメインプログラム
 """
 
 from __future__ import unicode_literals, print_function, division, absolute_import
+from collections import deque
+import inspect
 import json
 import os
+import re
 import traceback
 import time
+import threading
+import actionlib
+import numpy as np
 import rospy
 import rospkg
 import tf2_ros
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.srv import GetPlan
+from move_base_msgs.msg import MoveBaseGoal
+from nav_msgs.srv import GetMap, GetPlan
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import PointCloud2
+from tf.transformations import quaternion_matrix
 from actionlib_msgs.msg import GoalStatus
 from detector_msgs.srv import (
     SetTransformFromBBox, SetTransformFromBBoxRequest,
     GetObjectDetection, GetObjectDetectionRequest)
 from wrs_algorithm.util import omni_base, whole_body, gripper
+from wrs_algorithm.util.mathematics import quaternion_from_euler
 import math
 import copy
 import heapq
+
+
+class NavigationUnconfirmedError(RuntimeError):
+    """move_baseのゴール終了を確認できず、台車制御を引き継げない。"""
+
+
+class ManipulationUnconfirmedError(RuntimeError):
+    """把持指令を中止できたか確認できない。"""
 
 
 class WrsMainController(object):
@@ -37,14 +56,25 @@ class WrsMainController(object):
     HAND_PALM_Z_OFFSET = 0.075
     DETECT_CNT = 1
     TROFAST_Y_OFFSET = 0.2
+    NAVIGATION_TERMINAL_STATES = (
+        GoalStatus.PREEMPTED, GoalStatus.SUCCEEDED, GoalStatus.ABORTED,
+        GoalStatus.REJECTED, GoalStatus.RECALLED)
 
     def __init__(self):
-        """サンプルのまま（担当なし）
-        変数・設定ファイル・ROS通信を初期化する
+        """62418450 向井悠人
+        設定、深度の履歴、把持状態と台車制御を初期化する。
         """
         # 変数の初期化
         self.instruction_list = []
+        self.instruction_cursor = 0
         self.detection_list = []
+        self.navigation_pending = False
+        self.detection_job = None
+        self.depth_clouds = deque(maxlen=8)
+        self.hand_state = "empty"
+        self.arm_ready = True
+        self.held_geometry = None
+        self.wall_map = None
 
         # configファイルの受信
         self.coordinates = self.load_json(self.get_path(["config", "coordinates.json"]))
@@ -53,15 +83,16 @@ class WrsMainController(object):
 
         # ROS通信関連の初期化
         tf_from_bbox_srv_name = "set_tf_from_bbox"
-        rospy.wait_for_service(tf_from_bbox_srv_name)
         self.tf_from_bbox_clt = rospy.ServiceProxy(tf_from_bbox_srv_name, SetTransformFromBBox)
 
         obj_detection_name = "detection/get_object_detection"
-        rospy.wait_for_service(obj_detection_name)
         self.detection_clt = rospy.ServiceProxy(obj_detection_name, GetObjectDetection)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.depth_sub = rospy.Subscriber(rospy.get_param(
+            "~placement_cloud_topic", "/hsrb/head_rgbd_sensor/depth_registered/rectified_points"),
+            PointCloud2, self.depth_clouds.append, queue_size=1)
 
         self.instruction_sub = rospy.Subscriber(
             "/message", String, self.instruction_cb, queue_size=10)
@@ -119,23 +150,88 @@ class WrsMainController(object):
             return None
 
     def goto_name(self, name):
-        """サンプルのまま（担当なし）
-        waypoint名で指定された場所に移動する
+        """62418450 向井悠人
+        登録された地点へ台車を移動し、到達できたかを返す。
         """
-        if name in self.coordinates["positions"].keys():
-            pos = self.coordinates["positions"][name]
-            rospy.loginfo("go to [%s](%.2f, %.2f, %.2f)", name, pos[0], pos[1], pos[2])
-            return omni_base.go_abs(pos[0], pos[1], pos[2])
+        pos = self.coordinates["positions"].get(name)
+        if pos is None:
+            rospy.logerr("unknown waypoint name [%s]", name)
+            return False
+        return self.goto_pos(pos, name)
 
-        rospy.logerr("unknown waypoint name [%s]", name)
-        return False
-
-    def goto_pos(self, pos):
-        """サンプルのまま（担当なし）
-        waypoint名で指定された場所に移動する
+    def goto_pos(self, pos, name="raw_pos"):
+        """62418450 向井悠人
+        地図上の座標と向きへ、通常移動用の制限時間で台車を動かす。
         """
-        rospy.loginfo("go to [raw_pos](%.2f, %.2f, %.2f)", pos[0], pos[1], pos[2])
-        return omni_base.go_abs(pos[0], pos[1], pos[2])
+        return self.navigate_to_pose(pos, name, "~navigation_timeout")
+
+    def confirm_navigation_finished(self):
+        """62418450 向井悠人
+        前の台車ゴールの終了を確認し、未確定なら例外で後続動作を防ぐ。
+        """
+        if not self.navigation_pending:
+            return
+        client = omni_base.NAVCLIENT
+        finished = client.wait_for_result(rospy.Duration(2.0))
+        state = client.get_state()
+        if not finished or state not in self.NAVIGATION_TERMINAL_STATES:
+            raise NavigationUnconfirmedError(
+                "Previous navigation still unresolved: state={} text={}".format(
+                    state, client.get_goal_status_text()))
+        self.navigation_pending = False
+        rospy.loginfo("Previous navigation ended: state=%s text=%s",
+                      state, client.get_goal_status_text())
+
+    def navigate_to_pose(self, pos, name, timeout_param, corridor=None):
+        """62418450 向井悠人
+        目標へ台車を動かし、移動結果や床監視による中止理由を記録する。
+        """
+        timeout = float(rospy.get_param(timeout_param, 60.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("{} must be positive and finite".format(timeout_param))
+        self.confirm_navigation_finished()
+
+        client = omni_base.NAVCLIENT
+        if not client.wait_for_server(rospy.Duration(2.0)):
+            rospy.logerr("Navigation server unavailable for %s", name)
+            return False
+
+        x_pos, y_pos, yaw = pos
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = x_pos
+        goal.target_pose.pose.position.y = y_pos
+        goal.target_pose.pose.orientation = quaternion_from_euler(yaw, 0, 0)
+        rospy.loginfo("Navigation %s: x=%.2f y=%.2f yaw=%.1f", name, x_pos, y_pos, yaw)
+
+        self.navigation_pending = True
+        try:
+            client.send_goal(goal)
+            result = self.await_base_result(timeout, corridor)
+            if result != "done":
+                reason = "interrupted" if rospy.is_shutdown() else result
+                rospy.logerr("Navigation %s %s: state=%s text=%s",
+                             name, reason, client.get_state(), client.get_goal_status_text())
+                client.cancel_goal()
+                self.confirm_navigation_finished()
+                return False
+            state = client.get_state()
+        except rospy.ROSException as error:
+            raise NavigationUnconfirmedError(
+                "Cannot confirm navigation to {}: {}".format(name, error)) from error
+
+        if state not in self.NAVIGATION_TERMINAL_STATES:
+            raise NavigationUnconfirmedError(
+                "Navigation {} ended without a confirmed result: state={} text={}".format(
+                    name, state, client.get_goal_status_text()))
+        self.navigation_pending = False
+        if state != GoalStatus.SUCCEEDED:
+            rospy.logerr("Navigation %s failed: state=%s text=%s",
+                         name, state, client.get_goal_status_text())
+            return False
+        rospy.loginfo("Navigation reached %s", name)
+        return True
 
     def change_pose(self, name):
         """サンプルのまま（担当なし）
@@ -157,12 +253,307 @@ class WrsMainController(object):
             self.goto_name(wp_name)
             rospy.sleep(1)
 
-    def get_latest_detection(self):
-        """サンプルのまま（担当なし）
-        最新の認識結果が到着するまで待つ
+    def request_detection(self, job):
+        """62418450 向井悠人
+        検出サービスの応答を、呼び出し側が時間を区切って待てる形で返す。
         """
-        res = self.detection_clt(GetObjectDetectionRequest())
-        return res.bboxes
+        try:
+            job["response"] = self.detection_clt(GetObjectDetectionRequest())
+        except Exception as error:
+            job["error"] = error
+        finally:
+            job["done"].set()
+
+    def point_head(self, pan, tilt):
+        """62418450 向井悠人
+        腕の姿勢を保ったまま頭部カメラを指定方向へ向ける。
+        """
+        head = whole_body.HEAD_CMD
+        head.set_joint_value_target({"head_pan_joint": pan, "head_tilt_joint": tilt})
+        try:
+            return bool(head.go(wait=True))
+        finally:
+            head.stop()
+
+    def measure_object(self, bbox, detection, floor=False):
+        """62418450 向井悠人
+        RGBと時刻の近い深度から対象の中心と見える範囲の寸法を推定する。
+        """
+        deadline = time.monotonic() + 0.5
+        stamp = detection.header.stamp
+        cloud = None
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            clouds = self.depth_clouds.copy()
+            if clouds:
+                cloud = min(clouds, key=lambda item: abs((item.header.stamp - stamp).to_sec()))
+                if abs((cloud.header.stamp - stamp).to_sec()) <= 0.10:
+                    break
+            time.sleep(0.03)
+        else:
+            return None
+        if not cloud.header.frame_id or cloud.height <= 1:
+            return None
+
+        pixels = [(u, v)
+                  for v in range(max(0, bbox.y), min(cloud.height, bbox.y + bbox.h), 2)
+                  for u in range(max(0, bbox.x), min(cloud.width, bbox.x + bbox.w), 2)]
+        if not pixels:
+            return None
+        points = np.asarray(list(point_cloud2.read_points(
+            cloud, field_names=("x", "y", "z"), skip_nans=True, uvs=pixels)), dtype=float)
+        if len(points) < 15:
+            return None
+        points = points[np.isfinite(points).all(axis=1) & (points[:, 2] > 0)]
+        ordered = points[np.argsort(points[:, 2])]
+        groups = np.split(ordered, np.flatnonzero(np.diff(ordered[:, 2]) > 0.035) + 1)
+        points = next((group for group in groups if len(group) >= max(15, len(points) * 0.12)),
+                      None)
+        if points is None:
+            return None
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "map", cloud.header.frame_id, cloud.header.stamp, rospy.Duration(1.0)).transform
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as error:
+            rospy.logwarn("Cannot measure %s: %s", bbox.label, error)
+            return None
+        rotation, translation = self.transform_arrays(transform)
+        points = points.dot(rotation.T) + translation
+        if floor:
+            points = points[(points[:, 2] > 0.012) & (points[:, 2] < 0.35)]
+        if len(points) < 15:
+            return None
+        low, high = np.percentile(points, [3, 97], axis=0)
+        return {"center": (low + high) / 2, "size": np.maximum(high - low, 0.015),
+                "points": points}
+
+    @staticmethod
+    def transform_arrays(transform):
+        """62418450 向井悠人
+        TFの回転と平行移動を点群計算に使う配列に変換する。
+        """
+        q, t = transform.rotation, transform.translation
+        return quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3], np.array([t.x, t.y, t.z])
+
+    def finger_gap(self):
+        """62418450 向井悠人
+        左右の指先の距離を同じTFで求め、取得できないときは不明を返す。
+        """
+        try:
+            pos = self.tf_buffer.lookup_transform(
+                "hand_l_finger_tip_frame", "hand_r_finger_tip_frame",
+                rospy.Time(0), rospy.Duration(1.0)).transform.translation
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        return math.sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2)
+
+    def verify_holding(self):
+        """62418450 向井悠人
+        指先間隔から保持の手がかりを確認し、結果をログに残す。
+        """
+        gap = self.finger_gap()
+        empty_gap = float(rospy.get_param("~empty_finger_gap", 0.015))
+        holding = gap is not None and empty_gap < gap <= 0.12
+        rospy.loginfo("Grasp gap: %s m, holding=%s", gap, holding)
+        return holding
+
+    def close_for_grasp(self):
+        """62418450 向井悠人
+        力制御で指を閉じ、時間切れでは指令の中止を確認する。
+        """
+        from tmc_control_msgs.msg import GripperApplyEffortAction, GripperApplyEffortGoal
+
+        client = actionlib.SimpleActionClient(
+            "/hsrb/gripper_controller/grasp", GripperApplyEffortAction)
+        if not client.wait_for_server(rospy.Duration(3.0)):
+            rospy.logwarn("Gripper effort controller is unavailable")
+            return False
+        self.hand_state = "unknown"
+        client.send_goal(GripperApplyEffortGoal(effort=-0.5))
+        if not client.wait_for_result(rospy.Duration(5.0)):
+            client.cancel_goal()
+            if (not client.wait_for_result(rospy.Duration(2.0))
+                    or client.get_state() not in self.NAVIGATION_TERMINAL_STATES):
+                raise ManipulationUnconfirmedError("Cannot confirm gripper cancellation")
+            return False
+        state = client.get_state()
+        if state not in self.NAVIGATION_TERMINAL_STATES:
+            raise ManipulationUnconfirmedError("Unconfirmed gripper state {}".format(state))
+        return state == GoalStatus.SUCCEEDED
+
+    def hand_pose(self):
+        """62418450 向井悠人
+        現在の手のひらの地図座標と向きを取得する。
+        """
+        return self.tf_buffer.lookup_transform(
+            "map", "hand_palm_link", rospy.Time(0), rospy.Duration(1.0)).transform
+
+    @staticmethod
+    def hand_path_keeps_base_still(trajectory):
+        """62418450 向井悠人
+        全身の計画に台車の移動が含まれていれば実行を拒否する。
+        """
+        arm_joints = set(whole_body.ARM_CMD.get_active_joints())
+        joints = trajectory.joint_trajectory
+        if not joints.points:
+            return False
+        start = joints.points[0].positions
+        for index, name in enumerate(joints.joint_names):
+            if name in arm_joints:
+                continue
+            if any(abs(point.positions[index] - start[index]) > 0.025 for point in joints.points):
+                rospy.logwarn("Hand trajectory would move %s", name)
+                return False
+        base_path = trajectory.multi_dof_joint_trajectory.points
+        if not base_path:
+            return True
+        initial = base_path[0].transforms
+        for point in base_path:
+            for first, current in zip(initial, point.transforms):
+                a, b = first.translation, current.translation
+                p, q = first.rotation, current.rotation
+                dot = abs(p.x * q.x + p.y * q.y + p.z * q.z + p.w * q.w)
+                if math.dist((a.x, a.y, a.z), (b.x, b.y, b.z)) > 0.025 or dot < 0.9998:
+                    rospy.logwarn("Hand trajectory would move the floating base")
+                    return False
+        return True
+
+    def move_hand(self, xyz, orientation, linear=False):
+        """62418450 向井悠人
+        手先を地図座標へ動かし、直線移動では衝突のない完全な軌道だけを実行する。
+        """
+        self.confirm_navigation_finished()
+        commander = whole_body.WHOLE_BODY_CMD
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = xyz
+        pose.pose.orientation = orientation
+        if not linear:
+            try:
+                commander.set_pose_target(pose)
+                plan = commander.plan()
+                ok, trajectory = plan[:2] if isinstance(plan, tuple) else (True, plan)
+                return (bool(ok) and self.hand_path_keeps_base_still(trajectory)
+                        and bool(commander.execute(trajectory, wait=True)))
+            finally:
+                commander.stop()
+                commander.clear_pose_targets()
+
+        previous_frame = commander.get_pose_reference_frame()
+        try:
+            commander.set_pose_reference_frame("map")
+            cartesian = commander.compute_cartesian_path
+            kwargs = {"avoid_collisions": True}
+            if "jump_threshold" in inspect.signature(cartesian).parameters:
+                kwargs["jump_threshold"] = 0.0
+            trajectory, fraction = cartesian([pose.pose], 0.01, **kwargs)
+            if (not math.isfinite(fraction) or fraction < 1.0
+                    or not trajectory.joint_trajectory.points):
+                rospy.logwarn("Incomplete hand path: %.3f", fraction)
+                return False
+            return (self.hand_path_keeps_base_still(trajectory)
+                    and bool(commander.execute(trajectory, wait=True)))
+        finally:
+            commander.stop()
+            commander.set_pose_reference_frame(previous_frame)
+
+    def return_grasp_to_surface(self, contact, approach, orientation):
+        """62418450 向井悠人
+        保持が不明な把持を元の支持面へ戻し、開放してから腕を引く。
+        """
+        if self.hand_state != "empty":
+            if not self.move_hand(contact, orientation, linear=True):
+                return False
+            if not self.release_hand():
+                return False
+        return self.move_hand(approach, orientation, linear=True)
+
+    def release_hand(self):
+        """62418450 向井悠人
+        指の開放が成功したときに保持状態と物体寸法の記録を解消する。
+        """
+        self.hand_state = "unknown"
+        if not gripper.command(1):
+            return False
+        self.hand_state = "empty"
+        self.held_geometry = None
+        return True
+
+    def grasp_measured_object(self, item, approach_from_above, shelf=False):
+        """62418450 向井悠人
+        測った中心に指を合わせ、少し持ち上げて保持を確認し、安全に腕を引く。
+        """
+        base = self.get_robot_pose()
+        if base is None or self.hand_state != "empty":
+            return False
+        self.arm_ready = False
+        center = item["center"]
+        toward_base = np.array(base[:2]) - center[:2]
+        distance = np.linalg.norm(toward_base)
+        if distance < 0.25 or distance > 0.95:
+            rospy.logwarn("Grasp outside the provisional reach window: %.2fm", distance)
+            self.arm_ready = True
+            return False
+        toward_base /= distance
+        yaw = math.degrees(math.atan2(toward_base[1], toward_base[0]))
+        offset = np.array([0.0, 0.0, self.HAND_PALM_Z_OFFSET] if approach_from_above
+                          else [*(toward_base * self.HAND_PALM_OFFSET), 0.0])
+        contact = center + offset
+        approach = contact + np.array([0.0, 0.0, 0.10] if approach_from_above
+                                      else [*(toward_base * 0.15), 0.0])
+        orientation = quaternion_from_euler(yaw, -160 if approach_from_above else -100, 0)
+        if not gripper.command(1) or not self.move_hand(approach, orientation):
+            self.arm_ready = self.move_placement_pose("all_neutral")
+            return False
+        if not self.move_hand(contact, orientation, linear=True):
+            self.arm_ready = (self.move_hand(approach, orientation, linear=True)
+                              and self.move_placement_pose("all_neutral"))
+            return False
+        if not self.close_for_grasp() or not self.verify_holding():
+            self.arm_ready = (self.return_grasp_to_surface(contact, approach, orientation)
+                              and self.move_placement_pose("all_neutral"))
+            return False
+
+        rotation, translation = self.transform_arrays(self.hand_pose())
+        local = (item["points"] - translation).dot(rotation)
+        low, high = np.percentile(local, [3, 97], axis=0)
+        self.held_geometry = {"offset": (low + high) / 2,
+                              "size": np.maximum(high - low, 0.015) + 0.006}
+        lift = np.array([0.0, 0.0, 0.03 if shelf else 0.07])
+        if not self.move_hand(contact + lift, orientation, linear=True) or (
+                not self.verify_holding() and not self.verify_holding()):
+            self.arm_ready = (self.return_grasp_to_surface(contact, approach, orientation)
+                              and self.move_placement_pose("all_neutral"))
+            return False
+        retreat = approach if approach_from_above else approach + lift
+        if not self.move_hand(retreat, orientation, linear=True):
+            self.arm_ready = (self.move_hand(contact + lift, orientation, linear=True)
+                              and self.return_grasp_to_surface(contact, approach, orientation)
+                              and self.move_placement_pose("all_neutral"))
+            return False
+        self.hand_state = "held"
+        self.arm_ready = self.move_placement_pose("all_neutral")
+        return self.arm_ready
+
+    def get_latest_detection(self):
+        """62418450 向井悠人
+        新しいRGB画像の検出を要求し、通信失敗と空の検出結果を区別する。
+        """
+        if self.detection_job is not None and not self.detection_job["done"].is_set():
+            raise rospy.ServiceException("Previous detection request is still running")
+        job = {"done": threading.Event()}
+        self.detection_job = job
+        threading.Thread(target=self.request_detection, args=(job,), daemon=True).start()
+        if not job["done"].wait(5.0):
+            raise rospy.ServiceException("Object detection timed out")
+        if "error" in job:
+            raise rospy.ServiceException(str(job["error"]))
+        response = job["response"]
+        if not response.successed or response.bboxes.header.stamp == rospy.Time(0):
+            raise rospy.ServiceException(response.error_string or "No stamped detection result")
+        return response.bboxes
 
     def get_grasp_coordinate(self, bbox):
         """サンプルのまま（担当なし）
@@ -452,45 +843,23 @@ class WrsMainController(object):
         self.poses.update(poses)
         self.placement_targets = {name: dict(target) for name, target in targets.items()}
 
-    def read_placement_cloud(self, after):
+    def read_placement_cloud(self, after, stride=3):
         """62418450 向井悠人
-        頭部RGB-Dの新しい深度点群を受信し、撮影時刻のTFでmap座標へ変換する。
+        指定時刻より新しい深度点群を取り、地図座標の点群と時刻を返す。
         """
-        import numpy as np
-        from sensor_msgs.msg import PointCloud2
-        from sensor_msgs import point_cloud2
-        from tf.transformations import quaternion_matrix
-
-        topic = rospy.get_param(
-            "~placement_cloud_topic", "/hsrb/head_rgbd_sensor/depth_registered/rectified_points")
         deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            cloud = rospy.wait_for_message(topic, PointCloud2,
-                                           timeout=max(0.01, deadline - time.monotonic()))
-            if cloud.header.stamp <= after:
-                continue
-            if not cloud.header.frame_id or cloud.height <= 1:
-                raise ValueError("Placement requires an organized, stamped depth cloud")
-            transform = self.tf_buffer.lookup_transform(
-                "map", cloud.header.frame_id, cloud.header.stamp, rospy.Duration(2.0)).transform
-            pixels = [(u, v) for v in range(0, cloud.height, 3)
-                      for u in range(0, cloud.width, 3)]
-            points = np.asarray(list(point_cloud2.read_points(
-                cloud, field_names=("x", "y", "z"), skip_nans=True, uvs=pixels)))
-            if points.ndim != 2 or len(points) < 100:
-                raise ValueError("Not enough depth measurements for placement")
-            points = points[np.isfinite(points).all(axis=1)]
-            q = transform.rotation
-            matrix = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
-            t = transform.translation
-            return points.dot(matrix.T) + np.array([t.x, t.y, t.z]), cloud.header.stamp
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            clouds = self.depth_clouds.copy()
+            if clouds and clouds[-1].header.stamp > after:
+                cloud = clouds[-1]
+                return self.cloud_in_map(cloud, stride), cloud.header.stamp
+            time.sleep(0.03)
         raise ValueError("No new depth cloud after the observation pose")
 
     @staticmethod
-    def detect_container_rims(points):
+    def detect_container_rims(points, floor_bin=False):
         """62418450 向井悠人
-        深度点群から水平な机面と矩形の縁を抽出し、観測寸法で容器を分類する。
-        座標・高さは点群だけから求める。閾値は形状認識用で実環境で要調整。
+        深度点群から容器・トレイ・床のBinの矩形の縁を抽出する。
         """
         import cv2
         import numpy as np
@@ -499,19 +868,22 @@ class WrsMainController(object):
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError("Expected an Nx3 map-frame cloud")
         points = points[np.isfinite(points).all(axis=1)]
-        points = points[(points[:, 2] > 0.25) & (points[:, 2] < 1.1)]
-        if len(points) < 100:
-            return []
-        # 水平な面はmap座標の同じ高さに多数の点を持つ。
-        bins = np.floor(points[:, 2] / 0.008).astype(int)
-        levels, counts = np.unique(bins, return_counts=True)
-        plane_bin = levels[np.argmax(counts)]
-        surface = points[bins == plane_bin]
-        if len(surface) < 100 or np.min(np.ptp(surface[:, :2], axis=0)) < 0.25:
-            return []
-        table_z = float(np.median(surface[:, 2]))
-        raised = points[(points[:, 2] > table_z + 0.007)
-                        & (points[:, 2] < table_z + 0.18)]
+        if floor_bin:
+            table_z = 0.0
+            raised = points[(points[:, 2] > 0.10) & (points[:, 2] < 0.48)]
+        else:
+            points = points[(points[:, 2] > 0.25) & (points[:, 2] < 1.1)]
+            if len(points) < 100:
+                return []
+            bins = np.floor(points[:, 2] / 0.008).astype(int)
+            levels, counts = np.unique(bins, return_counts=True)
+            plane_bin = levels[np.argmax(counts)]
+            surface = points[bins == plane_bin]
+            if len(surface) < 100 or np.min(np.ptp(surface[:, :2], axis=0)) < 0.25:
+                return []
+            table_z = float(np.median(surface[:, 2]))
+            raised = points[(points[:, 2] > table_z + 0.007)
+                            & (points[:, 2] < table_z + 0.18)]
         if len(raised) < 40:
             return []
         resolution = 0.006
@@ -536,7 +908,12 @@ class WrsMainController(object):
             rect = cv2.minAreaRect(cluster[:, :2].astype(np.float32))
             width, length = sorted(rect[1])
             height = float(np.percentile(cluster[:, 2], 95) - table_z)
-            if 0.24 <= width <= 0.42 and 0.28 <= length <= 0.48 and height < 0.065:
+            if floor_bin:
+                if not (0.18 <= width <= 0.42 and 0.22 <= length <= 0.50
+                        and 0.16 <= height <= 0.46):
+                    continue
+                kind = "bin"
+            elif 0.24 <= width <= 0.42 and 0.28 <= length <= 0.48 and height < 0.065:
                 kind = "tray"
             elif 0.14 <= width <= 0.32 and 0.17 <= length <= 0.35 and height >= 0.065:
                 kind = "container_a"
@@ -597,34 +974,41 @@ class WrsMainController(object):
             results.append(result)
         return results
 
-    def observe_placement_containers(self):
+    def observe_placement_containers(self, category):
         """62418450 向井悠人
-        既存の観測地点から頭部を振り、深度点群で容器を探す。把持は維持する。
+        把持後に収納側を向いて観測し、足りなければ既知の観測地点で見直す。
         """
         waypoint = rospy.get_param("~placement_scan_waypoint", "drawer")
-        if waypoint not in self.coordinates["positions"]:
-            raise ValueError("Unknown placement observation waypoint: {}".format(waypoint))
-        if (not self.move_placement_pose("all_neutral")
-                or not self.navigate_for_placement(waypoint)):
-            raise ValueError("Cannot reach the placement observation waypoint")
-        frames = []
-        for pan in (-0.8, 0.0, 0.8):
-            head = whole_body.HEAD_CMD
-            head.set_joint_value_target({"head_pan_joint": pan, "head_tilt_joint": -0.55})
-            try:
-                if not head.go(wait=True):
-                    raise ValueError("Cannot point the depth camera at the deposit area")
-            finally:
-                head.stop()
-            stamp = rospy.Time.now()
-            for _ in range(2):
-                points, stamp = self.read_placement_cloud(stamp)
-                frames.append(self.detect_container_rims(points))
-        return self.merge_container_observations(frames)
+        pos = self.coordinates["positions"][waypoint]
+        for attempt in range(2):
+            arrived = (self.turn_base_toward(pos[2]) if attempt == 0 else
+                       self.navigate_checked(pos, waypoint, "~placement_navigation_timeout"))
+            if not arrived:
+                continue
+            frames = []
+            matches = []
+            for pan in (0.0, -0.7, 0.7):
+                if not self.point_head(pan, -0.55):
+                    continue
+                stamp = rospy.Time.now()
+                try:
+                    for _ in range(2):
+                        points, stamp = self.read_placement_cloud(stamp)
+                        frames.append(self.detect_container_rims(points))
+                except (ValueError, rospy.ROSException, tf2_ros.LookupException,
+                        tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as error:
+                    rospy.logwarn("Deposit view failed: %s", error)
+                matches = [item for item in self.merge_container_observations(frames)
+                           if item["kind"] == category]
+                if matches and (category != "tray" or len(matches) >= 2):
+                    return matches
+            if matches:
+                return matches
+        return []
 
     def ensure_sensor_placements(self, category, destinations):
         """62418450 向井悠人
-        配置設定がない容器をセンサで特定し、接近点と手先開放点を登録する。
+        配置設定がない容器を把持後に観測し、接近点と開口の候補を登録する。
         """
         if category not in ("tray", "container_a", "container_b"):
             return
@@ -638,18 +1022,16 @@ class WrsMainController(object):
             targets.pop(place, None)
             self.coordinates["positions"].pop(place, None)
         self.sensor_placement_names = set()
-        observations = self.observe_placement_containers()
-        found = [item for item in observations if item["kind"] == category]
+        found = self.observe_placement_containers(category)
         maximum = 2 if category == "tray" else 1
         if not found or len(found) > maximum:
             raise ValueError("Missing or ambiguous sensor observations for {}".format(category))
         base = self.tf_buffer.lookup_transform(
             "map", "base_footprint", rospy.Time(0), rospy.Duration(2.0)).transform.translation
         distance = float(rospy.get_param("~placement_standoff", 0.65))
-        clearance = float(rospy.get_param("~placement_release_clearance", 0.18))
         hover = float(rospy.get_param("~placement_hover_distance", 0.12))
         if any(not math.isfinite(value) or value <= 0 for value in
-               (distance, clearance, hover)):
+               (distance, hover)):
             raise ValueError("Placement distances must be positive and finite")
         self.placement_targets = targets
         for (place, _), item in zip(destinations, sorted(found, key=lambda value: value["x"])):
@@ -660,52 +1042,146 @@ class WrsMainController(object):
             self.coordinates["positions"][place] = [
                 item["x"] + distance * dx / norm, item["y"] + distance * dy / norm,
                 math.degrees(math.atan2(-dy, -dx))]
-            targets[place] = {"x": item["x"], "y": item["y"],
-                              "z": item["rim_z"] + clearance, "hover": hover}
+            targets[place] = dict(item, hover=hover)
             self.sensor_placement_names.add(place)
             rospy.loginfo("Sensor placement %s: %s", place, json.dumps(item, sort_keys=True))
 
-    def move_over_container(self, place, hover=False, linear=False):
+    def measure_container_opening(self, place, pan, tilt, skip=None):
         """62418450 向井悠人
-        手先の向きを保って中心上へ移動し、下降・退避は直線軌道を使う。
-        直線軌道が最後まで計画できなければ実行しない。
+        到着後の2フレームで同じ容器の縁と保持物を入れられる空きを探す。
         """
         target = self.placement_targets[place]
-        transform = self.tf_buffer.lookup_transform(
-            "map", "hand_palm_link", rospy.Time(0), rospy.Duration(2.0))
-        pose = PoseStamped()
-        pose.header.frame_id = "map"
-        pose.pose.position.x = target["x"]
-        pose.pose.position.y = target["y"]
-        pose.pose.position.z = target["z"] + (target["hover"] if hover else 0)
-        pose.pose.orientation = transform.transform.rotation
-        commander = whole_body.WHOLE_BODY_CMD
-        if not linear:
-            commander.set_pose_target(pose)
+        kind = target.get("kind", place.rsplit("_place", 1)[0])
+        if kind.startswith("tray"):
+            kind = "tray"
+        floor_bin = kind == "bin"
+        base = self.get_robot_pose() if floor_bin else None
+        if floor_bin and base is None:
+            return False
+        if not self.point_head(pan, tilt - 0.28 if floor_bin else tilt):
+            return False
+        frames = []
+        stamp = rospy.Time.now()
+        for _ in range(2):
             try:
-                return bool(commander.go(wait=True))
-            finally:
-                commander.stop()
-                commander.clear_pose_targets()
-        previous_frame = commander.get_pose_reference_frame()
-        try:
-            commander.set_pose_reference_frame("map")
-            trajectory, fraction = commander.compute_cartesian_path(
-                [pose.pose], 0.01, 0.0, avoid_collisions=True)
-            if (not math.isfinite(fraction) or fraction < 1.0
-                    or not trajectory.joint_trajectory.points):
-                rospy.logerr("Incomplete placement trajectory: %.3f", fraction)
+                cloud, stamp = self.read_placement_cloud(stamp, stride=2)
+            except (ValueError, rospy.ROSException, tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as error:
+                rospy.logwarn("Opening observation failed for %s: %s", place, error)
                 return False
-            return bool(commander.execute(trajectory, wait=True))
-        finally:
-            commander.stop()
-            commander.set_pose_reference_frame(previous_frame)
+            if floor_bin:
+                forward = np.array([math.cos(base[2]), math.sin(base[2])])
+                lateral = np.array([-forward[1], forward[0]])
+                delta = cloud[:, :2] - np.asarray(base[:2])
+                front, side = delta.dot(forward), delta.dot(lateral)
+                scan = cloud[(front > 0.15) & (front < 0.80) & (np.abs(side) < 0.24)]
+                rims = self.detect_container_rims(scan, floor_bin=True)
+            else:
+                rims = [rim for rim in self.detect_container_rims(cloud)
+                        if rim["kind"] == kind and math.hypot(
+                            rim["x"] - target["x"], rim["y"] - target["y"]) <= 0.14]
+            if len(rims) != 1:
+                return False
+            frames.append((cloud, rims[0]))
+        first, second = (frame[1] for frame in frames)
+        if math.hypot(first["x"] - second["x"], first["y"] - second["y"]) > 0.025:
+            return False
+        if abs(first["rim_z"] - second["rim_z"]) > 0.025:
+            return False
+        center = np.array([(first[axis] + second[axis]) / 2 for axis in ("x", "y")])
+        rim_z = max(first["rim_z"], second["rim_z"])
+        half = min(first["width"], second["width"]) / (2 * math.sqrt(2)) - 0.008
+        rotation, _ = self.transform_arrays(self.hand_pose())
+        extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
+        slack = half - extent[:2] - 0.012
+        if np.any(slack <= 0):
+            return False
+        for shift in ((0, 0), (-0.65, 0), (0.65, 0), (0, -0.65), (0, 0.65)):
+            xy = center + np.asarray(shift) * slack
+            if skip is not None and math.dist(xy, skip) < 0.012:
+                continue
+            free = True
+            for cloud, _ in frames:
+                inside = np.all(np.abs(cloud[:, :2] - xy) <= extent[:2] + 0.008, axis=1)
+                heights = cloud[inside, 2]
+                if (np.count_nonzero((heights < rim_z - 0.014) & (heights > rim_z - 0.30)) < 3
+                        or np.count_nonzero((heights >= rim_z - 0.014)
+                                            & (heights < rim_z + 0.25)) >= 3):
+                    free = False
+                    break
+            if free:
+                target.update(rim_z=rim_z, drop_x=float(xy[0]), drop_y=float(xy[1]),
+                              opening_x=float(center[0]), opening_y=float(center[1]),
+                              opening_half=half)
+                rospy.loginfo("Opening confirmed for %s: x=%.3f y=%.3f rim=%.3f",
+                              place, xy[0], xy[1], rim_z)
+                return True
+        return False
 
-    def select_place_for_label(self, label):
+    def held_object_fits(self, target):
         """62418450 向井悠人
-        正しいカテゴリの配置先だけを選ぶ。設定不足時は誤配送せず停止する。
+        開放直前に保持物の位置を計算し、縁との余裕と下降高さを確認する。
         """
-        label = self.normalize_placement_label(label)
+        if not self.verify_holding():
+            self.hand_state = "unknown"
+            return False
+        rotation, translation = self.transform_arrays(self.hand_pose())
+        center = translation + rotation.dot(self.held_geometry["offset"])
+        extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
+        opening = np.array([target["opening_x"], target["opening_y"]])
+        drop = np.array([target["drop_x"], target["drop_y"]])
+        bottom = center[2] - extent[2]
+        return (np.all(np.abs(center[:2] - opening) + extent[:2] + 0.010
+                       < target["opening_half"])
+                and np.linalg.norm(center[:2] - drop) <= 0.015
+                and target["rim_z"] + 0.003 <= bottom <= target["rim_z"] + 0.055)
+
+    def align_for_release(self, place, record):
+        """62418450 向井悠人
+        開口を測って置く位置へ移動し、必要なら位置を変えて一度試し直す。
+        """
+        target = self.placement_targets[place]
+        previous = None
+        for pan, tilt in ((0.0, -0.72), (0.20, -0.58)):
+            record["stage"] = "measure_opening"
+            if not self.measure_container_opening(place, pan, tilt, previous):
+                continue
+            previous = (target["drop_x"], target["drop_y"])
+            record["stage"] = "above_container"
+            if not self.move_over_container(place, hover=True):
+                continue
+            record["stage"] = "lower"
+            if self.move_over_container(place, linear=True):
+                record["stage"] = "verify_opening"
+                if self.held_object_fits(target):
+                    return True
+            if not self.move_over_container(place, hover=True, linear=True):
+                return False
+            if self.hand_state != "held" or not self.move_placement_pose("all_neutral"):
+                return False
+        return False
+
+    def move_over_container(self, place, hover=False, linear=False):
+        """62418450 向井悠人
+        保持物体の中心を開口に合わせ、手先とのずれを補正して動かす。
+        """
+        target = self.placement_targets[place]
+        hand = self.hand_pose()
+        rotation, _ = self.transform_arrays(hand)
+        offset = rotation.dot(self.held_geometry["offset"])
+        extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
+        center = np.array([target["drop_x"], target["drop_y"],
+                           target["rim_z"] + extent[2] + 0.024])
+        if hover:
+            center[2] += target["hover"]
+        return self.move_hand(center - offset, hand.rotation, linear)
+
+    @classmethod
+    def placement_category(cls, label):
+        """62418450 向井悠人
+        検出ラベルから本来の収納先の分類だけを判定する。
+        """
+        label = cls.normalize_placement_label(label)
         categories = {
             "tray": (
                 "cracker_box", "sugar_box", "pudding_box", "gelatin_box",
@@ -730,69 +1206,347 @@ class WrsMainController(object):
             ),
             "bin_b": ("unknown", "object"),
         }
+        return next((category for category, labels in categories.items() if label in labels), None)
+
+    def planned_placement(self, label):
+        """62418450 向井悠人
+        把持前に本来の収納先と、引き出しを使わない初版の搬送先を決める。
+        """
+        intended = self.placement_category(label)
+        return intended, "bin_b" if intended in ("drawer_tools", "drawer_shape") else intended
+
+    def placement_candidates(self, category):
+        """62418450 向井悠人
+        収納先の分類に合う候補を観測し、到達しやすい順に返す。
+        """
         destinations = {
-            "tray": (("tray_a_place", "put_in_tray"),
-                     ("tray_b_place", "put_in_tray")),
+            "tray": (("tray_a_place", "put_in_tray"), ("tray_b_place", "put_in_tray")),
             "container_a": (("container_a_place", "put_in_container_a"),),
             "container_b": (("container_b_place", "put_in_container_b"),),
             "bin_a": (("bin_a_place", "put_in_bin"),),
             "bin_b": (("bin_b_place", "put_in_bin"),),
         }
-        category = next((name for name, labels in categories.items() if label in labels), None)
-        if category is None:
-            raise ValueError("Unrecognized placement label: {}".format(label))
-        if category in ("drawer_tools", "drawer_shape"):
-            raise ValueError("Drawer placement is not implemented for {} ({})".format(
-                label, category))
-        self.ensure_sensor_placements(category, destinations[category])
-        targets = getattr(self, "placement_targets", {})
-        candidates = [(place, pose) for place, pose in destinations[category]
+        if category not in destinations:
+            return []
+        options = destinations[category]
+        self.ensure_sensor_placements(category, options)
+        candidates = [(place, pose) for place, pose in options
                       if place in self.coordinates["positions"]
-                      and (self.poses.get(pose) or place in targets)]
-        if candidates:
-            selected = self.choose_shortest_placement(candidates)
-            rospy.loginfo("place %s (%s) at %s", label, category, selected[0])
-            return selected
+                      and (self.poses.get(pose) or place in self.placement_targets)]
+        if len(candidates) <= 1:
+            return candidates
+        ranked = [(self.placement_path_length(place), (place, pose))
+                  for place, pose in candidates]
+        return [candidate for length, candidate in sorted(
+            ranked, key=lambda item: math.inf if item[0] is None else item[0])
+                if length != math.inf]
 
-        required = "; ".join("{} + {}".format(place, pose)
-                             for place, pose in destinations[category])
-        raise ValueError("Missing placement configuration for {} ({}): {}. "
-                         "Set measured placement_positions / placement_poses".format(
-                             label, category, required))
+    def plan_base_path(self, pos):
+        """62418450 向井悠人
+        move_baseに計画を問い合わせ、経路なしと問い合わせ失敗を区別する。
+        """
+        current = self.get_robot_pose()
+        if current is None:
+            return None
+        start = PoseStamped()
+        start.header.frame_id = "map"
+        start.pose.position.x, start.pose.position.y = current[:2]
+        start.pose.orientation = quaternion_from_euler(math.degrees(current[2]), 0, 0)
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.pose.position.x, goal.pose.position.y = pos[:2]
+        goal.pose.orientation = quaternion_from_euler(pos[2], 0, 0)
+        service = rospy.get_param("~placement_plan_service", "/move_base/make_plan")
+        try:
+            rospy.wait_for_service(service, timeout=1.0)
+            path = rospy.ServiceProxy(service, GetPlan)(start, goal, 0.0).plan.poses
+        except (rospy.ROSException, rospy.ServiceException) as error:
+            rospy.logwarn("Base path unavailable: %s", error)
+            return None
+        if not path:
+            return []
+        return [current[:2]] + [(p.pose.position.x, p.pose.position.y) for p in path]
+
+    def cloud_in_map(self, cloud, stride):
+        """62418450 向井悠人
+        深度点群を間引き、撮影時刻のTFで地図座標に変換する。
+        """
+        if not cloud.header.frame_id or cloud.height <= 1:
+            raise ValueError("Expected registered, organized depth")
+        transform = self.tf_buffer.lookup_transform(
+            "map", cloud.header.frame_id, cloud.header.stamp, rospy.Duration(1.0))
+        pixels = [(u, v) for v in range(0, cloud.height, stride)
+                  for u in range(0, cloud.width, stride)]
+        points = np.asarray(list(point_cloud2.read_points(
+            cloud, field_names=("x", "y", "z"), skip_nans=True, uvs=pixels)), dtype=float)
+        if len(points) < 30:
+            raise ValueError("Not enough depth measurements")
+        points = points[np.isfinite(points).all(axis=1)]
+        rotation, translation = self.transform_arrays(transform.transform)
+        return points.dot(rotation.T) + translation
+
+    @staticmethod
+    def floor_obstacle_cells(points):
+        """62418450 向井悠人
+        床の上で複数の深度点が支持する障害物セルを求める。
+        """
+        raised = points[(points[:, 2] > 0.015) & (points[:, 2] < 0.40), :2]
+        cells, counts = np.unique(np.floor(raised / 0.05), axis=0, return_counts=True)
+        return (cells[counts >= 2] + 0.5) * 0.05
+
+    def corridor_still_clear(self, corridor):
+        """62418450 向井悠人
+        走行中に確認済みの線分からの逸脱と、新しい床上の障害物を監視する。
+        """
+        start, target = corridor
+        pose = self.get_robot_pose()
+        if pose is None or self.dist_point_to_segment(pose[:2], start, target) > 0.08:
+            return False
+        clouds = self.depth_clouds.copy()
+        if not clouds or abs((rospy.Time.now() - clouds[-1].header.stamp).to_sec()) > 0.65:
+            return False
+        try:
+            obstacles = self.floor_obstacle_cells(self.cloud_in_map(clouds[-1], 5))
+        except (ValueError, rospy.ROSException, tf2_ros.LookupException,
+                tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            return False
+        radius = self.base_radius_with_payload(pose)
+        return (radius is not None and all(
+            self.dist_point_to_segment(point, pose[:2], target) >= radius + 0.12
+            for point in obstacles))
+
+    def await_base_result(self, timeout, corridor):
+        """62418450 向井悠人
+        台車の応答を待ち、監視対象の区間を走行中なら定期的に床を確認する。
+        """
+        client = omni_base.NAVCLIENT
+        if corridor is None:
+            return "done" if client.wait_for_result(rospy.Duration(timeout)) else "timed out"
+        deadline = rospy.Time.now() + rospy.Duration(timeout)
+        while not rospy.is_shutdown():
+            remaining = (deadline - rospy.Time.now()).to_sec()
+            if remaining <= 0:
+                return "timed out"
+            if client.wait_for_result(rospy.Duration(min(0.25, remaining))):
+                return "done"
+            if not self.corridor_still_clear(corridor):
+                return "left confirmed corridor or floor no longer clear"
+        return "interrupted"
+
+    def observe_floor(self, pan=0.0, tilt=-1.15):
+        """62418450 向井悠人
+        床面と床から出ている物を、新しい深度点群から分けて返す。
+        """
+        if not self.point_head(pan, tilt):
+            return None
+        try:
+            points, _ = self.read_placement_cloud(rospy.Time.now(), stride=5)
+        except (ValueError, rospy.ROSException, tf2_ros.LookupException,
+                tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as error:
+            rospy.logwarn("Floor observation failed: %s", error)
+            return None
+        floor = points[np.abs(points[:, 2]) <= 0.015, :2]
+        if len(floor) < 12:
+            rospy.logwarn("Not enough visible floor to check a base move")
+            return None
+        return floor, self.floor_obstacle_cells(points)
+
+    @classmethod
+    def observed_segment_clear(cls, start, goal, observation, margin=0.09):
+        """62418450 向井悠人
+        台車が次に通る帯に障害物がなく、外側まで床が見えているか調べる。
+        """
+        floor, obstacles = observation
+        direction = np.asarray(goal) - np.asarray(start)
+        distance = float(np.linalg.norm(direction))
+        if distance <= 1e-6:
+            return True
+        direction /= distance
+        side = np.array([-direction[1], direction[0]])
+        radius = cls.ROBOT_RADIUS + margin
+        if any(cls.dist_point_to_segment(point, start, goal) < radius + 0.035
+               for point in obstacles):
+            return False
+        # 台車が今占めている床は視界に入らないので、進行先の外周を確認する。
+        stations = np.linspace(radius, distance + radius + 0.07,
+                               max(2, int(math.ceil(distance / 0.08)) + 1))
+        for along in stations:
+            for lateral in (-radius + 0.06, 0.0, radius - 0.06):
+                sample = np.asarray(start) + direction * along + side * lateral
+                if np.min(np.linalg.norm(floor - sample, axis=1)) > 0.13:
+                    return False
+        return True
+
+    def base_radius_with_payload(self, pose):
+        """62418450 向井悠人
+        台車中心から保持物の外側まで含めた旋回・通行用の半径を見積もる。
+        """
+        if self.hand_state == "empty" or self.held_geometry is None:
+            return self.ROBOT_RADIUS
+        try:
+            rotation, translation = self.transform_arrays(self.hand_pose())
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as error:
+            rospy.logwarn("Cannot locate the payload for base clearance: %s", error)
+            return None
+        center = translation + rotation.dot(self.held_geometry["offset"])
+        extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
+        radius = math.dist(center[:2], pose[:2]) + float(np.linalg.norm(extent[:2]))
+        return max(self.ROBOT_RADIUS, radius)
+
+    def turn_base_toward(self, yaw_deg):
+        """62418450 向井悠人
+        腕を移動姿勢にした台車を、現在地で目標の向きまで回す。
+        """
+        self.confirm_navigation_finished()
+        if not self.arm_ready:
+            return False
+        pose = self.get_robot_pose()
+        if pose is None:
+            return False
+        desired = math.radians(yaw_deg)
+        error = math.atan2(math.sin(desired - pose[2]), math.cos(desired - pose[2]))
+        if abs(error) <= math.radians(5):
+            return True
+        observation = self.observe_floor()
+        if observation is None:
+            return False
+        radius = self.base_radius_with_payload(pose)
+        if radius is None:
+            return False
+        swept = radius + 0.12
+        if any(math.dist(point, pose[:2]) < swept for point in observation[1]):
+            rospy.logwarn("Cannot turn: floor obstacle in the swept footprint")
+            return False
+        if self.wall_map is not None and not self.wall_segment_clear(pose[:2], pose[:2], swept):
+            rospy.logwarn("Cannot turn: wall in the swept footprint")
+            return False
+
+        deadline = time.monotonic() + 15.0
+        try:
+            while not rospy.is_shutdown() and time.monotonic() < deadline:
+                pose = self.get_robot_pose()
+                if pose is None:
+                    return False
+                error = math.atan2(math.sin(desired - pose[2]), math.cos(desired - pose[2]))
+                if abs(error) <= math.radians(5):
+                    return True
+                omega = max(-28.0, min(28.0, math.degrees(error) * 1.5))
+                omni_base.cmd_vel(0, 0, omega)
+                time.sleep(0.1)
+        finally:
+            self.stop_base()
+        return False
+
+    def navigate_checked(self, pos, name, timeout_param="~navigation_timeout"):
+        """62418450 向井悠人
+        経路の次の短い区間を床観測で確認し、move_baseでその区間を進む。
+        """
+        self.confirm_navigation_finished()
+        if not self.arm_ready:
+            return False
+        for _ in range(32):
+            current = self.get_robot_pose()
+            if current is None or rospy.is_shutdown():
+                return False
+            if math.dist(current[:2], pos[:2]) <= 0.10:
+                return self.turn_base_toward(pos[2])
+            path = self.plan_base_path(pos)
+            if not path:
+                return False
+            # 曲がった先へ飛ばず、経路上で現在地から20〜30cm先の点を選ぶ。
+            next_point = path[-1]
+            for point in path[1:]:
+                if math.dist(current[:2], point) >= 0.20:
+                    next_point = point
+                    break
+            delta = np.asarray(next_point) - np.asarray(current[:2])
+            distance = float(np.linalg.norm(delta))
+            if distance < 0.06:
+                return False
+            target = np.asarray(current[:2]) + delta * min(1.0, 0.30 / distance)
+            heading = math.degrees(math.atan2(delta[1], delta[0]))
+            if not self.turn_base_toward(heading):
+                return False
+            current = self.get_robot_pose()
+            if current is None:
+                return False
+            radius = self.base_radius_with_payload(current)
+            if radius is None:
+                return False
+            margin = radius - self.ROBOT_RADIUS + 0.09
+            observation = self.observe_floor()
+            if observation is None or not self.observed_segment_clear(
+                    current[:2], target, observation, margin):
+                observation = self.observe_floor(tilt=-0.85)
+                if observation is None or not self.observed_segment_clear(
+                        current[:2], target, observation, margin):
+                    rospy.logwarn("Floor not clear on the next segment to %s", name)
+                    return False
+            if self.wall_map is not None and not self.wall_segment_clear(
+                    current[:2], target, radius + 0.07):
+                return False
+            if not self.navigate_to_pose([*target, heading], name, timeout_param,
+                                         corridor=(current[:2], target)):
+                return False
+            reached = self.get_robot_pose()
+            if reached is None or math.dist(current[:2], reached[:2]) < 0.035:
+                return False
+        rospy.logwarn("Checked navigation used its segment limit for %s", name)
+        return False
+
+    def recover_after_transport(self):
+        """62418450 向井悠人
+        正規の収納やBin Bが使えないとき、見えている近くの床へ戻す。
+        """
+        self.confirm_navigation_finished()
+        if self.hand_state == "empty":
+            self.arm_ready = self.move_placement_pose("all_neutral")
+            return self.arm_ready
+        if self.held_geometry is None:
+            return False
+        base = self.get_robot_pose()
+        observation = self.observe_floor()
+        if base is None or observation is None:
+            return False
+        floor, obstacles = observation
+        hand = self.hand_pose()
+        rotation, _ = self.transform_arrays(hand)
+        offset = rotation.dot(self.held_geometry["offset"])
+        extent = np.abs(rotation).dot(self.held_geometry["size"]) / 2
+        direction = np.array([math.cos(base[2]), math.sin(base[2])])
+        side = np.array([-direction[1], direction[0]])
+        radius = float(np.linalg.norm(extent[:2])) + 0.08
+        for lateral in (0.0, -0.16, 0.16):
+            xy = np.asarray(base[:2]) + direction * 0.52 + side * lateral
+            if np.min(np.linalg.norm(floor - xy, axis=1)) > 0.05:
+                continue
+            if any(math.dist(point, xy) < radius for point in obstacles):
+                continue
+            target = np.array([*xy, extent[2] + 0.015]) - offset
+            above = target + np.array([0.0, 0.0, 0.12])
+            self.arm_ready = False
+            if not self.move_hand(above, hand.rotation):
+                continue
+            if not self.move_hand(target, hand.rotation, linear=True):
+                continue
+            if not self.release_hand():
+                return False
+            self.arm_ready = (self.move_hand(above, hand.rotation, linear=True)
+                              and self.move_placement_pose("all_neutral"))
+            return self.arm_ready
+        return False
 
     def placement_path_length(self, place):
         """62418450 向井悠人
-        move_baseの経路長を取得する。未到達は無限大、計画不能はNone。
+        現在地から収納の停止候補までの計画経路長を求める。
         """
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "map", "base_footprint", rospy.Time(0), rospy.Duration(1.0))
-            start = PoseStamped()
-            start.header.frame_id = "map"
-            start.pose.position.x = transform.transform.translation.x
-            start.pose.position.y = transform.transform.translation.y
-            start.pose.orientation = transform.transform.rotation
-            goal = PoseStamped()
-            goal.header.frame_id = "map"
-            x_pos, y_pos, yaw = self.coordinates["positions"][place]
-            goal.pose.position.x = x_pos
-            goal.pose.position.y = y_pos
-            goal.pose.orientation.z = math.sin(math.radians(yaw) / 2.0)
-            goal.pose.orientation.w = math.cos(math.radians(yaw) / 2.0)
-            service = rospy.get_param("~placement_plan_service", "/move_base/make_plan")
-            rospy.wait_for_service(service, timeout=1.0)
-            path = rospy.ServiceProxy(service, GetPlan)(start, goal, 0.0).plan.poses
-            if not path:
-                return float("inf")
-            points = [start] + list(path) + [goal]
-            return sum(math.hypot(b.pose.position.x - a.pose.position.x,
-                                  b.pose.position.y - a.pose.position.y)
-                       for a, b in zip(points, points[1:]))
-        except (rospy.ROSException, rospy.ServiceException,
-                tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as error:
-            rospy.logwarn("Placement path unavailable: %s", error)
+        path = self.plan_base_path(self.coordinates["positions"][place])
+        if path is None:
             return None
+        if not path:
+            return math.inf
+        return sum(math.dist(a, b) for a, b in zip(path, path[1:]))
 
     def choose_shortest_placement(self, candidates):
         """62418450 向井悠人
@@ -836,91 +1590,110 @@ class WrsMainController(object):
 
     def navigate_for_placement(self, place):
         """62418450 向井悠人
-        台車の移動に時間制限を設け、失敗時は残ったゴールを取り消す。
+        床を確認して収納先へ進み、机上の収納先なら横へずらした停止位置も試す。
         """
-        from move_base_msgs.msg import MoveBaseGoal
-        from wrs_algorithm.util.mathematics import quaternion_from_euler
+        pos = self.coordinates["positions"][place]
+        if self.navigate_checked(pos, place, "~placement_navigation_timeout"):
+            return True
+        if place not in self.placement_targets:
+            return False
+        yaw = math.radians(pos[2])
+        for offset in (0.15, -0.15):
+            candidate = [pos[0] - math.sin(yaw) * offset,
+                         pos[1] + math.cos(yaw) * offset, pos[2]]
+            if self.plan_base_path(candidate):
+                return self.navigate_checked(candidate, place + "_alternate",
+                                             "~placement_navigation_timeout")
+        return False
 
-        timeout = float(rospy.get_param("~placement_navigation_timeout", 60.0))
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("placement_navigation_timeout must be positive and finite")
-        client = omni_base.NAVCLIENT
-        if not client.wait_for_server(rospy.Duration(2.0)):
-            return False
-        goal = MoveBaseGoal()
-        goal.target_pose.header.frame_id = "map"
-        goal.target_pose.header.stamp = rospy.Time.now()
-        x_pos, y_pos, yaw = self.coordinates["positions"][place]
-        goal.target_pose.pose.position.x = x_pos
-        goal.target_pose.pose.position.y = y_pos
-        goal.target_pose.pose.orientation = quaternion_from_euler(yaw, 0, 0)
-        client.send_goal(goal)
-        if not client.wait_for_result(rospy.Duration(timeout)):
-            client.cancel_goal()
-            return False
-        if client.get_state() != GoalStatus.SUCCEEDED:
-            client.cancel_goal()
-            return False
-        return True
-
-    def put_object_by_label(self, label):
+    def put_object_by_label(self, label, plan=None):
         """62418450 向井悠人
-        A側で把持成功を確認した後、検出器に依存せずラベルを受け取る。
+        正規の収納候補を順に試し、安全に保持できていれば Bin B に切り替える。
         """
-        if not isinstance(label, str) or not label.strip():
-            rospy.logerr("Placement requires a nonempty object label")
-            return False
-        label = self.normalize_placement_label(label)
+        intended, destination = plan if plan is not None else self.planned_placement(label)
+        rospy.loginfo("Placement intent: label=%s intended=%s destination=%s",
+                      label, intended, destination)
+        self.last_placement_result = {"released": False}
         try:
-            place, pose = self.select_place_for_label(label)
-            return self.put_in_place(place, pose, label=label)
-        except Exception as error:  # ロボット動作失敗をTask 1へ返す。
-            self.last_placement_result = {
-                "label": label, "stage": "select_destination", "released": False,
-                "success": False, "error": str(error)}
-            rospy.logerr("Placement result: %s",
-                         json.dumps(self.last_placement_result, sort_keys=True))
-            return False
+            candidates = self.placement_candidates(destination)
+        except (ValueError, rospy.ROSException, rospy.ServiceException,
+                tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as error:
+            rospy.logwarn("Cannot observe placement for %s: %s", label, error)
+            candidates = []
+        if destination != "bin_b":
+            candidates.extend(self.placement_candidates("bin_b"))
+        for place, pose in candidates:
+            if self.hand_state != "held" or not self.arm_ready:
+                break
+            if self.put_in_place(place, pose, label=label):
+                return True
+            if self.last_placement_result["released"]:
+                break
+        return False
 
     def put_in_place(self, place, into_pose, label=None):
         """62418450 向井悠人
-        運搬、移動、配置、開放、復帰の順に実行し工程と結果を記録する。
+        収納先に到達し、保持と開口を確認して開放・退避の結果を記録する。
         """
         started = time.monotonic()
         record = {"label": label, "place": place, "pose": into_pose, "stage": "validate",
                   "released": False, "success": False}
         self.last_placement_result = record
+        floor_bin = place in ("bin_a_place", "bin_b_place")
+        original = self.placement_targets.get(place) if floor_bin else None
         try:
-            use_target = place in getattr(self, "placement_targets", {})
-            if (place not in self.coordinates["positions"] or not self.poses.get("all_neutral")
-                    or (not use_target and not self.poses.get(into_pose))):
+            measured = floor_bin or place in self.placement_targets
+            if (self.hand_state != "held" or not self.arm_ready
+                    or place not in self.coordinates["positions"]
+                    or (not measured and not self.poses.get(into_pose))):
                 return False
-            stages = [("transport", lambda: self.move_placement_pose("all_neutral")),
-                      ("navigate", lambda: self.navigate_for_placement(place))]
-            if use_target:
-                stages.extend([
-                    ("above_container", lambda: self.move_over_container(place, hover=True)),
-                    ("lower", lambda: self.move_over_container(place, linear=True)),
-                    ("release", lambda: gripper.command(1)),
-                    ("lift", lambda: self.move_over_container(place, hover=True, linear=True))])
+            record["stage"] = "navigate"
+            if not self.navigate_for_placement(place):
+                return False
+            record["stage"] = "holding"
+            if not self.verify_holding():
+                self.hand_state = "unknown"
+                return False
+            self.arm_ready = False
+            if floor_bin:
+                self.placement_targets[place] = {"kind": "bin", "hover": 0.12}
+            if measured:
+                aligned = self.align_for_release(place, record)
             else:
-                stages.extend([("place", lambda: self.move_placement_pose(into_pose)),
-                               ("release", lambda: gripper.command(1))])
-            stages.append(("retreat", lambda: self.move_placement_pose("all_neutral")))
-            for stage, action in stages:
-                record["stage"] = stage
-                rospy.loginfo("Placement %s: %s", place, stage)
-                if not action():
+                record["stage"] = "place"
+                aligned = self.move_placement_pose(into_pose)
+            if not aligned:
+                self.arm_ready = self.move_placement_pose("all_neutral")
+                return False
+            record["stage"] = "release"
+            if not self.release_hand():
+                return False
+            record["released"] = True
+            record["stage"] = "retreat"
+            if measured:
+                hand = self.hand_pose()
+                _, current = self.transform_arrays(hand)
+                if not self.move_hand(current + np.array([0.0, 0.0, 0.12]),
+                                      hand.rotation, linear=True):
                     return False
-                if stage == "release":
-                    record["released"] = True
-            record["success"] = True
-            return True
-        except Exception as error:  # 開放後の失敗もログに残し、自動再試行はしない。
-            rospy.logerr("Placement error at %s: %s", record["stage"], error)
+            self.arm_ready = self.move_placement_pose("all_neutral")
+            record["success"] = self.arm_ready
+            return self.arm_ready
+        except (ValueError, rospy.ROSException, rospy.ServiceException,
+                tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as error:
+            record["error"] = str(error)
+            rospy.logwarn("Placement failed at %s: %s", record["stage"], error)
             return False
         finally:
+            if floor_bin:
+                if original is None:
+                    self.placement_targets.pop(place, None)
+                else:
+                    self.placement_targets[place] = original
             record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            record["holding_state"] = self.hand_state
             rospy.loginfo("Placement result: %s", json.dumps(record, sort_keys=True))
 
     def pull_out_trofast(self, x, y, z, yaw, pitch, roll):
@@ -959,89 +1732,142 @@ class WrsMainController(object):
 
         self.change_pose("all_neutral")
 
+    def observe_pick_candidate(self, pose, floor=False, attempted=(), label=None,
+                               previous=None, shelf=False):
+        """62418450 向井悠人
+        新しい観測から、指定条件と把持範囲を満たす候補を選ぶ。
+        """
+        tilt = self.poses[pose]["head_tilt_joint"]
+        for pan in (0.0, 0.45 if previous is None else -0.45):
+            if not self.point_head(pan, tilt):
+                continue
+            detection = self.observe_detections()
+            if detection is None:
+                continue
+            base = self.get_robot_pose()
+            if base is None:
+                return None
+            ranked = sorted(detection.bboxes, key=self.calc_score_bbox, reverse=True)
+            candidates = []
+            for bbox in ranked:
+                if (bbox.w <= 0 or bbox.h <= 0 or bbox.score <= 0
+                        or (label is not None and bbox.label != label)
+                        or (not shelf and self.placement_category(bbox.label) is None)):
+                    continue
+                item = self.measure_object(bbox, detection, floor)
+                if item is None or (not floor and item["center"][2] < 0.32):
+                    continue
+                center = item["center"]
+                reach = math.hypot(center[0] - base[0], center[1] - base[1])
+                if (reach < 0.25 or reach > 0.95
+                        or (previous is not None and math.dist(center, previous) > 0.18)
+                        or any(bbox.label == kind and math.dist(center, location) < 0.12
+                               for kind, location in attempted)):
+                    continue
+                item["label"] = bbox.label
+                item["placement"] = self.planned_placement(bbox.label) if not shelf else None
+                if not floor:
+                    return item
+                # 台車の進行方向付近にある床の物体を先に検討する。
+                lateral = abs(-math.sin(base[2]) * (center[0] - base[0])
+                              + math.cos(base[2]) * (center[1] - base[1]))
+                candidates.append((lateral > 0.32, reach, item))
+            if candidates:
+                return min(candidates, key=lambda entry: entry[:2])[2]
+        return None
+
+    def observe_detections(self):
+        """62418450 向井悠人
+        検出の通信失敗を一度だけ再試行し、空の結果と区別する。
+        """
+        for _ in range(2):
+            try:
+                return self.get_latest_detection()
+            except (rospy.ROSException, rospy.ServiceException) as error:
+                rospy.logwarn("Object observation failed: %s", error)
+        return None
+
+    def try_pick_object(self, item, pose, floor, view=None, shelf=False):
+        """62418450 向井悠人
+        個体を最大2回つかみ、2回目は再計測して把持方法を変える。
+        """
+        for attempt in (1, 2):
+            above = False if shelf else floor == (attempt == 1)
+            rospy.loginfo("Grasp attempt %d: %s from %s",
+                          attempt, item["label"], "above" if above else "side")
+            if self.grasp_measured_object(item, above, shelf):
+                return True, item
+            if self.hand_state != "empty" or not self.arm_ready or attempt == 2:
+                break
+            rospy.loginfo("Reobserving %s after grasp failure (view=%s)", item["label"], view)
+            fresh = self.observe_pick_candidate(
+                pose, floor, label=item["label"], previous=item["center"], shelf=shelf)
+            if fresh is None:
+                break
+            item = fresh
+        return False, item
+
     def execute_task1(self):
-        """62408993 Masami Sakuma
-        Task1を実行する。
+        """62418450 向井悠人
+        床、机の順に片付け、配置後は現在地から次の物体を探す。
         """
         rospy.loginfo("#### start Task 1 ####")
-
-        hsr_position = [
-            ("tall_table", "look_at_tall_table"),
-            ("near_long_table_l", "look_at_near_floor"),
-            ("long_table_r", "look_at_tall_table")
-        ]
-
-        # 置き場所の判断は B（put_object_by_label）に任せる（統合時に一本化）
-        placed = []
-        empty_count = [0] * len(hsr_position)
-        max_attempts_per_place = 12
-        attempt_count = [0] * len(hsr_position)
-
-        start_time = rospy.Time.now()
-        time_limit = 14 * 60
-
-        rospy.loginfo("Start searching objects.")
-
-        while not all(count >= 2 for count in empty_count):
-            elapsed = (rospy.Time.now() - start_time).to_sec()
-            if elapsed >= time_limit:
-                rospy.logwarn("Task1 time limit is approaching. Stop searching.")
-                break
-
-            for i, (plc, pose) in enumerate(hsr_position):
-                if empty_count[i] >= 2 or attempt_count[i] >= max_attempts_per_place:
-                    empty_count[i] = 2
+        phases = ((True, ("near_long_table_l",), "look_at_near_floor"),
+                  (False, ("tall_table", "long_table_r"), "look_at_tall_table"))
+        attempted = []
+        placed = 0
+        started = rospy.Time.now()
+        limit = float(rospy.get_param("~task1_time_limit", 14 * 60))
+        for floor, places, search_pose in phases:
+            views = list(places)
+            scans = 0
+            last_view = None
+            while scans < 12 * len(places) and not rospy.is_shutdown():
+                if limit > 0 and (rospy.Time.now() - started).to_sec() >= limit:
+                    rospy.loginfo("Task 1 search budget used; placements=%d", placed)
+                    return True
+                scans += 1
+                current = self.get_robot_pose()
+                if current is None:
+                    return False
+                if not self.turn_base_toward(self.coordinates["positions"][places[0]][2]):
+                    item = None
+                else:
+                    item = self.observe_pick_candidate(search_pose, floor, attempted)
+                if item is None:
+                    if not views:
+                        break
+                    name = min(views, key=lambda view: math.hypot(
+                        current[0] - self.coordinates["positions"][view][0],
+                        current[1] - self.coordinates["positions"][view][1]))
+                    views.remove(name)
+                    if self.navigate_checked(self.coordinates["positions"][name], name):
+                        last_view = name
                     continue
 
-                self.goto_name(plc)
-                self.change_pose(pose)
-                gripper.command(1)
-
-                detected_objs = self.get_latest_detection()
-                graspable_obj = self.get_most_graspable_obj(detected_objs.bboxes)
-                attempt_count[i] += 1
-
-                if graspable_obj is None:
-                    empty_count[i] += 1
-                    rospy.loginfo("No object at %s (%d/2)", plc, empty_count[i])
+                if limit > 0 and (rospy.Time.now() - started).to_sec() >= limit:
+                    return True
+                attempted.append((item["label"], tuple(item["center"])))
+                grasped, item = self.try_pick_object(item, search_pose, floor, last_view)
+                identity = (item["label"], tuple(item["center"]))
+                if identity != attempted[-1]:
+                    attempted.append(identity)
+                if not grasped:
+                    if not (self.hand_state == "empty" and self.arm_ready):
+                        if not self.recover_after_transport():
+                            return False
                     continue
 
-                empty_count[i] = 0
-                label = graspable_obj["label"]
-                grasp_bbox = graspable_obj["bbox"]
+                completed = self.put_object_by_label(item["label"], item["placement"])
+                if completed or self.last_placement_result.get("released", False):
+                    placed += 1
+                if not (self.hand_state == "empty" and self.arm_ready):
+                    if not self.recover_after_transport():
+                        rospy.logerr("Cannot resume Task 1 after placement failure")
+                        return False
 
-                rospy.loginfo("Selected object: %s", label)
-
-                grasp_pos = self.get_grasp_coordinate(grasp_bbox)
-                if grasp_pos is None:
-                    rospy.logwarn("Failed to obtain grasp coordinate.")
-                    continue
-
-                # ----------------------------------------------------
-                # 改善点: 中間姿勢 change_pose("grasp_on_table") を削除
-                # grasp_from_side 内のアプローチ移動で直接把持動作を行う
-                # ----------------------------------------------------
-                grasp_success = self.exec_graspable_method(grasp_pos, label)
-
-                self.change_pose("all_neutral")
-
-                # 把持に失敗（空振り）した場合は搬送動作を行わず再試行
-                if not grasp_success:
-                    rospy.logwarn("Could not grasp object: %s. Retrying loop.", label)
-                    continue
-
-                # B担当の配置処理へラベルを渡す（ラベル→置き場所の対応・移動・配置）
-                if self.put_object_by_label(label):
-                    placed.append(label)
-                elif not getattr(self, "last_placement_result", {}).get("released", False):
-                    # まだ持っている（引き出し行きは未実装・置き場所が分からない など）。
-                    # 持ったまま次へ進むと次の探索地点で落とすので、Bin B に入れる（置き場所に入れば10点）
-                    rospy.logwarn("Placement failed for %s; put it in bin_b instead", label)
-                    if self.put_in_place("bin_b_place", "put_in_bin", label=label):
-                        placed.append(label + "(bin_b)")
-
-        rospy.loginfo("#### finish Task 1 ####")
-        rospy.loginfo("Placed objects (%d): %s", len(placed), ", ".join(placed))
+        rospy.loginfo("#### finish Task 1 #### placement motions completed=%d", placed)
+        return True
 
     # ------------------------------------------------------------------
     # Task 2a / 2b（担当 C）
@@ -1105,7 +1931,6 @@ class WrsMainController(object):
         "left": "person_a", "right": "person_b",
         "a": "person_a", "b": "person_b",
     }
-    DEFAULT_PERSON = "right"
 
     # 検出ラベル（wrs_detector/config/wod-c_classes.json）
     DETECTOR_LABELS = [
@@ -1152,49 +1977,44 @@ class WrsMainController(object):
 
     @classmethod
     def extract_target_obj_and_person(cls, instruction):
-        """62401738 いしい
-        指示文から対象の物体ラベルと人物（"left" / "right" / "a" / "b"）を取り出す。
-        見つからない場合はそれぞれ None を返す。
+        """62418450 向井悠人
+        指示文から物体のラベルと、人物を指している方向またはIDを取り出す。
         """
-        rospy.loginfo("[extract_target_obj_and_person] instruction: %s", instruction)
-        words = " " + cls.normalize_text(instruction) + " "
+        text = cls.normalize_text(instruction)
+        words = " " + text + " "
+        names = [(cls.normalize_text(label), label) for label in cls.DETECTOR_LABELS]
+        names.extend(cls.LABEL_ALIASES.items())
+        matches = [(len(phrase), label) for phrase, label in names
+                   if any(" " + variant + " " in words
+                          for variant in (phrase, phrase + "s", phrase + "es"))]
+        longest = max((length for length, _ in matches), default=0)
+        labels = {label for length, label in matches if length == longest}
+        target_obj = next(iter(labels)) if len(labels) == 1 else None
 
-        # 物体: ラベル名と別名のうち、指示文に含まれる最も長いものを採用する
-        candidates = [(cls.normalize_text(label), label) for label in cls.DETECTOR_LABELS]
-        candidates += list(cls.LABEL_ALIASES.items())
-        target_obj = None
-        best_len = 0
-        for phrase, label in candidates:
-            for form in (phrase, phrase + "s", phrase + "es"):
-                if " " + form + " " in words and len(phrase) > best_len:
-                    target_obj = label
-                    best_len = len(phrase)
-
-        # 人物: left / right / person a / person b
-        target_person = None
-        if " left " in words:
-            target_person = "left"
-        elif " right " in words:
-            target_person = "right"
-        else:
-            for key in ("a", "b"):
-                if " person " + key + " " in words:
-                    target_person = key
-
-        rospy.loginfo("[extract_target_obj_and_person] target_obj=%s target_person=%s",
-                      target_obj, target_person)
-        return target_obj, target_person
+        patterns = (
+            r"\b(left|right) (?:person|human)\b",
+            r"\b(?:person|human) (?:(?:on|to|at) (?:(?:the|your|my) )?)?(left|right|a|b)\b",
+            r"\b(?:to|for) (?:the )?(left|right)(?: side)?$",
+        )
+        people = {key for pattern in patterns for key in re.findall(pattern, text)}
+        if not people and "shelf" not in text.split():
+            people = {word for word in text.split() if word in ("left", "right")}
+        person = next(iter(people)) if len(people) == 1 else None
+        rospy.loginfo("Task 2b request: object=%s person=%s", target_obj, person)
+        return target_obj, person
 
     def wait_for_instruction(self, timeout):
-        """62401738 いしい
-        指示文が届くまで最大 timeout 秒待ち、最新の指示文を返す。届かなければ None。
+        """62418450 向井悠人
+        今回の実行で受け取った未処理の指示を、時間を区切って待つ。
         """
-        end_time = rospy.Time.now() + rospy.Duration(timeout)
-        while not self.instruction_list and rospy.Time.now() < end_time:
-            rospy.sleep(0.5)
-        if not self.instruction_list:
-            return None
-        return self.instruction_list[-1]
+        deadline = time.monotonic() + timeout
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            count = len(self.instruction_list)
+            if count > self.instruction_cursor:
+                self.instruction_cursor = count
+                return self.instruction_list[count - 1]
+            time.sleep(0.1)
+        return None
 
     def get_bbox_position(self, bbox):
         """62401738 いしい
@@ -1208,55 +2028,50 @@ class WrsMainController(object):
         return trans.translation
 
     def deliver_to_target(self, target_obj, target_person):
-        """62401738 いしい
-        棚で target_obj を取り、target_person に渡す。
-        target_obj が見つからなければ、棚で見えている物体を代わりに渡す（誤った物体でも20点）。
+        """62418450 向井悠人
+        棚から指定物か代替品を取り、保持と到達を確認して指定の人物に渡す。
         """
-        self.change_pose("look_at_near_floor")
-        self.goto_name("shelf")
-        self.change_pose("look_at_shelf")
-        rospy.loginfo("target_obj: %s  target_person: %s", target_obj, target_person)
-
-        # 物体検出結果（複数フレームの多数決）から、把持するbboxを決定（見つからなければやり直す）
-        grasp_bbox = None
-        bboxes = []
-        for _ in range(self.TASK2B_DETECT_RETRY):
-            bboxes = self.get_stable_detection()
-            matches = [bbox for bbox in bboxes if bbox.label == target_obj]
-            if matches:
-                grasp_bbox = max(matches, key=lambda bbox: bbox.score)
+        waypoint = self.PERSON_WAYPOINTS.get(target_person)
+        if waypoint is None:
+            return False
+        if not self.move_placement_pose("look_at_shelf"):
+            return False
+        attempted = []
+        for label in ((target_obj, None) if target_obj is not None else (None,)):
+            item = self.observe_pick_candidate(
+                "look_at_shelf", label=label, attempted=attempted, shelf=True)
+            if item is None:
+                continue
+            grasped, item = self.try_pick_object(item, "look_at_shelf", False, shelf=True)
+            if grasped:
                 break
-            rospy.sleep(1.0)
+            attempted.append((item["label"], tuple(item["center"])))
+            if self.hand_state != "empty" or not self.arm_ready:
+                self.recover_after_transport()
+                return False
+        else:
+            rospy.logwarn("Task 2b: no deliverable object")
+            return False
 
-        if grasp_bbox is None:
-            rospy.logwarn("Cannot find [%s]. deliver another object instead.", target_obj)
-            if bboxes:
-                grasp_bbox = max(bboxes, key=lambda bbox: bbox.score)
-        if grasp_bbox is None:
-            rospy.logwarn("Cannot find any object on the shelf. task2b is aborted.")
-            return
-        rospy.loginfo("grasp [%s] (%.2f)", grasp_bbox.label, grasp_bbox.score)
-
-        # BBoxの3次元座標を取得して、その座標で把持する
-        grasp_pos = self.get_bbox_position(grasp_bbox)
-        if grasp_pos is None:
-            rospy.logwarn("Cannot get the position of the object. task2b is aborted.")
-            return
-        self.change_pose("grasp_on_shelf")
-        self.grasp_from_front_side(grasp_pos)
-        self.change_pose("all_neutral")
-
-        # target_personの前に持っていく
-        if target_person not in self.PERSON_WAYPOINTS:
-            rospy.logwarn("unknown person [%s]. use default [%s].", target_person,
-                          self.DEFAULT_PERSON)
-            target_person = self.DEFAULT_PERSON
-        self.change_pose("look_at_near_floor")
-        self.goto_name(self.PERSON_WAYPOINTS[target_person])
-        self.change_pose("deliver_to_human")
+        rospy.loginfo("Task 2b carrying: requested=%s selected=%s person=%s",
+                      target_obj, item["label"], target_person)
+        if not self.navigate_checked(self.coordinates["positions"][waypoint], waypoint):
+            self.recover_after_transport()
+            return False
+        self.arm_ready = False
+        if not self.move_placement_pose("deliver_to_human") or not self.verify_holding():
+            self.recover_after_transport()
+            return False
         rospy.sleep(10.0)
-        gripper.command(1)
-        self.change_pose("all_neutral")
+        if not self.verify_holding() or not self.release_hand():
+            self.recover_after_transport()
+            return False
+        self.arm_ready = self.move_placement_pose("all_neutral")
+        if not self.arm_ready:
+            self.recover_after_transport()
+        rospy.loginfo("Task 2b handoff: requested=%s delivered=%s person=%s retreated=%s",
+                      target_obj, item["label"], target_person, self.arm_ready)
+        return self.arm_ready
 
     @classmethod
     def is_task2a_obstacle(cls, pos):
@@ -1397,16 +2212,16 @@ class WrsMainController(object):
             rospy.loginfo("obstacle %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
             self.add_obstacle(obstacles, (pos.x, pos.y))
 
-    @classmethod
-    def plan_path_astar(cls, start, goal, obstacles, safe_dist):
-        """62401738 いしい
+    def plan_path_astar(self, start, goal, obstacles, safe_dist):
+        """62418450 向井悠人
         TASK2A_GRID 間隔の格子の上で、start から goal までの経路を A* で探す。
         - 障害物から safe_dist 未満の格子は通れない（start の格子だけは例外）
         - 障害物から TASK2A_SOFT_DIST 未満の格子は、近いほどコストを上乗せする
           （ぎりぎりを通らず、余裕のある経路を選ぶため）
         - 8近傍で移動し、ヒューリスティックはゴールまでの直線距離
-        経路（(x, y) のリスト）を返す。見つからなければ None。
+        壁と床の物体を避ける経路を返し、経路がなければNoneを返す。
         """
+        cls = type(self)
         res = cls.TASK2A_GRID
         x_min, x_max = cls.TASK2A_PLAN_X
         y_min, y_max = cls.TASK2A_PLAN_Y
@@ -1414,7 +2229,7 @@ class WrsMainController(object):
         n_y = int(round((y_max - y_min) / res)) + 1
 
         def to_cell(point):
-            """62401738 いしい
+            """62418450 向井悠人
             map 座標 (x, y) を格子の番号に変換する（範囲外は端の格子にする）
             """
             c_x = int(round((point[0] - x_min) / res))
@@ -1422,7 +2237,7 @@ class WrsMainController(object):
             return (max(0, min(n_x - 1, c_x)), max(0, min(n_y - 1, c_y)))
 
         def to_xy(cell):
-            """62401738 いしい
+            """62418450 向井悠人
             格子の番号を map 座標 (x, y) に変換する
             """
             return (x_min + cell[0] * res, y_min + cell[1] * res)
@@ -1430,7 +2245,7 @@ class WrsMainController(object):
         clearance_cache = {}
 
         def clearance(cell):
-            """62401738 いしい
+            """62418450 向井悠人
             格子の中心から一番近い障害物までの距離を返す（計算結果は覚えておく）
             """
             if cell not in clearance_cache:
@@ -1440,11 +2255,11 @@ class WrsMainController(object):
             return clearance_cache[cell]
 
         start_cell, goal_cell = to_cell(start), to_cell(goal)
-        if clearance(goal_cell) < safe_dist:
+        if clearance(goal_cell) < safe_dist or not self.wall_segment_clear(goal, goal):
             return None
 
         def heuristic(cell):
-            """62401738 いしい
+            """62418450 向井悠人
             A* のヒューリスティック: 格子からゴールまでの直線距離 [m]
             """
             return math.hypot(cell[0] - goal_cell[0], cell[1] - goal_cell[1]) * res
@@ -1475,7 +2290,8 @@ class WrsMainController(object):
                     if not (0 <= nxt[0] < n_x and 0 <= nxt[1] < n_y):
                         continue
                     clr = clearance(nxt)
-                    if clr < safe_dist:
+                    if clr < safe_dist or not self.is_segment_free(
+                            to_xy(cell), to_xy(nxt), obstacles, safe_dist):
                         continue
                     step = math.hypot(d_x, d_y) * res
                     penalty = cls.TASK2A_CLEAR_WEIGHT * max(0.0, cls.TASK2A_SOFT_DIST - clr)
@@ -1486,55 +2302,93 @@ class WrsMainController(object):
                         heapq.heappush(open_list, (new_cost + heuristic(nxt), nxt))
         return None
 
-    @classmethod
-    def is_segment_free(cls, seg_start, seg_end, obstacles, safe_dist):
-        """62401738 いしい
-        線分の上をロボットが通ったとき、すべての障害物から safe_dist 以上離れているか
+    def load_wall_map(self):
+        """62418450 向井悠人
+        ROSの静的地図から壁・未知領域までの距離を計算する。
         """
-        return all([cls.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
-                    for obs in obstacles])
+        import cv2
+        from nav_msgs.msg import OccupancyGrid
 
-    @classmethod
-    def simplify_path(cls, path, obstacles, safe_dist):
-        """62401738 いしい
-        A* の格子経路から、障害物に近づかずに直線で結べる点を飛ばして、曲がり角だけにする
+        try:
+            rospy.wait_for_service("/static_map", timeout=2.0)
+            grid = rospy.ServiceProxy("/static_map", GetMap)().map
+        except (rospy.ROSException, rospy.ServiceException):
+            try:
+                grid = rospy.wait_for_message("/map", OccupancyGrid, timeout=2.0)
+            except rospy.ROSException as error:
+                rospy.logwarn("Static wall map unavailable: %s", error)
+                return False
+        info = grid.info
+        if (grid.header.frame_id.lstrip("/") != "map"
+                or info.resolution <= 0 or info.width <= 0 or info.height <= 0
+                or len(grid.data) != info.width * info.height):
+            rospy.logwarn("Static wall map has invalid coordinates")
+            return False
+        occupancy = np.asarray(grid.data).reshape(info.height, info.width)
+        free = ((occupancy >= 0) & (occupancy < 50)).astype(np.uint8)
+        distance = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
+        q = info.origin.orientation
+        rotation = quaternion_matrix([q.x, q.y, q.z, q.w])[:2, :2]
+        origin = np.array([info.origin.position.x, info.origin.position.y])
+        self.wall_map = (distance * info.resolution, rotation, origin, info.resolution)
+        return True
+
+    def wall_segment_clear(self, start, end, radius=None):
+        """62418450 向井悠人
+        台車の幅を含め、線分が地図上の壁・扉枠・未知セルを避けるか判定する。
         """
-        if len(path) <= 2:
-            return list(path)
+        if self.wall_map is None:
+            return False
+        distances, rotation, origin, resolution = self.wall_map
+        margin = self.ROBOT_RADIUS + 0.07 if radius is None else radius
+        samples = np.linspace(start, end, max(2, math.ceil(math.dist(start, end) /
+                                                           (resolution / 2)) + 1))
+        indices = np.floor((samples - origin).dot(rotation) / resolution).astype(int)
+        height, width = distances.shape
+        return all(0 <= x < width and 0 <= y < height
+                   and distances[y, x] >= margin + resolution * math.sqrt(2)
+                   for x, y in indices)
+
+    def is_segment_free(self, seg_start, seg_end, obstacles, safe_dist):
+        """62418450 向井悠人
+        線分全体で、壁と床上の障害物の両方から距離を確保できるか調べる。
+        """
+        return (self.wall_segment_clear(seg_start, seg_end)
+                and all(self.dist_point_to_segment(obs, seg_start, seg_end) >= safe_dist
+                        for obs in obstacles))
+
+    def simplify_path(self, path, obstacles, safe_dist):
+        """62418450 向井悠人
+        壁と物体を避けられる直線区間だけを残して経路を単純化する。
+        """
         result = [path[0]]
-        i = 0
-        while i < len(path) - 1:
-            j = len(path) - 1
-            while j > i + 1 and not cls.is_segment_free(path[i], path[j], obstacles, safe_dist):
-                j -= 1
-            result.append(path[j])
-            i = j
+        index = 0
+        while index < len(path) - 1:
+            following = next((i for i in range(len(path) - 1, index, -1)
+                              if self.is_segment_free(path[index], path[i], obstacles, safe_dist)),
+                             None)
+            if following is None:
+                return []
+            result.append(path[following])
+            index = following
         return result
 
-    @classmethod
-    def plan_next_point(cls, current, goal, obstacles):
-        """62401738 いしい
-        A* で current から goal までの経路を求め、次に進む点（最大 TASK2A_STEP_MAX 先）を返す。
-        安全距離は TASK2A_SAFE_DISTS の順（広い→狭い）に試し、広く避けられるときは広く、
-        障害物の間が狭いときだけ詰めて通る。どれでも経路がなければ None。
+    def plan_next_point(self, current, goal, obstacles):
+        """62418450 向井悠人
+        壁を含めてA*で計画し、検査済みの最初の線分から次の短い移動点を返す。
         """
-        for safe_dist in cls.TASK2A_SAFE_DISTS:
-            path = cls.plan_path_astar(current, goal, obstacles, safe_dist)
-            if path is None:
-                rospy.logwarn("A*: no path with safe_dist=%.2f", safe_dist)
+        for safe_dist in self.TASK2A_SAFE_DISTS:
+            path = self.plan_path_astar(current, goal, obstacles, safe_dist)
+            if not path:
                 continue
-            corners = cls.simplify_path(path, obstacles, safe_dist)
-            rospy.loginfo("A* path: %s",
-                          " -> ".join(["({:.2f}, {:.2f})".format(p[0], p[1]) for p in corners]))
-            # すぐ隣の格子だと到着判定にすぐ引っかかって進まないので、10cm 以上先の角を選ぶ
-            far = [c for c in corners[1:] if math.hypot(c[0] - current[0], c[1] - current[1]) > 0.1]
-            target = far[0] if far else corners[-1]
-            dist = math.hypot(target[0] - current[0], target[1] - current[1])
-            if dist > cls.TASK2A_STEP_MAX:
-                ratio = cls.TASK2A_STEP_MAX / dist
-                target = (current[0] + (target[0] - current[0]) * ratio,
-                          current[1] + (target[1] - current[1]) * ratio)
-            return target
+            corners = self.simplify_path(path, obstacles, safe_dist)
+            if len(corners) < 2:
+                continue
+            distance = math.dist(current, corners[1])
+            if distance < 0.035:
+                continue
+            ratio = min(1.0, self.TASK2A_STEP_MAX / distance)
+            return tuple(a + (b - a) * ratio for a, b in zip(current, corners[1]))
         return None
 
     def scan_task2a_obstacles(self, obstacles, pans):
@@ -1634,40 +2488,36 @@ class WrsMainController(object):
         return False
 
     def move_straight_to(self, target, obstacles, watch=True):
-        """62401738 いしい
-        tf で今の位置を見ながら、速度指令で target (x, y) まで直進する。
-        watch=True のときは毎周期、次を監視して止まる。
-          - Task 2a の衝突メッセージが新しく来た → "collision"
-          - 覚えている障害物に TASK2A_DANGER_DIST より近づこうとした → "too_close"
-        戻り値: "reached" / "collision" / "too_close" / "timeout" / "no_tf"
+        """62418450 向井悠人
+        壁と床の物体を監視して短距離を進み、結果にかかわらず停止指令を出す。
         """
+        self.confirm_navigation_finished()
         collisions = self.count_task2a_collisions()
         pose = self.get_robot_pose()
         if pose is None:
             return "no_tf"
-        dist0 = math.hypot(target[0] - pose[0], target[1] - pose[1])
-        end_time = rospy.Time.now() + rospy.Duration(dist0 / self.TASK2A_MAX_SPEED * 3.0 + 5.0)
-        while not rospy.is_shutdown():
-            pose = self.get_robot_pose()
-            if pose is None:
-                self.stop_base()
-                return "no_tf"
-            if watch and self.count_task2a_collisions() > collisions:
-                self.stop_base()
-                return "collision"
-            if math.hypot(target[0] - pose[0], target[1] - pose[1]) < self.TASK2A_GOAL_TOL:
-                self.stop_base()
-                return "reached"
-            if watch and self.is_approaching_obstacle(pose, target, obstacles):
-                self.stop_base()
-                return "too_close"
-            if rospy.Time.now() > end_time:
-                self.stop_base()
-                return "timeout"
-            omni_base.cmd_vel(*self.calc_base_velocity(pose, target))
-            rospy.sleep(self.TASK2A_CONTROL_DT)
-        self.stop_base()
-        return "timeout"
+        start = pose[:2]
+        distance = math.dist(target, start)
+        deadline = time.monotonic() + distance / self.TASK2A_MAX_SPEED * 3.0 + 5.0
+        try:
+            while not rospy.is_shutdown() and time.monotonic() < deadline:
+                pose = self.get_robot_pose()
+                if pose is None:
+                    return "no_tf"
+                if watch and self.count_task2a_collisions() > collisions:
+                    return "collision"
+                if math.dist(target, pose[:2]) < self.TASK2A_GOAL_TOL:
+                    return "reached"
+                if not self.wall_segment_clear(pose[:2], target):
+                    return "wall"
+                if watch and (self.is_approaching_obstacle(pose, target, obstacles)
+                              or not self.corridor_still_clear((start, target))):
+                    return "too_close"
+                omni_base.cmd_vel(*self.calc_base_velocity(pose, target))
+                time.sleep(self.TASK2A_CONTROL_DT)
+            return "timeout"
+        finally:
+            self.stop_base()
 
     @classmethod
     def estimate_hit_position(cls, pose, direction):
@@ -1728,78 +2578,84 @@ class WrsMainController(object):
         return False
 
     def execute_avoid_blocks(self):
-        """62401738 いしい
-        床の障害物を避けながら go_throw_2a まで進む。
-        1回進むごとに検出し直し、見つけた障害物は map 座標で覚えておいて（近づいて見えなくなっても
-        避ける）、tf で取った今の位置から A* で経路を計画し直す。
-        移動は move_base を使わず、速度指令で A* の線分どおりに直進する（move_straight_to）。
-          - 障害物に近づきすぎそうになったら止まって計画し直す
-          - 触れてしまったら escape_from_obstacle で下がり、触れた位置を避けて計画し直す
-        A* で経路が見つからないときは、3レーン方式（select_next_waypoint）で次の段へ進む。
-        tf が取れないときは、今までどおり move_base（goto_pos）で動く。
-        カメラは前しか見えないので、最初に首を左・正面・右に振って見渡し、
-        横に動く前にはその方向を見てから計画し直す（横の物体の見落とし対策）。
-        ゴール（ふさがれていれば find_free_goal で選んだ近くの点）に着いたら True を返す。
+        """62418450 向井悠人
+        壁と床を確認して短く進み、行き止まりでは観測位置を変えて再計画する。
         """
-        obstacles = []
-        hits = []  # 踏んだ物体の推定位置
-        current = self.TASK2A_START
-        # 開始時: 足元（スタート直前の物体はふつうの下向きでは視野の手前に外れる）→ 左・右・正面
-        whole_body.move_to_joint_positions(
-            {"head_pan_joint": 0.0, "head_tilt_joint": self.TASK2A_NEAR_TILT})
-        self.update_task2a_obstacles(obstacles)
-        self.scan_task2a_obstacles(
-            obstacles, (self.TASK2A_SCAN_PAN, -self.TASK2A_SCAN_PAN, 0.0))
-        for move in range(self.TASK2A_MAX_MOVES):
-            if move > 0:
-                self.update_task2a_obstacles(obstacles)
+        history = []
+        attempted = set()
+        obstacles = set()
+        for iteration in range(self.TASK2A_MAX_MOVES * 2):
             pose = self.get_robot_pose()
-            if pose is not None:
-                current = (pose[0], pose[1])
+            if pose is None or rospy.is_shutdown():
+                return False
+            current = pose[:2]
+            observations = [self.observe_floor(pan, -1.0)
+                            for pan in ((0.0, -0.7, 0.7) if iteration == 0 else (0.0,))]
+            observations = [entry for entry in observations if entry is not None]
+            for floor, raised in observations:
+                # 以前の障害物も、同じ位置に床が見えるまで候補として残す。
+                obstacles = {point for point in obstacles
+                             if np.min(np.linalg.norm(floor - point, axis=1)) > 0.03}
+                obstacles.update(tuple(point) for point in raised)
             goal = self.find_free_goal(obstacles)
-            if math.hypot(current[0] - goal[0], current[1] - goal[1]) < 0.1:
+            if goal is not None and math.dist(current, goal) <= 0.09:
                 return True
-            target = self.plan_next_point(current, goal, obstacles)
-            pan = self.side_to_look(pose, target) if (pose and target) else None
-            if pan is not None:
-                self.scan_task2a_obstacles(obstacles, (pan, 0.0))
-                goal = self.find_free_goal(obstacles)
-                target = self.plan_next_point(current, goal, obstacles)
-            if target is None:
-                steps = [i for i, s_y in enumerate(self.TASK2A_STEPS_Y) if s_y > current[1] + 0.05]
-                if not steps:
-                    break
-                target = tuple(self.select_next_waypoint(steps[0], obstacles, current)[:2])
-
-            result = self.move_straight_to(target, obstacles) if pose is not None else "no_tf"
-            rospy.loginfo("task2a move to (%.2f, %.2f): %s", target[0], target[1], result)
-            if result == "collision":
-                length = math.hypot(target[0] - current[0], target[1] - current[1]) or 1.0
-                direction = ((target[0] - current[0]) / length, (target[1] - current[1]) / length)
-                self.escape_from_obstacle(obstacles, current, direction, hits)
-            elif result == "no_tf":
-                self.goto_pos([target[0], target[1], self.TASK2A_YAW])
-                current = target
+            primary = self.plan_next_point(current, goal, obstacles) if goal is not None else None
+            alternatives = [(current[0] + delta, current[1]) for delta in (-0.19, 0.19)]
+            if history:
+                alternatives.append(history[-1])
+            moved = False
+            for target in [primary] + alternatives:
+                if target is None:
+                    continue
+                edge = tuple(round(value, 1) for value in (*current, *target))
+                if edge in attempted or not self.is_segment_free(
+                        current, target, obstacles, self.TASK2A_SAFE_DISTS[-1]):
+                    continue
+                attempted.add(edge)
+                pan = self.side_to_look(pose, target) or 0.0
+                observation = self.observe_floor(pan, -1.0)
+                reversing = bool(history) and target == history[-1]
+                if observation is not None:
+                    obstacles.update(tuple(point) for point in observation[1])
+                if not self.is_segment_free(current, target, obstacles,
+                                            self.TASK2A_SAFE_DISTS[-1]):
+                    continue
+                if not reversing and not (
+                        observation is not None
+                        and self.observed_segment_clear(current, target, observation)):
+                    continue
+                result = self.move_straight_to(target, obstacles)
+                rospy.loginfo("Task 2a segment %s: %s", target, result)
+                moved = True
+                if result == "reached":
+                    if reversing:
+                        history.pop()
+                    else:
+                        history.append(current)
+                elif result == "collision":
+                    hit_pose = self.get_robot_pose()
+                    if hit_pose is not None and self.wall_segment_clear(hit_pose[:2], current):
+                        # 直前に通った同じ線分だけを戻り、新しい方向は次の観測で決める。
+                        self.move_straight_to(current, obstacles, watch=False)
+                break
+            if not moved:
+                rospy.logwarn("Task 2a: alternate views and known retreat exhausted")
+                return False
         return False
 
-    @classmethod
-    def find_free_goal(cls, obstacles):
-        """62401738 いしい
-        Task 2a のゴール（go_throw_2a）が障害物の安全距離の内側にあると A* が経路を見つけられない。
-        そのときはゴールと同じ y で左右に 0.1m ずつずらした点（最大 0.5m）から、空いている点を選ぶ。
-        安全距離は広い順に試し、どれでも空いていなければ元のゴールを返す。
+    def find_free_goal(self, obstacles):
+        """62418450 向井悠人
+        ゴール領域の中で壁と床の物体から距離を取れる到達候補を選ぶ。
         """
-        g_x, g_y = cls.TASK2A_GOAL
-        offsets = [0.0] + [sign * k * 0.1 for k in range(1, 6) for sign in (-1, 1)]
-        for safe_dist in cls.TASK2A_SAFE_DISTS:
-            for off in offsets:
-                cand = (g_x + off, g_y)
-                if not cls.TASK2A_PLAN_X[0] <= cand[0] <= cls.TASK2A_PLAN_X[1]:
-                    continue
-                if all(math.hypot(cand[0] - o_x, cand[1] - o_y) >= safe_dist
-                       for o_x, o_y in obstacles):
-                    return cand
-        return cls.TASK2A_GOAL
+        gx, gy = self.TASK2A_GOAL
+        for distance in self.TASK2A_SAFE_DISTS:
+            for offset in (0, -0.1, 0.1, -0.2, 0.2, -0.3, 0.3, -0.4, 0.4):
+                point = (gx + offset, gy)
+                if (self.TASK2A_PLAN_X[0] <= point[0] <= self.TASK2A_PLAN_X[1]
+                        and self.is_segment_free(point, point, obstacles, distance)):
+                    return point
+        return None
 
     @classmethod
     def select_next_waypoint(cls, current_stp, obstacles, current_pos):
@@ -1830,65 +2686,78 @@ class WrsMainController(object):
         return [best["x"], target_y, cls.TASK2A_YAW]
 
     def execute_task2a(self):
-        """62401738 いしい
-        task2aを実行する
+        """62418450 向井悠人
+        障害物回避を実行し、ゴール到達と接触を別々に記録する。
         """
-        rospy.loginfo("#### start Task 2a ####  detector: %s", self.get_detector_type())
-        self.change_pose("look_at_near_floor")
-        gripper.command(0)
-        self.goto_name("standby_2a")
-        log_start = len(self.detection_list)
-
-        # 落ちているブロックを避けて移動
-        reached = self.execute_avoid_blocks()
-
-        # 回避の移動でゴールに着けなかったときだけ move_base でゴールへ向かう
-        # （着いているのに move_base を使うと、床の物体が見えない move_base が近くの物体に寄ることがある）
-        if not reached:
-            self.goto_name("go_throw_2a")
-        whole_body.move_to_go()
-
-        # 障害物に触れたかを確認する（触れると 2a は0点）
-        hits = [msg for msg in self.detection_list[log_start:] if "task2a" in msg]
-        if hits:
-            rospy.logwarn("task2a collision: %s", ", ".join(hits))
-        else:
-            rospy.loginfo("task2a: no collision")
+        start = len(self.detection_list)
+        reached = False
+        standby = self.coordinates["positions"]["standby_2a"]
+        if self.navigate_checked(standby, "standby_2a"):
+            if self.wall_map is None:
+                self.load_wall_map()
+            if self.wall_map is not None:
+                reached = self.execute_avoid_blocks()
+            else:
+                rospy.logwarn("Task 2a: cannot use A* without a map of the walls")
+                reached = self.navigate_checked(
+                    self.coordinates["positions"]["go_throw_2a"], "go_throw_2a")
+        hits = self.detection_list[start:]
+        rospy.loginfo("Task 2a result: reached=%s contacts=%s", reached, json.dumps(hits))
+        return reached
 
     def execute_task2b(self):
-        """62401738 いしい
-        task2bを実行する。指示文は棚の前に行くと届くので、棚へ移動してから待つ。
+        """62418450 向井悠人
+        棚へ安全に到達して新しい指示を受け、人物が確定した場合に配達する。
         """
         rospy.loginfo("#### start Task 2b ####")
-        self.change_pose("look_at_near_floor")
-        self.goto_name("shelf")
-
-        # 命令文を取得して解釈
-        instruction = self.wait_for_instruction(self.TASK2B_WAIT_SEC)
-        if instruction is None:
-            rospy.logwarn("no instruction received. deliver any object to the default person.")
-            target_obj, target_person = None, None
-        else:
-            rospy.loginfo("recieved instruction: %s", instruction)
-            target_obj, target_person = self.extract_target_obj_and_person(instruction)
-
-        # 指定したオブジェクトを指定した配達先へ（見つからなくても何かを届けて20点を狙う）
-        self.deliver_to_target(target_obj, target_person)
+        if not self.navigate_checked(self.coordinates["positions"]["shelf"], "shelf"):
+            rospy.logwarn("Task 2b: shelf not reached")
+            return False
+        for _ in range(2):
+            instruction = self.wait_for_instruction(self.TASK2B_WAIT_SEC)
+            if instruction is None:
+                rospy.logwarn("Task 2b: no instruction at the shelf")
+                continue
+            rospy.loginfo("Task 2b instruction: %s", instruction)
+            label, person = self.extract_target_obj_and_person(instruction)
+            if person is not None:
+                return self.deliver_to_target(label, person)
+            rospy.logwarn("Task 2b: could not confirm the intended person")
+        return False
 
     def run(self):
         """62418450 向井悠人
-        全てのタスクを実行する（Task 1 → Task 2a → Task 2b）。
-        Task 2b の指示文は棚の前に行くと届くので、2a を先に実行する。
+        センサと初期姿勢を確認し、Task 1から配達まで順に実行する。
         """
-        self.change_pose("all_neutral")
-        self.execute_task1()
+        self.confirm_navigation_finished()
+        if self.hand_state != "empty":
+            return
+        try:
+            rospy.wait_for_service("detection/get_object_detection", timeout=30.0)
+            self.read_placement_cloud(rospy.Time.now(), stride=8)
+        except (ValueError, rospy.ROSException, tf2_ros.LookupException,
+                tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as error:
+            rospy.logerr("Cannot start without depth and detector services: %s", error)
+            return
+        if self.get_robot_pose() is None or self.observe_detections() is None:
+            rospy.logerr("Cannot start without localization and a fresh RGB detection response")
+            return
+        self.arm_ready = self.move_placement_pose("all_neutral")
+        if not self.arm_ready:
+            rospy.logerr("Cannot reach initial pose")
+            return
+        self.load_wall_map()
+        if not self.execute_task1() or self.hand_state != "empty" or not self.arm_ready:
+            rospy.logerr("Task 1 could not finish with an empty hand and safe arm pose")
+            return
+        self.instruction_cursor = len(self.instruction_list)
         self.execute_task2a()
         self.execute_task2b()
 
 
 def main():
-    """
-    WRS環境内でタスクを実行するためのメインノードを起動する
+    """62418450 向井悠人
+    WRSノードを起動し、台車や把持の終了が未確定なら後続動作を中断する。
     """
     rospy.init_node('main_controller')
     try:
@@ -1903,6 +2772,8 @@ def main():
             rospy.loginfo("#### start with NORMAL mode. ####")
             ctrl.run()
 
+    except (NavigationUnconfirmedError, ManipulationUnconfirmedError) as error:
+        rospy.logerr("Cannot continue with unresolved robot control: %s", error)
     except rospy.ROSInterruptException:
         pass
 
