@@ -23,6 +23,306 @@ from wrs_algorithm.util import omni_base, whole_body, gripper
 import math
 import copy
 import heapq
+import collections
+import threading
+
+
+DIAG = None  # 原因切り分けの記録（WrsMainController.__init__ で作る）
+
+
+class Diagnostics(object):
+    """62401738 いしい
+    腕の指令が通らない原因の切り分け用の記録。ロボットの動きは変えない（記録するだけ）。
+    node.log に "[DIAG] {json}" の行を出す。集計は tools/experiment/diag_verdict.py。
+
+      仮説1 CPU 環境で計画が間に合わない
+        → MoveIt の呼び出しごとに、かかった時間・move_group の状態（PLANNING のまま終わったか、
+          MONITOR＝実行に入ったか）・CPU 使用率・シミュレータの速さ（RTF）・手の動きを記録する。
+      仮説2 計画の負荷でコントローラが止まる
+        → 腕の指令が通らなかった瞬間に、コントローラの状態と、action の status が届いていたか
+          （常駐の購読で見る）・joint_states が来ていたかを記録する。5 秒ごとに受信の頻度も記録する。
+      仮説3 move_joints が毎回新しい接続を作り、5 秒では間に合わない
+        → 接続にかかった時間を毎回記録し、失敗したときは 15 秒まで待って繋がるかを見る。
+
+    CPU 使用率・負荷は、ワークスペースのコンテナから見える PC 全体の値（シミュレータのプロセス単体ではない）。
+    ~diagnose:=false で無効にできる。
+    """
+    ARM_ACTION = "/hsrb/arm_trajectory_controller/follow_joint_trajectory"
+    HEAD_ACTION = "/hsrb/head_trajectory_controller/follow_joint_trajectory"
+
+    def __init__(self, lookup_xyz=None):
+        self.lookup_xyz = lookup_xyz
+        self.stamps = dict((key, collections.deque(maxlen=400))
+                           for key in ("arm", "head", "joint_states"))
+        self.mg_states = []
+        self.mg_result = None
+        self.mg_ready = False
+        self.last_moveit = None
+        self.last_tick = None
+        self.retry_sec = float(rospy.get_param("~diagnose_retry_sec", 15.0))
+        self.tick_sec = float(rospy.get_param("~diagnose_tick_sec", 5.0))
+
+    # ---- 受信と計測 ----
+    def start(self):
+        """購読と、5 秒ごとの記録を始める"""
+        from actionlib_msgs.msg import GoalStatusArray
+        from sensor_msgs.msg import JointState
+        for key, action in (("arm", self.ARM_ACTION), ("head", self.HEAD_ACTION)):
+            rospy.Subscriber(action + "/status", GoalStatusArray, self._on_stamp,
+                             callback_args=key, queue_size=1)
+        rospy.Subscriber("/hsrb/joint_states", JointState, self._on_stamp,
+                         callback_args="joint_states", queue_size=1)
+        self.find_move_group()
+        thread = threading.Thread(target=self._loop)
+        thread.daemon = True
+        thread.start()
+
+    def _on_stamp(self, _msg, key):
+        self.stamps[key].append(time.time())
+
+    def find_move_group(self):
+        """move_group の feedback / result の購読（見つかるまで毎回探す）"""
+        if self.mg_ready:
+            return
+        try:
+            from moveit_msgs.msg import MoveGroupActionFeedback, MoveGroupActionResult
+            topics = dict((name, kind) for name, kind in rospy.get_published_topics())
+            for name, kind in topics.items():
+                if kind == "moveit_msgs/MoveGroupActionFeedback":
+                    rospy.Subscriber(name, MoveGroupActionFeedback, self._on_mg_feedback,
+                                     queue_size=10)
+                    self.mg_ready = True
+                elif kind == "moveit_msgs/MoveGroupActionResult":
+                    rospy.Subscriber(name, MoveGroupActionResult, self._on_mg_result,
+                                     queue_size=10)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    def _on_mg_feedback(self, msg):
+        state = str(msg.feedback.state)
+        if not self.mg_states or self.mg_states[-1] != state:
+            self.mg_states.append(state)
+
+    def _on_mg_result(self, msg):
+        self.mg_result = {"wall": time.time(), "code": int(msg.result.error_code.val),
+                          "text": str(msg.status.text)}
+
+    @staticmethod
+    def read_cpu():
+        """(止まっている時間, 全体の時間)。/proc/stat は PC 全体の値"""
+        try:
+            with open("/proc/stat") as stat:
+                fields = [float(v) for v in stat.readline().split()[1:]]
+            return fields[3] + fields[4], sum(fields[:8])
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    @staticmethod
+    def cpu_util(before, after):
+        """2 回の read_cpu の間の CPU 使用率（0〜1）"""
+        if before is None or after is None or after[1] <= before[1]:
+            return None
+        return round(1.0 - (after[0] - before[0]) / (after[1] - before[1]), 3)
+
+    @staticmethod
+    def load1():
+        try:
+            return round(os.getloadavg()[0], 2)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def age(self, key):
+        """最後に受信してからの秒数。一度も届いていなければ None"""
+        stamps = self.stamps[key]
+        return round(time.time() - stamps[-1], 2) if stamps else None
+
+    def hz(self, key, window):
+        now = time.time()
+        return round(sum(1 for t in list(self.stamps[key]) if now - t <= window) / window, 1)
+
+    def palm(self):
+        return self.lookup_xyz("hand_palm_link") if self.lookup_xyz else None
+
+    @staticmethod
+    def dist(a, b):
+        return round(math.sqrt(sum((p - q) ** 2 for p, q in zip(a, b))), 3)
+
+    def emit(self, rec):
+        rospy.loginfo("[DIAG] %s", json.dumps(rec, sort_keys=True, default=str))
+
+    def _loop(self):
+        """5 秒ごとに、シミュレータの速さ・CPU・受信の頻度を記録する"""
+        prev = (time.time(), rospy.Time.now().to_sec(), self.read_cpu())
+        while not rospy.is_shutdown():
+            time.sleep(self.tick_sec)
+            try:
+                cur = (time.time(), rospy.Time.now().to_sec(), self.read_cpu())
+                wall = cur[0] - prev[0]
+                rec = {"kind": "tick", "t_sim": round(cur[1], 1),
+                       "rtf": round((cur[1] - prev[1]) / wall, 2) if wall > 0 else None,
+                       "cpu_util": self.cpu_util(prev[2], cur[2]), "load1": self.load1(),
+                       "cores": os.cpu_count(),
+                       "arm_hz": self.hz("arm", self.tick_sec),
+                       "head_hz": self.hz("head", self.tick_sec),
+                       "js_hz": self.hz("joint_states", self.tick_sec)}
+                self.last_tick = rec
+                self.emit(rec)
+                prev = cur
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    # ---- MoveIt の呼び出しの記録 ----
+    def install(self, modules):
+        """whole_body / gripper の関数を、記録つきの関数に差し替える（戻り値と例外はそのまま）"""
+        whole_body_module, gripper_module = modules
+        targets = (
+            (whole_body_module, "move_end_effector_pose", "ee_pose"),
+            (whole_body_module, "move_to_neutral", "neutral"),
+            (whole_body_module, "move_to_go", "to_go"),
+            (whole_body_module, "move_head_tilt", "head_tilt"),
+            (whole_body_module, "move_to_joint_positions", "joint_positions"),
+            (gripper_module, "command", "gripper"),
+        )
+        newly = False
+        for module, name, label in targets:
+            func = getattr(module, name, None)
+            if func is not None and not getattr(func, "diag_wrapped", False):
+                setattr(module, name, self.wrap(label, func))
+                newly = True
+        if not newly:
+            return
+        info = {"kind": "start", "cores": os.cpu_count(), "load1": self.load1(),
+                "retry_sec": self.retry_sec, "tick_sec": self.tick_sec}
+        try:
+            command = whole_body_module.WHOLE_BODY_CMD
+            info["planning_time"] = command.get_planning_time()
+            info["planning_attempts"] = command.get_num_planning_attempts()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        self.emit(info)
+
+    def wrap(self, label, func):
+        diag = self
+
+        def wrapper(*args, **kwargs):
+            ctx = None
+            try:
+                ctx = diag._begin(label, args)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            try:
+                result = func(*args, **kwargs)
+            except Exception as error:
+                diag._finish(ctx, "exception: {!r}".format(error))
+                raise
+            diag._finish(ctx, result)
+            return result
+
+        wrapper.__name__ = getattr(func, "__name__", label)
+        wrapper.diag_wrapped = True
+        return wrapper
+
+    def _begin(self, label, args):
+        self.find_move_group()
+        self.mg_states = []
+        self.mg_result = None
+        ctx = {"label": label, "wall": time.time(), "sim": rospy.Time.now().to_sec(),
+               "cpu": self.read_cpu(),
+               "palm": self.palm() if label not in ("gripper", "head_tilt") else None}
+        if label == "ee_pose" and len(args) >= 3:
+            ctx["target"] = tuple(float(v) for v in args[:3])
+        if label == "gripper" and args:
+            ctx["value"] = args[0]
+        return ctx
+
+    def _finish(self, ctx, result):
+        if ctx is None:
+            return
+        try:
+            if result is not True:
+                time.sleep(0.1)  # move_group の result が少し遅れて届くことがある
+            wall = time.time() - ctx["wall"]
+            sim = rospy.Time.now().to_sec() - ctx["sim"]
+            rec = {"kind": "moveit", "label": ctx["label"], "t_sim": round(ctx["sim"], 1),
+                   "ok": result if isinstance(result, str) else bool(result),
+                   "wall_s": round(wall, 2), "sim_s": round(sim, 2),
+                   "rtf": round(sim / wall, 2) if wall > 0 else None,
+                   "cpu_util": self.cpu_util(ctx["cpu"], self.read_cpu()),
+                   "load1": self.load1(), "cores": os.cpu_count(),
+                   "states": list(self.mg_states), "mg_code": None, "mg_text": None}
+            mg_result = self.mg_result
+            if mg_result is not None and mg_result["wall"] >= ctx["wall"]:
+                rec["mg_code"], rec["mg_text"] = mg_result["code"], mg_result["text"]
+            if "value" in ctx:
+                rec["value"] = ctx["value"]
+            end = self.palm() if ctx["palm"] is not None else None
+            if end is not None:
+                rec["palm_moved_m"] = self.dist(ctx["palm"], end)
+                if "target" in ctx:
+                    rec["start_dist_m"] = self.dist(ctx["palm"], ctx["target"])
+                    rec["end_dist_m"] = self.dist(end, ctx["target"])
+            self.last_moveit = {"label": rec["label"], "ok": rec["ok"], "wall_s": rec["wall_s"],
+                                "t_sim": rec["t_sim"]}
+            self.emit(rec)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    # ---- move_joints の接続の記録 ----
+    def joints_done(self, connect_log, success, total_wall):
+        """move_joints 1 回ごとの、接続にかかった時間と結果"""
+        try:
+            self.emit({"kind": "joints", "t_sim": round(rospy.Time.now().to_sec(), 1),
+                       "connect_wall_s": connect_log, "ok": bool(success),
+                       "total_wall_s": round(total_wall, 2)})
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    @staticmethod
+    def list_controllers(timeout=3.0):
+        """コントローラの状態。応答がなければそのことを返す（止まっていること自体が手がかり）"""
+        out = {}
+
+        def call():
+            try:
+                from controller_manager_msgs.srv import ListControllers
+                name = "/hsrb/controller_manager/list_controllers"
+                rospy.wait_for_service(name, timeout=2.0)
+                for controller in rospy.ServiceProxy(name, ListControllers)().controller:
+                    out[controller.name] = controller.state
+            except Exception as error:  # pylint: disable=broad-except
+                out["error"] = repr(error)
+
+        thread = threading.Thread(target=call)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            out["error"] = "no response in {:.0f}s".format(timeout)
+        return dict(out)
+
+    def controller_unavailable(self, client, action_name, first_wait):
+        """腕・頭の指令が 5 秒待っても繋がらなかった瞬間の記録。
+        その後 retry_sec まで待って、繋がれば True を返す（繋がれば指令は続けて出される）。"""
+        key = "arm" if "arm_" in action_name else "head"
+        rec = {"kind": "controller_unavailable", "action": key,
+               "t_sim": round(rospy.Time.now().to_sec(), 1), "first_wait": first_wait,
+               "status_age_s": self.age(key), "status_hz": self.hz(key, 5.0),
+               "arm_status_age_s": self.age("arm"), "head_status_age_s": self.age("head"),
+               "js_age_s": self.age("joint_states"), "js_hz": self.hz("joint_states", 5.0),
+               "load1": self.load1(), "cores": os.cpu_count(), "last_tick": self.last_tick,
+               "last_moveit": self.last_moveit}
+        try:
+            rec["controllers"] = self.list_controllers()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        wall0, sim0 = time.time(), rospy.Time.now().to_sec()
+        connected = bool(client.wait_for_server(rospy.Duration(self.retry_sec)))
+        rec["retry"] = {"connected": connected, "limit_s": self.retry_sec,
+                        "wall_s": round(time.time() - wall0, 2),
+                        "sim_s": round(rospy.Time.now().to_sec() - sim0, 2)}
+        rec["status_age_after_retry_s"] = self.age(key)
+        self.emit(rec)
+        return connected
 
 
 class WrsMainController(object):
@@ -71,6 +371,17 @@ class WrsMainController(object):
         # シミュレータの得点（画面左上の数字）。置いた後に増えたかで、置けたかを確かめる
         self.score = None
         self.score_sub = rospy.Subscriber("/score", Float32, self.score_cb, queue_size=10)
+
+        # 腕の指令が通らない原因の切り分け用の記録（動きは変えない。~diagnose:=false で無効）
+        global DIAG
+        if DIAG is None and rospy.get_param("~diagnose", True):
+            try:
+                DIAG = Diagnostics(self.lookup_xyz)
+                DIAG.start()
+                DIAG.install((whole_body, gripper))
+            except Exception as error:  # pylint: disable=broad-except
+                DIAG = None
+                rospy.logwarn("diagnostics could not start: %s", error)
 
     @staticmethod
     def get_path(pathes, package="wrs_algorithm"):
@@ -180,6 +491,7 @@ class WrsMainController(object):
              ("head_pan_joint", "head_tilt_joint")),
         )
         clients = []
+        started, connect_log = time.time(), {}
         for action_name, names in groups:
             point = JointTrajectoryPoint()
             trajectory = JointTrajectory()
@@ -193,9 +505,21 @@ class WrsMainController(object):
             point.time_from_start = rospy.Duration(1.0)
             trajectory.points = [point]
             client = actionlib.SimpleActionClient(action_name, FollowJointTrajectoryAction)
-            if not client.wait_for_server(rospy.Duration(5.0)):
+            wall0, sim0 = time.time(), rospy.Time.now().to_sec()
+            connected = client.wait_for_server(rospy.Duration(5.0))
+            first_wait = {"wall_s": round(time.time() - wall0, 2),
+                          "sim_s": round(rospy.Time.now().to_sec() - sim0, 2)}
+            connect_log["arm" if "arm_" in action_name else "head"] = first_wait["wall_s"]
+            if not connected:
                 rospy.logerr("joint controller unavailable: %s", action_name)
-                return False
+                if DIAG is not None:
+                    # 原因の切り分け: 状態を記録し、15 秒まで待って繋がれば指令を続ける
+                    try:
+                        connected = DIAG.controller_unavailable(client, action_name, first_wait)
+                    except Exception:  # pylint: disable=broad-except
+                        connected = False
+                if not connected:
+                    return False
             client.send_goal(FollowJointTrajectoryGoal(trajectory=trajectory))
             clients.append(client)
         success = True
@@ -205,6 +529,8 @@ class WrsMainController(object):
                 success = False
             elif client.get_state() != GoalStatus.SUCCEEDED:
                 success = False
+        if DIAG is not None:
+            DIAG.joints_done(connect_log, success, time.time() - started)
         return success
 
     def check_positions(self):
