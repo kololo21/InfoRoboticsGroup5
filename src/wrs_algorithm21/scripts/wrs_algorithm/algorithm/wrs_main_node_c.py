@@ -1569,6 +1569,7 @@ class WrsMainController(object):
         self.look_at_drawer(level)
         knob = (self.detect_drawer_knob(level, expected, z_tol=0.10, y_tol=0.15) if second
                 else self.detect_drawer_knob(level, expected))
+        knob_seen = knob is not None
         if knob is None:
             rospy.logwarn("%s drawer knob not seen; use the expected position", level)
             knob = (self.DRAWERS[level]["x"], expected, self.DRAWERS[level]["z"])
@@ -1579,6 +1580,9 @@ class WrsMainController(object):
             pull = total
         else:
             self.drawer_face0[level] = face0
+            # 実際に見えた位置か（bottom_still_closed で見え方のずれを打ち消す基準に使う）
+            self.drawer_face0_seen = getattr(self, "drawer_face0_seen", {})
+            self.drawer_face0_seen[level] = knob_seen
         goal = face0 + pull             # 引き終わりの取っ手の位置
         # 手を引く先は「最初の取っ手の位置 + pull」で固定する（つかみ直しても、これより先へは引かない）。
         # 上段は傾くと取っ手が下がって見え、開いた量を少なく測る。測った量で引き足すと
@@ -1726,16 +1730,20 @@ class WrsMainController(object):
         """62401738 いしい
         下段を開けられなかった後、下段の取っ手を見て、閉じたまま（DRAWER_TOP_FALLBACK_TOL 未満）かを返す。
         見えなければ分からないので False（上段は開けない）。
+        基準は、開ける前に実際に見えた取っ手の位置（見え方のずれが打ち消される）。見えていなければ決まった位置。
         """
+        reference = self.DRAWER_KNOB_FACE_Y
+        if getattr(self, "drawer_face0_seen", {}).get("bottom"):
+            reference = self.drawer_face0["bottom"]
         if not self.look_at_drawer("bottom"):
             rospy.logwarn("cannot look at the bottom drawer; do not try the top drawer")
             return False
-        knob = self.detect_drawer_knob("bottom", self.DRAWER_KNOB_FACE_Y, z_tol=0.10, y_tol=0.30)
+        knob = self.detect_drawer_knob("bottom", reference, z_tol=0.10, y_tol=0.30)
         if knob is None:
             rospy.logwarn("bottom drawer knob not seen; do not try the top drawer")
             return False
-        out = knob[1] - self.DRAWER_KNOB_FACE_Y
-        if out >= self.DRAWER_TOP_FALLBACK_TOL:
+        out = knob[1] - reference
+        if abs(out) >= self.DRAWER_TOP_FALLBACK_TOL:
             rospy.logwarn("bottom drawer is out by %.3f m; do not try the top drawer", out)
             return False
         rospy.loginfo("bottom drawer stayed closed (%.3f m); try the top drawer instead", out)
@@ -1779,6 +1787,8 @@ class WrsMainController(object):
                     # 1 段で失敗しても、残りの引き出し（横の引き出しなど）は試す
                     opened[level] = False
                     rospy.logerr("could not open the %s drawer: %s", level, error)
+                    if level == "bottom":
+                        rospy.logwarn("skip the top drawer after the bottom drawer error")
                     gripper.command(1)
                     self.drawer_pose("all_neutral")
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
