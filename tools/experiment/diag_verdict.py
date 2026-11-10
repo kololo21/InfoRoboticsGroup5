@@ -43,7 +43,15 @@ FRESH_HZ = 3.0
 def read_records(path):
     """node.log から [DIAG] の json を集める"""
     if os.path.isdir(path):
-        path = os.path.join(path, "node.log")
+        folder = path
+        # node.log が無い実行（途中で止まった・古い実行）では、同じ行が入っている run.log を読む
+        for name in ("node.log", "run.log"):
+            if os.path.isfile(os.path.join(folder, name)):
+                path = os.path.join(folder, name)
+                break
+        else:
+            print("  {} に node.log も run.log もない。中身: {}".format(folder, sorted(os.listdir(folder))))
+            return []
     records = []
     with open(path, encoding="utf-8", errors="replace") as log:
         for line in log:
