@@ -2367,15 +2367,15 @@ class WrsMainController(object):
 
     def select_drawer_place(self, label, category):
         """62401738 いしい
-        引き出し行きの物体の置き場所を返す。~drawer_any（既定 True）なら、開いている引き出しのどれか
-        （横 / 2 段の方）。False なら以前どおり、工具は 2 段の引き出し、形のもの（Shape items）は横の引き出し。
+        引き出し行きの物体の置き場所を返す。~drawer_any（既定 True）なら、横の 1 段の引き出し
+        （開いていなければ 2 段の方）。False なら以前どおり、工具は 2 段の引き出し、形のもの（Shape items）は横の引き出し。
         入れられる引き出しが開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
         """
         places = getattr(self, "drawer_places", {})
         if rospy.get_param("~drawer_any", True):
             # 11/10 判明したルール: 引き切った引き出しのどれかに入れば「引き出しに入れた」になる。
-            # 工具も形のものも、開いている引き出しのうち、入れた数が少ない方へ入れる（同じ数なら横の引き出し。
-            # 横は 1 段だけで上に何もなく、下の姿勢 put_in_bin で入れられる）。1 か所に積むと物が転がり出る。
+            # 引き出し行きの物（工具も形のものも）は基本的に横の 1 段の引き出しに入れる。
+            # 横が開いていないときだけ 2 段の方に入れる。
             order = (self.DRAWER_LEFT_PLACE_NAME, self.DRAWER_PLACE_NAME)
         elif category == "drawer_tools":
             order = (self.DRAWER_PLACE_NAME,)
@@ -2384,11 +2384,8 @@ class WrsMainController(object):
         candidates = [name for name in order if name in places]
         if not candidates:
             raise ValueError("Drawer for {} ({}) is not open".format(label, category))
-        self.drawer_counts = getattr(self, "drawer_counts", {})
-        place = min(candidates, key=lambda name: (self.drawer_counts.get(name, 0), order.index(name)))
-        self.drawer_counts[place] = self.drawer_counts.get(place, 0) + 1
-        rospy.loginfo("place %s (%s) at %s (drawer counts %s)", label, category, place,
-                      json.dumps(self.drawer_counts, sort_keys=True))
+        place = candidates[0]
+        rospy.loginfo("place %s (%s) at %s", label, category, place)
         return place, places[place]
 
     def put_in_fallback(self, label):
