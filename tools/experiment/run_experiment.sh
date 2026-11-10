@@ -98,7 +98,9 @@ SUMMARY="$OUT/summary.csv"
 echo "seed,run,score_final,score_max,collisions,not_found,exit_code,wall_sec,logdir" > "$SUMMARY"
 
 dc() { docker compose "$@" 2> >(grep -v obsolete >&2); }
-ros_sim() { dc exec -T simulator bash -c "source /opt/ros/noetic/setup.bash; $*"; }
+# simulator コンテナ内で ROS のコマンドを実行する。ROS_TO 秒(既定 90)で打ち切る
+# (終了時のスナップショットの rostopic が戻らず、実行ループが何分も止まったことがあったため)
+ros_sim() { dc exec -T simulator timeout -k 3 "${ROS_TO:-90}" bash -c "source /opt/ros/noetic/setup.bash; $*"; }
 
 # 事前確認: 3コンテナが動いていなければ起動(--build は使わない。コンテナは作り直さない)
 for svc in xserver simulator workspace; do
@@ -172,6 +174,21 @@ wait_ready() {  # simulator の Gazebo と /score が立ち上がるまで待つ
   return 1
 }
 
+wait_moveit() {  # Play のあとに、MoveIt(move_group の execute_trajectory)が立ち上がるまで待つ
+  # 待たないと、ノードが先に起動して "Unable to connect to move_group action server
+  # 'execute_trajectory' within allotted time (5s)" で落ちる(CPU 環境では move_group の起動が遅い)。
+  # execute_trajectory は、コントローラが起動してから(=シミュレーションが進んでから)できるので、Play の前には待てない
+  for _ in $(seq 1 90); do
+    if ros_sim 'rosnode list 2>/dev/null | grep -q "^/move_group$" && rostopic list 2>/dev/null | grep -q "^/execute_trajectory/status$"' >/dev/null 2>&1; then
+      sleep 3   # move_group が計画グループを読み込み終わるまで、少し待つ
+      return 0
+    fi
+    sleep 2
+  done
+  echo "  (警告: MoveIt の準備を確認できないまま続けます)"
+  return 1
+}
+
 set_seed() {
   if [ -x ./change_seed.sh ]; then
     ./change_seed.sh "$1" >/dev/null
@@ -197,9 +214,10 @@ one_run() {  # $1=seed $2=run番号
     ros_sim "for n in \$(rosnode list | grep -E '_detector\$|undesired_contact|wrs_score_counter' | grep -v frcnn_detector | grep -E '$MON_KILL'); do rosnode kill \$n >/dev/null 2>&1; done" >/dev/null 2>&1
   fi
   ros_sim 'rosservice call /gazebo/unpause_physics' >/dev/null 2>&1   # Playボタン相当
+  wait_moveit
 
   # スコアの時系列を記録
-  ros_sim 'rostopic echo -p /score' > "$rd/score_timeline.csv" 2>/dev/null &
+  ROS_TO=$((TIMEOUT + 600)) ros_sim 'rostopic echo -p /score' > "$rd/score_timeline.csv" 2>/dev/null &
   local spid=$!
   local t0; t0=$(date +%s)
 
@@ -242,8 +260,8 @@ one_run() {  # $1=seed $2=run番号
 
   # 終了時の物体の位置と、置き場所ごとの判定器の数を保存する。「物体を離したのに0点」のとき、
   # 実際にどこにあるか(置き場所に入っているか)と、採点側の数え方を後から突き合わせるため
-  ros_sim 'timeout 10 rostopic echo -n1 /gazebo/model_states' > "$rd/model_states.txt" 2>/dev/null
-  ros_sim 'for t in $(rostopic list | grep -E "_detector/count$"); do (echo "$t $(timeout 4 rostopic echo -n1 $t 2>/dev/null | head -1)") & done; wait' \
+  ROS_TO=20 ros_sim 'timeout 10 rostopic echo -n1 /gazebo/model_states' > "$rd/model_states.txt" 2>/dev/null
+  ROS_TO=25 ros_sim 'for t in $(rostopic list | grep -E "_detector/count$"); do (echo "$t $(timeout 4 rostopic echo -n1 $t 2>/dev/null | head -1)") & done; wait' \
     > "$rd/counters.txt" 2>/dev/null
 
   local final max col nf src
