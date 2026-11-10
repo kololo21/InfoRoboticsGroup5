@@ -152,6 +152,8 @@ fi
   echo "code_path=$CODE_FILE"
   [ -f "$OUT/code_snapshot.py" ] && echo "code_sha=$(sha256sum "$OUT/code_snapshot.py" | cut -c1-10)"
   echo "detector=${DETECTOR_OPT:-default}"
+  # シミュレータのイメージ(wrs_sim_lab:cpu なら研究室版の採点・衝突判定)
+  echo "sim_image=$(docker compose ps --format '{{.Image}}' simulator 2>/dev/null | head -1)"
   echo "seeds=$SEEDS"
   echo "repeat=$REPEAT"
   echo "headless=$HEADLESS"
