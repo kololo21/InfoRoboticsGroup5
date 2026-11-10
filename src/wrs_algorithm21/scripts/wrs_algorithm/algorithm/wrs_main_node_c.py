@@ -1438,17 +1438,26 @@ class WrsMainController(object):
         "drawer_standpoint": [0.2, 0.28, -90],
         "drawer_left_standpoint": [0.53, 0.28, -90],
     }
+    # 11/10 判明した競技ルール: 3 つの引き出しを引き切っておけば、どれか 1 つに入った物は「引き出しに入れた」になる。
+    # そこで 3 つとも DRAWER_FULL_PULL まで引く（~drawer_pull で変更。DRAWER_PULL_MAX より大きくはしない）。
+    # 引き切りの長さ（tmc_wrs_gazebo の trofast_knob と wrc_stair_like_drawer のモデルから）:
+    #   引き出しの箱は奥行き 0.424（重心は箱の中心）。棚のレールは長さ 0.42 で、箱の縁を下のレールに載せ、
+    #   上のレールで押さえている。引き出しはレールに載っているだけで、止める物はない。
+    #   0.21 を越えると重心がレールの先より前に出て、前が下がる（上のレールが後ろの縁を押さえるので傾くだけ）。
+    #   0.42 で後ろの縁が上のレールから外れて抜け落ちる。
+    #   実測: 下段 0.30 は全開で問題なし（11/9 04:26 に 3 つとも開いた回）。上段 0.36 は傾いて抜け落ちた（11/9）。
+    #   → 0.30 にする。0.34 を上限とし、それより大きい値を指定されても使わない（散らかさない）。
+    DRAWER_FULL_PULL = 0.30
+    DRAWER_PULL_MAX = 0.34
     DRAWERS = {
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
-        "bottom": {"x": 0.20, "z": 0.28, "pull": 0.25, "tilt": -0.85, "stand": "drawer_standpoint"},
-        "top": {"x": 0.20, "z": 0.54, "pull": 0.20, "tilt": -0.6, "stand": "drawer_standpoint"},
-        "left": {"x": 0.53, "z": 0.28, "pull": 0.25, "tilt": -0.85,
+        "bottom": {"x": 0.20, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
+                   "stand": "drawer_standpoint"},
+        "top": {"x": 0.20, "z": 0.54, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
+        "left": {"x": 0.53, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                  "stand": "drawer_left_standpoint"},
     }
     DRAWER_KNOB_FACE_Y = -0.355             # 取っ手の板の前面の y（3 つとも同じ）
-    # 下段が開かなかったとき、取っ手がこの距離未満しか出ていなければ「閉じたまま」とみなし上段を代わりに開ける。
-    # 下段が出たまま台車を上段の前へ進めるとぶつかるので、ほぼ閉じている場合に限る
-    DRAWER_TOP_FALLBACK_TOL = 0.03
     DRAWER_FINGER_REACH = 0.063             # 手のひら(hand_palm_link)から指先までの前後距離（実測）
     # 指先を板の前面からどれだけ奥へ入れるか。取っ手は「板（幅 6.6cm・厚さ 1cm）→ 軸（太さ 3cm・長さ 2cm）
     # → 根元の円板（直径 6.8cm）」の順に並ぶ。0.022 では指の腹が板の両端をはさみ（閉じた後の間隔 0.06 前後）、
@@ -1482,19 +1491,21 @@ class WrsMainController(object):
                                "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
                                "head_tilt_joint": 0.0, "head_pan_joint": 0.0},
     }
+    # 物体を落とす位置の x と、離すときの腕の姿勢（縁の高さ: 上段 0.59、下段・横 0.33）。
+    # y は引いた距離から drawer_drop_point で決める。
     DRAWER_DROP = {
-        # 上段を半分（0.20）: 棚から出ている所は y -0.39〜-0.19。その真ん中、縁の高さ 0.59
-        "top": (0.2, -0.29, "put_in_drawer_high"),
-        # 下段を 0.25、上段は閉じたまま: 棚から出ている所 y -0.39〜-0.14 の真ん中、縁の高さ 0.33
-        "bottom": (0.2, -0.265, "put_in_bin"),
-        # 横の引き出し 0.25: 棚の前面（y -0.39）より手前の空いている所、縁の高さ 0.33
-        "left": (0.53, -0.26, "put_in_bin"),
+        "top": (0.2, "put_in_drawer_high"),
+        "bottom": (0.2, "put_in_bin"),
+        "left": (0.53, "put_in_bin"),
     }
-    DRAWER_PLACE_NAME = "drawer_top_place"      # 工具（2 段の引き出し。開いた方に入れる。名前は前のまま）
-    # 開ける引き出しの順番。ダブルスコア（上段を傾けて下段に重ねる）は一旦やめた（11/9 夜）。
-    # 上段を開けると、下段は上段の下に隠れ、上段は傾いて抜け落ちることがあった。
-    # 工具は上下どちらの段でも正解なので、上段は下段が開かず閉じたままのときだけ代わりに開ける（open_drawers）。
-    DRAWER_LEVELS = ("bottom", "left")
+    DRAWER_SHELF_FRONT_Y = -0.39   # 棚（レールの先）の前面の y。これより奥は棚の中で、上から落とせない
+    # 取っ手の板の前面から、得点判定の箱の前の端まで（判定の箱は引き出しの中心から前後 0.175。中心は板の前面の 0.245 奥）
+    DRAWER_JUDGE_FRONT = 0.07
+    DRAWER_PLACE_NAME = "drawer_top_place"      # 2 段の引き出し（開いた段のうち上の方に入れる。名前は前のまま）
+    # 開ける引き出しの順番。下段を先に開ける（上段を先に開けると、下段へ腕を下ろすときに上段に引っかかる）。
+    # 上段は傾いて抜けることがあったので最後にする（失敗しても下段と横は開いている）。
+    # 上段を引き切ると下段は上段の下に隠れるので、2 段の方は上段に入れる。
+    DRAWER_LEVELS = ("bottom", "left", "top")
     DRAWER_YAW = -90.0          # 引き出しを引くときの台車の向き [deg]（棚の正面に垂直）
     DRAWER_YAW_TOL = 1.0        # 向きを合わせる許容誤差 [deg]
     DRAWER_YAW_GAIN = 1.5       # 向きの誤差 [deg] → 回転速度 [deg/s]
@@ -1906,7 +1917,7 @@ class WrsMainController(object):
             pull = total
         else:
             self.drawer_face0[level] = face0
-            # 実際に見えた位置か（bottom_still_closed で見え方のずれを打ち消す基準に使う）
+            # 実際に見えた位置か（ログ・調査用）
             self.drawer_face0_seen = getattr(self, "drawer_face0_seen", {})
             self.drawer_face0_seen[level] = knob_seen
         goal = face0 + pull             # 引き終わりの取っ手の位置
@@ -2052,33 +2063,30 @@ class WrsMainController(object):
         finally:
             omni_base.cmd_vel(0, 0, 0)
 
-    def bottom_still_closed(self):
+    def drawer_full_pull(self):
         """62401738 いしい
-        下段を開けられなかった後、下段の取っ手を見て、閉じたまま（DRAWER_TOP_FALLBACK_TOL 未満）かを返す。
-        見えなければ分からないので False（上段は開けない）。
-        基準は、開ける前に実際に見えた取っ手の位置（見え方のずれが打ち消される）。見えていなければ決まった位置。
+        引き切る距離 [m]（~drawer_pull、既定 DRAWER_FULL_PULL）。DRAWER_PULL_MAX を越える値は使わない（抜け落ちて散らかる）。
         """
-        reference = self.DRAWER_KNOB_FACE_Y
-        if getattr(self, "drawer_face0_seen", {}).get("bottom"):
-            reference = self.drawer_face0["bottom"]
-        if not self.look_at_drawer("bottom"):
-            rospy.logwarn("cannot look at the bottom drawer; do not try the top drawer")
-            return False
-        knob = self.detect_drawer_knob("bottom", reference, z_tol=0.10, y_tol=0.30)
-        if knob is None:
-            rospy.logwarn("bottom drawer knob not seen; do not try the top drawer")
-            return False
-        out = knob[1] - reference
-        if abs(out) >= self.DRAWER_TOP_FALLBACK_TOL:
-            rospy.logwarn("bottom drawer is out by %.3f m; do not try the top drawer", out)
-            return False
-        rospy.loginfo("bottom drawer stayed closed (%.3f m); try the top drawer instead", out)
-        return True
+        pull = float(rospy.get_param("~drawer_pull", self.DRAWER_FULL_PULL))
+        if pull > self.DRAWER_PULL_MAX:
+            rospy.logwarn("drawer pull %.3f m is too far; use %.3f m", pull, self.DRAWER_PULL_MAX)
+            pull = self.DRAWER_PULL_MAX
+        return pull
+
+    def drawer_drop_point(self, level, pull):
+        """62401738 いしい
+        level の引き出しを pull [m] 引いたときに、物体を落とす位置 (x, y, 腕の姿勢) を返す。
+        y は「棚の前面」と「得点判定の箱の前の端」の真ん中（上から落とせて、判定の箱に入る所）。
+          pull 0.30: 判定の箱の前の端 -0.355 + 0.30 - 0.07 = -0.125 → 真ん中 -0.258
+        """
+        x, pose = self.DRAWER_DROP[level]
+        judge_front = self.DRAWER_KNOB_FACE_Y + pull - self.DRAWER_JUDGE_FRONT
+        return x, (self.DRAWER_SHELF_FRONT_Y + judge_front) / 2.0, pose
 
     def open_drawers(self):
         """62401738 いしい
-        DRAWER_LEVELS の順に開ける（2 段の下段 0.25 → 横の引き出し 0.25）。下段が開かず閉じたままなら、上段 0.20 を代わりに開ける。
-        開いた引き出しに物体を落とす位置を登録する（工具: DRAWER_PLACE_NAME、形のもの: DRAWER_LEFT_PLACE_NAME）。
+        DRAWER_LEVELS の順（下段 → 横 → 上段）に、3 つとも引き切る（drawer_full_pull）。
+        開いた引き出しに物体を落とす位置を登録する（2 段の方: DRAWER_PLACE_NAME、横: DRAWER_LEFT_PLACE_NAME）。
         """
         if getattr(self, "drawers_attempted", False):
             return getattr(self, "drawers_open", False)
@@ -2091,30 +2099,24 @@ class WrsMainController(object):
         for name, pos in self.DRAWER_STANDPOINTS.items():
             self.coordinates["positions"][name] = list(pos)
         opened = {}
+        pull = self.drawer_full_pull()
         try:
-            # 下段を全開（0.30）→ 上段を半分（0.20）の順。
-            # 上段を先に開けると、下段へ腕を下ろすときに開いた上段に引っかかる（11/9 の実行）。
-            # 下段が出ていると全身 IK では上段に届かないので、上段は決まった姿勢 + 台車でつかむ。
+            # 下段が出ていると全身 IK では上段に届かないので、上段は決まった姿勢 + 台車でつかむ
+            # （台車の前端は全開の下段に当たらない位置。grasp_drawer_handle_by_pose）。
             end = float(rospy.get_param("~drawer_end_sec", self.DRAWER_END_SEC))
-            levels = list(self.DRAWER_LEVELS)
-            for index, level in enumerate(levels):
+            for level in self.DRAWER_LEVELS:
                 if self.elapsed_since_start() > end:
                     # 引き出しに時間を使いすぎると Task 1・2 の時間がなくなるので、残りは開けない
                     rospy.logwarn("drawer time is up; skip the %s drawer", level)
                     continue
                 try:
                     self.go_to_drawer(level)
-                    opened[level] = self.pull_drawer(level)
+                    opened[level] = self.pull_drawer(level, pull=pull)
                     self.log_drawer_poses("pulling the {} drawer".format(level))
-                    if level == "bottom" and not opened[level] and self.bottom_still_closed():
-                        levels.insert(index + 1, "top")   # 上段を下段の代わりに開ける
                 except Exception as error:
-                    # 例外のときは下段がどこまで出たか分からないので、上段は開けない
-                    # 1 段で失敗しても、残りの引き出し（横の引き出しなど）は試す
+                    # 1 つで失敗しても、残りの引き出しは試す
                     opened[level] = False
                     rospy.logerr("could not open the %s drawer: %s", level, error)
-                    if level == "bottom":
-                        rospy.logwarn("skip the top drawer after the bottom drawer error")
                     gripper.command(1)
                     self.drawer_pose("all_neutral")
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
@@ -2125,18 +2127,14 @@ class WrsMainController(object):
         rospy.loginfo("drawer result: %s  opened [m]: %s", json.dumps(opened, sort_keys=True),
                       json.dumps({k: round(v, 3) for k, v in getattr(self, "drawer_opened", {}).items()}))
 
-        # 工具の置き場所（2 段の引き出し）
-        drop, level = None, None
-        # 工具は開いた方の段に入れる（上段は下段が開かなかったときだけ開けている）
-        if opened.get("top"):
-            drop, level = self.DRAWER_DROP["top"], "top"
-        elif opened.get("bottom"):
-            drop, level = self.DRAWER_DROP["bottom"], "bottom"
-        if drop is not None:
-            self.register_drawer_place(self.DRAWER_PLACE_NAME, drop, level)
-        # 形のものの置き場所（横の引き出し）
+        # 2 段の引き出しの置き場所: 上段が開いていれば上段（下段は上段の下に隠れている）、なければ下段
+        level = "top" if opened.get("top") else ("bottom" if opened.get("bottom") else None)
+        if level is not None:
+            self.register_drawer_place(self.DRAWER_PLACE_NAME, self.drawer_drop_point(level, pull), level)
+        # 横の引き出しの置き場所
         if opened.get("left"):
-            self.register_drawer_place(self.DRAWER_LEFT_PLACE_NAME, self.DRAWER_DROP["left"], "left")
+            self.register_drawer_place(self.DRAWER_LEFT_PLACE_NAME, self.drawer_drop_point("left", pull),
+                                       "left")
         self.drawers_open = any(opened.values())
         if not self.drawers_open:
             rospy.logwarn("could not open the drawers. use bin_b instead.")
@@ -2369,14 +2367,28 @@ class WrsMainController(object):
 
     def select_drawer_place(self, label, category):
         """62401738 いしい
-        引き出し行きの物体の置き場所を返す。工具は 2 段の引き出し、形のもの（Shape items）は横の引き出し。
-        その引き出しが開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
+        引き出し行きの物体の置き場所を返す。~drawer_any（既定 True）なら、開いている引き出しのどれか
+        （横 / 2 段の方）。False なら以前どおり、工具は 2 段の引き出し、形のもの（Shape items）は横の引き出し。
+        入れられる引き出しが開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
         """
-        place = self.DRAWER_PLACE_NAME if category == "drawer_tools" else self.DRAWER_LEFT_PLACE_NAME
         places = getattr(self, "drawer_places", {})
-        if place not in places:
+        if rospy.get_param("~drawer_any", True):
+            # 11/10 判明したルール: 引き切った引き出しのどれかに入れば「引き出しに入れた」になる。
+            # 工具も形のものも、開いている引き出しのうち、入れた数が少ない方へ入れる（同じ数なら横の引き出し。
+            # 横は 1 段だけで上に何もなく、下の姿勢 put_in_bin で入れられる）。1 か所に積むと物が転がり出る。
+            order = (self.DRAWER_LEFT_PLACE_NAME, self.DRAWER_PLACE_NAME)
+        elif category == "drawer_tools":
+            order = (self.DRAWER_PLACE_NAME,)
+        else:
+            order = (self.DRAWER_LEFT_PLACE_NAME,)
+        candidates = [name for name in order if name in places]
+        if not candidates:
             raise ValueError("Drawer for {} ({}) is not open".format(label, category))
-        rospy.loginfo("place %s (%s) at %s", label, category, place)
+        self.drawer_counts = getattr(self, "drawer_counts", {})
+        place = min(candidates, key=lambda name: (self.drawer_counts.get(name, 0), order.index(name)))
+        self.drawer_counts[place] = self.drawer_counts.get(place, 0) + 1
+        rospy.loginfo("place %s (%s) at %s (drawer counts %s)", label, category, place,
+                      json.dumps(self.drawer_counts, sort_keys=True))
         return place, places[place]
 
     def put_in_fallback(self, label):
