@@ -40,18 +40,26 @@ FRESH_S = 1.0
 FRESH_HZ = 3.0
 
 
-def read_records(path):
-    """node.log から [DIAG] の json を集める"""
-    if os.path.isdir(path):
-        folder = path
-        # node.log が無い実行（途中で止まった・古い実行）では、同じ行が入っている run.log を読む
+def find_logs(path):
+    """渡されたものから、読むログのファイルを探す。実行のフォルダなら、直下か seed*_run*/ の node.log
+    （無ければ run.log）。1 つの実行に複数の seed があれば、すべて返す"""
+    if not os.path.isdir(path):
+        return [path]
+    found = []
+    for folder in [path] + sorted(
+            os.path.join(path, name) for name in os.listdir(path)
+            if os.path.isdir(os.path.join(path, name))):
         for name in ("node.log", "run.log"):
             if os.path.isfile(os.path.join(folder, name)):
-                path = os.path.join(folder, name)
+                found.append(os.path.join(folder, name))
                 break
-        else:
-            print("  {} に node.log も run.log もない。中身: {}".format(folder, sorted(os.listdir(folder))))
-            return []
+    if not found:
+        print("  {} に node.log も run.log もない。中身: {}".format(path, sorted(os.listdir(path))))
+    return found
+
+
+def read_records(path):
+    """ログファイルから [DIAG] の json を集める"""
     records = []
     with open(path, encoding="utf-8", errors="replace") as log:
         for line in log:
@@ -193,7 +201,8 @@ def main():
     if not paths:
         print(__doc__)
         return 1
-    for path in paths:
+    logs = [log for path in paths for log in find_logs(path)]
+    for path in logs:
         records = read_records(path)
         print("#" * 70)
         print("# {}   [DIAG] の行: {}".format(path, len(records)))
