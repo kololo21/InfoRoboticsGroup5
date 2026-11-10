@@ -1501,6 +1501,13 @@ class WrsMainController(object):
     DRAWER_SHELF_FRONT_Y = -0.39   # 棚（レールの先）の前面の y。これより奥は棚の中で、上から落とせない
     # 取っ手の板の前面から、得点判定の箱の前の端まで（判定の箱は引き出しの中心から前後 0.175。中心は板の前面の 0.245 奥）
     DRAWER_JUDGE_FRONT = 0.07
+    # 同じ引き出しに入れる物は、落とす位置を 1 個ごとにずらす（同じ所に積むと崩れて外へ転がり出る）。
+    # drawer_drop_point からのずれ (dx, dy) [m]。奥の列 → 手前の列の順に使い、6 個を越えたら最初に戻る。
+    #   x: 箱の内幅は約 0.28（中心 ±0.14）。物の半径 5cm を引いて ±0.07 なら壁から 2cm 以上離れる。
+    #   y: 0.30 引いたとき、落とせる範囲は棚の前面 -0.39 〜 判定の箱の前の端 -0.125（真ん中 -0.258）。
+    #      奥の列 -0.303（棚の前面まで 8.7cm）、手前の列 -0.218（判定の箱の端まで 9.3cm）。
+    DRAWER_DROP_SLOTS = ((0.0, -0.045), (-0.07, -0.045), (0.07, -0.045),
+                         (0.0, 0.04), (-0.07, 0.04), (0.07, 0.04))
     DRAWER_PLACE_NAME = "drawer_top_place"      # 2 段の引き出し（開いた段のうち上の方に入れる。名前は前のまま）
     # 開ける引き出しの順番。下段を先に開ける（上段を先に開けると、下段へ腕を下ろすときに上段に引っかかる）。
     # 上段は傾いて抜けることがあったので最後にする（失敗しても下段と横は開いている）。
@@ -2181,6 +2188,10 @@ class WrsMainController(object):
         if not hasattr(self, "drawer_drops"):
             self.drawer_drops = {}
         self.drawer_drops[place] = (x, y)
+        # ずらす前の落とす位置（取っ手を見て決め直したら、その位置に更新する）
+        if not hasattr(self, "drawer_drop_base"):
+            self.drawer_drop_base = {}
+        self.drawer_drop_base[place] = (x, y)
         # 落とす位置を「開いた取っ手からのずれ」としても覚えておく（置く直前に取っ手を見て合わせる）
         opened = getattr(self, "drawer_opened", {}).get(level, self.DRAWERS[level]["pull"])
         knob = (self.DRAWERS[level]["x"], self.DRAWER_KNOB_FACE_Y + opened)
@@ -2201,12 +2212,16 @@ class WrsMainController(object):
         self.look_at_drawer(level, fold_arm=False)
         knob = self.detect_drawer_knob(level, self.DRAWER_KNOB_FACE_Y + opened, z_tol=0.10,
                                        y_tol=0.15)
+        dx, dy = getattr(self, "drawer_slot", {}).get(place, (0.0, 0.0))
         if knob is None:
             rospy.logwarn("opened %s drawer knob not seen; use the planned drop point", level)
+            base = self.drawer_drop_base[place]
+            self.drawer_drops[place] = (base[0] + dx, base[1] + dy)
             self.lock_target(place, *self.drawer_drops[place])
             return True
         old = self.drawer_drops[place]
-        self.drawer_drops[place] = (knob[0] + off_x, knob[1] + off_y)
+        self.drawer_drop_base[place] = (knob[0] + off_x, knob[1] + off_y)
+        self.drawer_drops[place] = (knob[0] + off_x + dx, knob[1] + off_y + dy)
         self.lock_target(place, *self.drawer_drops[place])
         rospy.loginfo("drop point for %s: (%.3f, %.3f) -> (%.3f, %.3f) from the knob",
                       place, old[0], old[1], self.drawer_drops[place][0], self.drawer_drops[place][1])
@@ -2365,6 +2380,23 @@ class WrsMainController(object):
         x, y = self.drawer_drops[place]
         return self.align_tips_over(place, x, y)
 
+    def set_drawer_slot(self, place):
+        """62401738 いしい
+        place の引き出しに今度落とす位置を、DRAWER_DROP_SLOTS の次のずれにする（1 個ごとにずらして積まない）。
+        台車の立つ位置も同じだけずらす（置く直前の位置合わせの移動を小さくする）。
+        """
+        self.drawer_slot_count = getattr(self, "drawer_slot_count", {})
+        index = self.drawer_slot_count.get(place, 0)
+        self.drawer_slot_count[place] = index + 1
+        dx, dy = self.DRAWER_DROP_SLOTS[index % len(self.DRAWER_DROP_SLOTS)]
+        self.drawer_slot = getattr(self, "drawer_slot", {})
+        self.drawer_slot[place] = (dx, dy)
+        x, y = self.drawer_drop_base[place]
+        self.drawer_drops[place] = (x + dx, y + dy)
+        self.coordinates["positions"][place] = [
+            x + dx - self.DRAWER_HAND_LEFT, y + dy + self.DRAWER_HAND_FORWARD, -90]
+        rospy.loginfo("drawer %s: item %d, drop at (%.3f, %.3f)", place, index + 1, x + dx, y + dy)
+
     def select_drawer_place(self, label, category):
         """62401738 いしい
         引き出し行きの物体の置き場所を返す。~drawer_any（既定 True）なら、横の 1 段の引き出し
@@ -2385,6 +2417,7 @@ class WrsMainController(object):
         if not candidates:
             raise ValueError("Drawer for {} ({}) is not open".format(label, category))
         place = candidates[0]
+        self.set_drawer_slot(place)
         rospy.loginfo("place %s (%s) at %s", label, category, place)
         return place, places[place]
 
