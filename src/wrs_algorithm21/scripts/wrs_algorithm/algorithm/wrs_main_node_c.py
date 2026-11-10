@@ -1485,7 +1485,10 @@ class WrsMainController(object):
             self.coordinates["positions"]["drawer_pose_approach"] = [
                 pos_x - self.DRAWER_POSE_LEFT,
                 grasp_y + self.DRAWER_APPROACH + self.DRAWER_POSE_FORWARD, -90.0]
-            self.navigate_for_placement("drawer_pose_approach")
+            if not self.navigate_for_placement("drawer_pose_approach"):
+                # 腕の姿勢が固定なので、立ち位置がずれたまま手を出すと棚にぶつかる
+                rospy.logwarn("cannot reach the approach point for the %s drawer; do not grasp", level)
+                return None
             self.square_to_drawer()
             joints = dict(self.DRAWER_POSE_GRASP, arm_lift_joint=lift)
             if not self.move_joints(joints):
@@ -1739,9 +1742,16 @@ class WrsMainController(object):
                     # 引き出しに時間を使いすぎると Task 1・2 の時間がなくなるので、残りは開けない
                     rospy.logwarn("drawer time is up; skip the %s drawer", level)
                     continue
-                self.go_to_drawer(level)
-                opened[level] = self.pull_drawer(level)
-                self.log_drawer_poses("pulling the {} drawer".format(level))
+                try:
+                    self.go_to_drawer(level)
+                    opened[level] = self.pull_drawer(level)
+                    self.log_drawer_poses("pulling the {} drawer".format(level))
+                except Exception as error:
+                    # 1 段で失敗しても、残りの引き出し（横の引き出しなど）は試す
+                    opened[level] = False
+                    rospy.logerr("could not open the %s drawer: %s", level, error)
+                    gripper.command(1)
+                    self.drawer_pose("all_neutral")
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
             rospy.logerr("drawer error: %s", error)
         finally:
@@ -3273,7 +3283,10 @@ class WrsMainController(object):
         # 回避の移動でゴールに着けなかったときだけ move_base でゴールへ向かう
         # （着いているのに move_base を使うと、床の物体が見えない move_base が近くの物体に寄ることがある）
         if not reached:
-            self.goto_name("go_throw_2a")
+            if self.goto_name("go_throw_2a"):
+                rospy.loginfo("task2a: reached the goal with the move_base fallback")
+            else:
+                rospy.logerr("task2a: both the avoidance and the move_base fallback failed")
         whole_body.move_to_go()
 
         # 障害物に触れたかを確認する（触れると 2a は0点）
