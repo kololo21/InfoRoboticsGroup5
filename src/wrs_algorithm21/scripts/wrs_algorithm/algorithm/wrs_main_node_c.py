@@ -1932,6 +1932,7 @@ class WrsMainController(object):
     # 11/11 から既定で右側から（15°）。引く向きは台車の角度によらず棚に垂直（map の +y）で、
     # 引いている間は台車の角度を保ったまま真後ろへ平行に下がる（pull_drawer の line / hold_yaw）
     DRAWER_TOP_SIDE_DEG = 15.0
+    DRAWER_TOP_EXTRA_DEPTH = 0.03   # 上段だけ、手をこれだけ深く入れる [m]
 
     def top_side_yaw(self):
         """62401738 いしい
@@ -1958,6 +1959,10 @@ class WrsMainController(object):
         gap_min, gap_max = self.DRAWER_FINGER_GAP_RANGE
         pos_x, face_y, knob_z = knob
         grasp_y = face_y - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH
+        if level == "top":
+            # 11/11: 上段は手が取っ手の板まで届かず、3 回とも何もつかめなかった（指の間隔 0.001〜0.002）。
+            # もう少し前（棚の方）まで手を入れる（~drawer_top_depth）
+            grasp_y -= float(rospy.get_param("~drawer_top_depth", self.DRAWER_TOP_EXTRA_DEPTH))
         for dz in self.DRAWER_Z_RETRY:
             lift = self.DRAWER_POSE_LIFT0 + (knob_z + dz - self.DRAWER_POSE_PALM_Z)
             lift = max(0.0, min(0.6, lift))
@@ -2074,6 +2079,9 @@ class WrsMainController(object):
         # 上段は傾くと取っ手が下がって見え、開いた量を少なく測る。測った量で引き足すと
         # 引き出しが抜けて落ちた（11/9 06:00）ので、引く先は測った量に頼らない。
         hand_goal_y = face0 - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH + pull
+        if level == "top":
+            # 上段は手を深く入れるので、引き終わりの手の位置も同じだけ奥にする（引く量は pull のまま）
+            hand_goal_y -= float(rospy.get_param("~drawer_top_depth", self.DRAWER_TOP_EXTRA_DEPTH))
         tries = self.DRAWER_PULL_TRIES   # 上段も半分だけなので傾かない。外れたらつかみ直す
         if level == "top":
             # 11/11: 上段は下段が開いていると手が届かず、つかみ直しても毎回空振りで約 4 分（シミュレータ時間）使っていた。
@@ -2645,7 +2653,8 @@ class WrsMainController(object):
     # Task 1 は物がなくなるまで続ける（全部取る）。それでも終わらないときだけ、ここで打ち切って Task 2 へ行く。
     # 11/9 08:30 は 10 分で打ち切っていたが、シミュレータの時間は実時間の約 2 倍の速さで進んでいて、
     # 実時間 5 分・3 個で Task 2a へ行ってしまった。Task 2a・2b はシミュレータの時間で 3〜4 分かかる。
-    TASK1_END_SEC = 16 * 60      # これを過ぎたら Task 1 をやめる（~task1_end_sec で変更）
+    # 11/11: 時間で打ち切らない（物がなくなるまで Task 1 を続ける）。打ち切るときは ~task1_end_sec に秒数を入れる
+    TASK1_END_SEC = float("inf")
     TASK1_MIN_CYCLE_SEC = 60     # 物体 1 個（探す・つかむ・置く）にかかる時間の目安
     DRAWER_END_SEC = 6 * 60      # 引き出しを開けるのはここまで（~drawer_end_sec で変更。3 つで約 4 分）
 
@@ -3530,7 +3539,91 @@ class WrsMainController(object):
                 target = (current[0] + (target[0] - current[0]) * ratio,
                           current[1] + (target[1] - current[1]) * ratio)
             return target
-        return None
+        return cls.plan_widest_step(current, goal, obstacles)
+
+    # 固定の安全距離で道がないときの最後の手段: 物と壁から「一番離れられる道」を選ぶ（11/11）。
+    # lego と foam_brick の間・壁の端と lego の間はどちらも 0.55〜0.59m で、0.28 の安全距離でも
+    # 道がないことがある。そのとき今までは止まり続け、最後に move_base で物を踏んでいた。
+    TASK2A_OBJ_CONTACT = 0.27    # 台車（半径 0.22）が物（半径 0.05 程度）に触れる中心間の距離 [m]
+    TASK2A_WALL_CONTACT = 0.245  # 台車が壁のセル（中心から 0.025）に触れる距離 [m]
+    TASK2A_WIDEST_MIN = 0.008    # この余裕もない道は通らない [m]
+    TASK2A_WIDEST_X = (1.4, 3.1)
+    TASK2A_WIDEST_RES = 0.025
+
+    @classmethod
+    def widest_margin(cls, point, obstacles):
+        """62401738 いしい
+        台車の中心が point にあるときの余裕 [m]（物・壁に触れるまでの距離の小さい方）。
+        """
+        m_o = min([math.hypot(point[0] - o[0], point[1] - o[1]) for o in obstacles] or [9.0])
+        m_w = min([math.hypot(point[0] - w[0], point[1] - w[1]) for w in cls.task2a_walls] or [9.0])
+        return min(m_o - cls.TASK2A_OBJ_CONTACT, m_w - cls.TASK2A_WALL_CONTACT)
+
+    @classmethod
+    def plan_widest_step(cls, current, goal, obstacles):
+        """62401738 いしい
+        余裕（widest_margin）の最小値が一番大きくなる道を格子で探し（最大最小の Dijkstra）、
+        その道に沿って最大 TASK2A_STEP_MAX 先の点を返す。余裕が TASK2A_WIDEST_MIN 未満なら None。
+        """
+        res = cls.TASK2A_WIDEST_RES
+        x_lo, x_hi = cls.TASK2A_WIDEST_X
+        y_lo, y_hi = cls.TASK2A_PLAN_Y
+        n_x, n_y = int((x_hi - x_lo) / res) + 1, int((y_hi - y_lo) / res) + 1
+        to_xy = lambda c: (x_lo + c[0] * res, y_lo + c[1] * res)
+        to_cell = lambda p: (max(0, min(n_x - 1, int(round((p[0] - x_lo) / res)))),
+                             max(0, min(n_y - 1, int(round((p[1] - y_lo) / res)))))
+        cache = {}
+
+        def margin(cell):
+            if cell not in cache:
+                cache[cell] = cls.widest_margin(to_xy(cell), obstacles)
+            return cache[cell]
+
+        start, target = to_cell(current), to_cell(goal)
+        # スタートが狭い所でも出られるように、スタートの余裕は数えない
+        best = {start: float("inf")}
+        parent = {start: None}
+        heap = [(-float("inf"), start)]
+        while heap:
+            value, cell = heapq.heappop(heap)
+            value = -value
+            if cell == target:
+                break
+            if value < best.get(cell, -1.0):
+                continue
+            for d_x in (-1, 0, 1):
+                for d_y in (-1, 0, 1):
+                    nxt = (cell[0] + d_x, cell[1] + d_y)
+                    if nxt == cell or not (0 <= nxt[0] < n_x and 0 <= nxt[1] < n_y):
+                        continue
+                    new = min(value, margin(nxt))
+                    if new > best.get(nxt, -1.0):
+                        best[nxt] = new
+                        parent[nxt] = cell
+                        heapq.heappush(heap, (-new, nxt))
+        width = best.get(target, -1.0)
+        if width < cls.TASK2A_WIDEST_MIN:
+            rospy.logwarn("widest path: no way (margin %.3f m)", width)
+            return None
+        path, cell = [], target
+        while cell is not None:
+            path.append(to_xy(cell))
+            cell = parent[cell]
+        path.reverse()
+        path[0] = tuple(current)
+        # 道に沿って STEP_MAX までの点のうち、まっすぐ進んでも余裕が width 以上残る一番遠い点
+        chosen = path[min(1, len(path) - 1)]
+        for point in path[1:]:
+            if math.hypot(point[0] - current[0], point[1] - current[1]) > cls.TASK2A_STEP_MAX:
+                break
+            samples = [(current[0] + (point[0] - current[0]) * k / 10.0,
+                        current[1] + (point[1] - current[1]) * k / 10.0) for k in range(1, 11)]
+            if all(cls.widest_margin(q, obstacles) >= width - 0.003 for q in samples):
+                chosen = point
+        # 見張りは「触れる距離の少し手前」まで詰める（そうしないと狭い道の手前で止まり続ける）
+        cls.task2a_danger = cls.TASK2A_OBJ_CONTACT + 0.003
+        rospy.loginfo("widest path (margin %.3f m): next (%.2f, %.2f)", width, chosen[0], chosen[1])
+        return chosen
 
     def scan_task2a_obstacles(self, obstacles, pans):
         """62401738 いしい
@@ -3755,6 +3848,7 @@ class WrsMainController(object):
             pose = self.get_robot_pose()
             if pose is not None:
                 current = (pose[0], pose[1])
+            self.task2a_seen_obstacles = bool(obstacles)
             goal = self.find_free_goal(obstacles)
             if math.hypot(current[0] - goal[0], current[1] - goal[1]) < 0.1:
                 return True
@@ -3949,7 +4043,10 @@ class WrsMainController(object):
 
         # 回避の移動でゴールに着けなかったときだけ move_base でゴールへ向かう
         # （着いているのに move_base を使うと、床の物体が見えない move_base が近くの物体に寄ることがある）
-        if not reached:
+        if not reached and getattr(self, "task2a_seen_obstacles", False):
+            # 床に物があるときは move_base でゴールへ行かない（物が見えない move_base が物を踏む。11/11 task2a_1）
+            rospy.logwarn("task2a: could not find a way without touching the objects; stop here")
+        elif not reached:
             if self.goto_name("go_throw_2a"):
                 rospy.loginfo("task2a: reached the goal with the move_base fallback")
             else:
