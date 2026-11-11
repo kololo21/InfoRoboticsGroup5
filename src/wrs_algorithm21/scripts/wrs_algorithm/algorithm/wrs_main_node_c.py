@@ -1069,6 +1069,14 @@ class WrsMainController(object):
                 frames.append(self.detect_container_rims(points))
         return self.merge_container_observations(frames)
 
+    # トレイの位置（tmc_wrs_gazebo_worlds の wrc_tray_1 / wrc_tray_2 を map に直した値。map_x = 1.2 - world_y,
+    # map_y = world_x + 2.1）。同じ式で直した容器の位置は、センサで見た位置と 1〜4cm で合っていた。
+    # 縁の高さは机の天面 0.40 + 0.014
+    TRAY_FALLBACK = (
+        {"kind": "tray", "x": 1.65, "y": -0.60, "rim_z": 0.414, "width": 0.36, "length": 0.38},
+        {"kind": "tray", "x": 1.95, "y": -0.60, "rim_z": 0.414, "width": 0.36, "length": 0.38},
+    )
+
     def ensure_sensor_placements(self, category, destinations):
         """62418450 向井悠人
         配置設定がない容器をセンサで特定し、接近点と手先開放点を登録する。
@@ -1093,8 +1101,18 @@ class WrsMainController(object):
         if found and len(found) <= maximum:
             base = scan["base"]
         else:
-            observations = self.observe_placement_containers()
+            try:
+                observations = self.observe_placement_containers()
+            except ValueError:
+                if category != "tray":
+                    raise
+                observations = []
             found = [item for item in observations if item["kind"] == category]
+            if category == "tray" and (not found or len(found) > maximum):
+                # トレイは縁が 1cm しかなく、深度カメラでは一度も見つかっていない（11/9〜11/11 の全回）。
+                # そのため食べ物が毎回 Bin B（10 点）に行っていた。見つからなければ地図上の位置を使う
+                rospy.logwarn("trays are not seen; use the trays in the world model")
+                found = [dict(item) for item in self.TRAY_FALLBACK]
             if not found or len(found) > maximum:
                 raise ValueError("Missing or ambiguous sensor observations for {}".format(category))
             base = self.tf_buffer.lookup_transform(
@@ -1226,7 +1244,8 @@ class WrsMainController(object):
             "bin_b": (("bin_b_place", "put_in_bin"),),
         }
         category = next((name for name, labels in categories.items() if label in labels), None)
-        if label in self.LONG_TO_GREEN_BIN and rospy.get_param("~long_to_green_bin", True):
+        # 11/11: 撤回（Bin A では点にならない）。既定は元の置き場所。~long_to_green_bin:=true で Bin A
+        if label in self.LONG_TO_GREEN_BIN and rospy.get_param("~long_to_green_bin", False):
             # 細長い物は、いったん全部 緑のボックス（Bin A）に入れる（容器・トレイに向きを合わせて入れられないため）
             category = "bin_a"
         if category is None:
@@ -1857,7 +1876,9 @@ class WrsMainController(object):
             rospy.sleep(0.5)
         return True
 
-    def look_at_drawer(self, level, fold_arm=True):
+    DRAWER_TOP_TILTS = (-0.45, -0.75, -0.35)   # 上段の取っ手が見えないときに試す首の角度 [rad]
+
+    def look_at_drawer(self, level, fold_arm=True, tilt=None):
         """62401738 いしい
         腕を下ろして（カメラの前からどけて）、頭を level の取っ手の方へ向ける。
         物を持っているとき（fold_arm=False）は腕はそのまま（all_neutral で上に上げてある）。
@@ -1866,7 +1887,8 @@ class WrsMainController(object):
             whole_body.move_to_go()
         head = whole_body.HEAD_CMD
         head.set_joint_value_target(
-            {"head_pan_joint": 0.0, "head_tilt_joint": self.DRAWERS[level]["tilt"]})
+            {"head_pan_joint": 0.0,
+             "head_tilt_joint": self.DRAWERS[level]["tilt"] if tilt is None else tilt})
         try:
             ok = bool(head.go(wait=True))
         finally:
@@ -2062,6 +2084,14 @@ class WrsMainController(object):
         self.look_at_drawer(level)
         knob = (self.detect_drawer_knob(level, expected, z_tol=0.10, y_tol=0.15) if second
                 else self.detect_drawer_knob(level, expected))
+        if knob is None and level == "top":
+            # 11/11: 上段の取っ手は最初に見えず、決め打ちの位置へ手を出していた。自己位置が 7cm ずれていて
+            # （つかみ損ねた後に見えた取っ手は -0.40）、手は毎回取っ手の手前で止まっていた。首の角度を変えて探し直す
+            for tilt in self.DRAWER_TOP_TILTS:
+                self.look_at_drawer(level, tilt=tilt)
+                knob = self.detect_drawer_knob(level, expected, z_tol=0.06, y_tol=0.12)
+                if knob is not None:
+                    break
         knob_seen = knob is not None
         if knob is None:
             rospy.logwarn("%s drawer knob not seen; use the expected position", level)
@@ -2252,8 +2282,19 @@ class WrsMainController(object):
           pull 0.30: 判定の箱の前の端 -0.355 + 0.30 - 0.07 = -0.125 → 真ん中 -0.258
         """
         x, pose = self.DRAWER_DROP[level]
-        judge_front = self.DRAWER_KNOB_FACE_Y + pull - self.DRAWER_JUDGE_FRONT
-        return x, (self.DRAWER_SHELF_FRONT_Y + judge_front) / 2.0, pose
+        # 11/11: 横の引き出しの閉じた取っ手は -0.403 に見えていたのに、決め打ちの -0.355 から落とす所を決めていて
+        # 4cm 手前で離し、コップが箱に入らなかった。見えた取っ手の位置と、実際に開いた量から決める
+        face = self.drawer_face(level)
+        opened = getattr(self, "drawer_opened", {}).get(level, pull)
+        shelf_front = face + (self.DRAWER_SHELF_FRONT_Y - self.DRAWER_KNOB_FACE_Y)
+        judge_front = face + opened - self.DRAWER_JUDGE_FRONT
+        return x, (shelf_front + judge_front) / 2.0, pose
+
+    def drawer_face(self, level):
+        """62401738 いしい
+        level の引き出しが閉じていたときの取っ手の前面の y（見えた値。見えていなければ決め打ちの値）。
+        """
+        return getattr(self, "drawer_face0", {}).get(level, self.DRAWER_KNOB_FACE_Y)
 
     def open_drawers(self):
         """62401738 いしい
@@ -2364,7 +2405,7 @@ class WrsMainController(object):
         self.drawer_drop_base[place] = (x, y)
         # 落とす位置を「開いた取っ手からのずれ」としても覚えておく（置く直前に取っ手を見て合わせる）
         opened = getattr(self, "drawer_opened", {}).get(level, self.DRAWERS[level]["pull"])
-        knob = (self.DRAWERS[level]["x"], self.DRAWER_KNOB_FACE_Y + opened)
+        knob = (self.DRAWERS[level]["x"], self.drawer_face(level) + opened)
         if not hasattr(self, "drawer_drop_refs"):
             self.drawer_drop_refs = {}
         self.drawer_drop_refs[place] = (level, opened, x - knob[0], y - knob[1])
@@ -2380,7 +2421,7 @@ class WrsMainController(object):
         """
         level, opened, off_x, off_y = self.drawer_drop_refs[place]
         self.look_at_drawer(level, fold_arm=False)
-        knob = self.detect_drawer_knob(level, self.DRAWER_KNOB_FACE_Y + opened, z_tol=0.10,
+        knob = self.detect_drawer_knob(level, self.drawer_face(level) + opened, z_tol=0.10,
                                        y_tol=0.15)
         dx, dy = getattr(self, "drawer_slot", {}).get(place, (0.0, 0.0))
         if knob is None:
@@ -2735,7 +2776,9 @@ class WrsMainController(object):
             return True, False
         # 離したのに点が入らないとき、物が指に引っかかったまま持ってきていないか確かめる（11/11 ペンチ・コップ）。
         # 引っかかっていれば「まだ持っている」として、もう一度置きに行く（足元を探して拾い直さない）
-        return False, self.still_in_hand(label)
+        # 11/11: 握り直して確かめる still_in_hand はやめた。閉じきる前の間隔（0.018〜0.033）で「まだ持っている」と
+        # 誤判定し、空の手で置きに行って「lost on the way」→ 手を開く（つかんですぐ落とすように見えた）
+        return False, False
 
     def place_until_scored(self, label):
         """62401738 いしい
@@ -3344,8 +3387,20 @@ class WrsMainController(object):
             if not self.is_task2a_obstacle(pos):
                 rospy.loginfo("ignore %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
                 continue
+            if bbox.score < self.TASK2A_WEAK_SCORE:
+                # 11/11: 確信度 0.35〜0.50 の windex_bottle が、ロボットの前の毎回違う所に見え、
+                # ゴールの手前をふさいで止まった。弱い検出は、同じ所で 2 回見えたときだけ障害物にする
+                weak = getattr(self, "task2a_weak", [])
+                again = any(math.hypot(w[0] - pos.x, w[1] - pos.y) < self.TASK2A_MERGE_DIST for w in weak)
+                weak.append((pos.x, pos.y))
+                self.task2a_weak = weak
+                if not again:
+                    rospy.loginfo("weak %s (%.2f) at (%.2f, %.2f); wait for a second look",
+                                  bbox.label, bbox.score, pos.x, pos.y)
+                    continue
             rospy.loginfo("obstacle %s (%.2f, %.2f, %.2f)", bbox.label, pos.x, pos.y, pos.z)
             self.add_obstacle(obstacles, (pos.x, pos.y))
+            type(self).task2a_labels = getattr(self, "task2a_labels", []) + [(pos.x, pos.y, bbox.label)]
 
     @classmethod
     def plan_path_astar(cls, start, goal, obstacles, safe_dist, grid=None):
@@ -3555,8 +3610,15 @@ class WrsMainController(object):
     # 固定の安全距離で道がないときの最後の手段: 物と壁から「一番離れられる道」を選ぶ（11/11）。
     # lego と foam_brick の間・壁の端と lego の間はどちらも 0.55〜0.59m で、0.28 の安全距離でも
     # 道がないことがある。そのとき今までは止まり続け、最後に move_base で物を踏んでいた。
-    TASK2A_OBJ_CONTACT = 0.27    # 台車（半径 0.22）が物（半径 0.05 程度）に触れる中心間の距離 [m]
-    TASK2A_WALL_CONTACT = 0.245  # 台車が壁のセル（中心から 0.025）に触れる距離 [m]
+    TASK2A_OBJ_CONTACT = 0.27    # 台車（半径 0.22）が物（半径 0.05 程度）に触れる中心間の距離 [m]（種類が分からないとき）
+    # 物の種類ごとの半径 [m]（上から見た外接円）。lego_duplo 2x2 は 3.2cm 角、foam_brick は 5x7.5cm
+    TASK2A_OBJ_RADIUS = {"lego_duplo": 0.025, "foam_brick": 0.045, "rubiks_cube": 0.04, "dice": 0.015,
+                         "marble": 0.01, "golf_ball": 0.025, "tennis_ball": 0.035}
+    TASK2A_ROBOT_RADIUS = 0.22
+    # 台車が壁のセル（中心から 0.025）に触れる距離 0.245 に 2.5cm の余裕を足す。
+    # 11/11: 壁の端と lego の間を 1.3cm の余裕で通り、壁にすれすれだった
+    TASK2A_WALL_CONTACT = 0.27
+    TASK2A_WEAK_SCORE = 0.6      # これより確信度の低い検出は、同じ所で 2 回見えたときだけ障害物にする
     TASK2A_WIDEST_MIN = 0.008    # この余裕もない道は通らない [m]
     TASK2A_WIDEST_X = (1.4, 3.1)
     TASK2A_WIDEST_RES = 0.025
@@ -3566,9 +3628,24 @@ class WrsMainController(object):
         """62401738 いしい
         台車の中心が point にあるときの余裕 [m]（物・壁に触れるまでの距離の小さい方）。
         """
-        m_o = min([math.hypot(point[0] - o[0], point[1] - o[1]) for o in obstacles] or [9.0])
+        m_o = min([math.hypot(point[0] - o[0], point[1] - o[1]) - cls.obstacle_contact(o)
+                   for o in obstacles] or [9.0])
         m_w = min([math.hypot(point[0] - w[0], point[1] - w[1]) for w in cls.task2a_walls] or [9.0])
-        return min(m_o - cls.TASK2A_OBJ_CONTACT, m_w - cls.TASK2A_WALL_CONTACT)
+        return min(m_o, m_w - cls.TASK2A_WALL_CONTACT)
+
+    @classmethod
+    def obstacle_contact(cls, obs):
+        """62401738 いしい
+        障害物 obs (x, y) に台車が触れる中心間の距離。近くで見えた物の種類から半径を決める（分からなければ 0.05）。
+        """
+        best, label = 0.15, None
+        for l_x, l_y, name in getattr(cls, "task2a_labels", []):
+            dist = math.hypot(l_x - obs[0], l_y - obs[1])
+            if dist < best:
+                best, label = dist, name
+        if label in cls.TASK2A_OBJ_RADIUS:
+            return cls.TASK2A_ROBOT_RADIUS + cls.TASK2A_OBJ_RADIUS[label]
+        return cls.TASK2A_OBJ_CONTACT
 
     @classmethod
     def plan_widest_step(cls, current, goal, obstacles):
@@ -3632,7 +3709,7 @@ class WrsMainController(object):
             if all(cls.widest_margin(q, obstacles) >= width - 0.003 for q in samples):
                 chosen = point
         # 見張りは「触れる距離の少し手前」まで詰める（そうしないと狭い道の手前で止まり続ける）
-        cls.task2a_danger = cls.TASK2A_OBJ_CONTACT + 0.003
+        cls.task2a_danger = min([cls.obstacle_contact(o) for o in obstacles] or [cls.TASK2A_OBJ_CONTACT]) + 0.003
         rospy.loginfo("widest path (margin %.3f m): next (%.2f, %.2f)", width, chosen[0], chosen[1])
         return chosen
 
