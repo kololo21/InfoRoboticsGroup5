@@ -2860,7 +2860,10 @@ class WrsMainController(object):
     # 最後の 0.28 は、ほかに道がないときだけ使う（接触は 0.26〜0.27。11/9 08:31 は lego と foam_brick の
     # 間が 0.58m しかなく、0.32 では道がないので壁の角を削って回り込み、枠に当たった）
     # 0.28 の段はやめた（11/9 夜）。接触は 0.26〜0.27 で余裕が 1〜2cm しかなく、壁や枠に当たると減点される
-    TASK2A_SAFE_DISTS = (0.45, 0.38, 0.32)
+    # 0.28 を最後の手段として戻した（11/11）。以前やめた理由は、A* が壁の角をかすめて枠に当たったことで、
+    # 今は壁から TASK2A_WALL_SAFE 離す条件が A* に入っている。0.32 で道がないとき、今までは壁を横切る
+    # レーンへ直進して wrc_frame に当たっていた（standby_2a のそばに windex、lego と foam_brick の間 0.59m）
+    TASK2A_SAFE_DISTS = (0.45, 0.38, 0.32, 0.28)
     TASK2A_NARROW_DIST = 0.32         # これより狭い安全距離では、格子を細かくし、見張りの距離も詰める
     TASK2A_GRID_FINE = 0.025          # 狭い所を探すときの格子 [m]（5cm では隙間の真ん中が格子に乗らない）
     TASK2A_DANGER_MARGIN = 0.015      # 狭い道のときの見張りの距離 = 安全距離 - これ
@@ -3315,7 +3318,13 @@ class WrsMainController(object):
                     if not (0 <= nxt[0] < n_x and 0 <= nxt[1] < n_y):
                         continue
                     clr = clearance(nxt)
-                    if clr < safe_dist or (nxt != goal_cell and near_wall(nxt)):
+                    if nxt != goal_cell and near_wall(nxt):
+                        continue
+                    if clr < safe_dist and not (clr >= clearance(cell) and clr >= cls.TASK2A_ESCAPE_MIN):
+                        # 安全距離より近い格子は通らない。ただし、今いる所がすでに近いとき（スタートのすぐそばに
+                        # 物がある）は、離れていく向きにだけ進んでよい。
+                        # 11/11: standby_2a の 0.27m 先に windex_bottle があり、スタートから一歩も出られず
+                        # 3 つの安全距離とも「経路なし」→ 斜めのレーンへ直進して wrc_frame（扉の枠）に当たった
                         continue
                     step = math.hypot(d_x, d_y) * res
                     penalty = cls.TASK2A_CLEAR_WEIGHT * max(0.0, cls.TASK2A_SOFT_DIST - clr)
@@ -3342,6 +3351,7 @@ class WrsMainController(object):
     # 11/9 08:31、A* が部屋の境目の壁の端（x 2.05, y 2.1〜2.2）をかすめる斜めの経路を選び、
     # 台車が wrc_frame に当たった。床の物だけでなく壁も避ける。
     task2a_walls = []
+    TASK2A_ESCAPE_MIN = 0.25  # スタートのそばの物から離れるときに許す、物の中心までの最小距離 [m]
     TASK2A_WALL_SAFE = 0.32   # 壁の中心から台車の中心まで（半径 0.22 + セルの半分 0.025 + 余裕）
 
     @classmethod
@@ -3712,10 +3722,19 @@ class WrsMainController(object):
             goal = (lane_x, target_y)
             dists = [cls.dist_point_to_segment(obs, current_pos, goal) for obs in obstacles]
             clearance = min(dists) if dists else float("inf")
+            # 壁（扉の枠）を横切るレーンは選ばない（11/11: (2.5, 1.85) → (1.70, 2.50) で wrc_frame に当たった）
+            if any(cls.dist_point_to_segment(wall, current_pos, goal) < cls.TASK2A_WALL_SAFE
+                   for wall in cls.task2a_walls):
+                rospy.loginfo("step %d lane x=%.2f crosses a wall", current_stp, lane_x)
+                continue
             lanes.append({"x": lane_x, "clearance": clearance,
                           "lateral": abs(lane_x - current_pos[0])})
             rospy.loginfo("step %d lane x=%.2f clearance=%.2f", current_stp, lane_x, clearance)
 
+        if not lanes:
+            # どのレーンも壁を横切るときは、今の x のまままっすぐ進む
+            rospy.logwarn("all lanes cross a wall at step %d; go straight", current_stp)
+            return [current_pos[0], target_y, cls.TASK2A_YAW]
         safe = [lane for lane in lanes if lane["clearance"] >= cls.TASK2A_SAFE_DIST]
         if safe:
             best = min(safe, key=lambda lane: (lane["lateral"], -lane["clearance"]))
