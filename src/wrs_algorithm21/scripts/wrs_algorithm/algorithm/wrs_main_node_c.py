@@ -2143,6 +2143,22 @@ class WrsMainController(object):
                     rospy.logerr("could not open the %s drawer: %s", level, error)
                     gripper.command(1)
                     self.drawer_pose("all_neutral")
+            # 3 つ引いた後、引き切れていない（失敗・途中まで）引き出しを、時間があれば引き足す。
+            # 3 つとも引き切らないと点にならない。取っ手の今の位置から合計 pull になるまで引く（total）。
+            retry_end = float(rospy.get_param("~drawer_retry_end_sec", self.DRAWER_RETRY_END_SEC))
+            for level in self.DRAWER_LEVELS:
+                done = getattr(self, "drawer_opened", {}).get(level, 0.0)
+                if done >= pull * self.DRAWER_DONE_RATIO or self.elapsed_since_start() > retry_end:
+                    continue
+                rospy.logwarn("%s drawer opened only %.3f of %.2f m; pull it again", level, done, pull)
+                try:
+                    self.go_to_drawer(level)
+                    if self.pull_drawer(level, pull=pull, total=pull):
+                        opened[level] = True
+                except Exception as error:
+                    rospy.logerr("could not pull the %s drawer again: %s", level, error)
+                    gripper.command(1)
+                    self.drawer_pose("all_neutral")
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
             rospy.logerr("drawer error: %s", error)
         finally:
@@ -2456,6 +2472,10 @@ class WrsMainController(object):
     # 実時間 5 分・3 個で Task 2a へ行ってしまった。Task 2a・2b はシミュレータの時間で 3〜4 分かかる。
     TASK1_END_SEC = 16 * 60      # これを過ぎたら Task 1 をやめる（~task1_end_sec で変更）
     TASK1_MIN_CYCLE_SEC = 60     # 物体 1 個（探す・つかむ・置く）にかかる時間の目安
+    TASK1_RESCANS = 1            # 全部の場所で「物なし」になった後に、見直す回数
+    TASK1_RESCAN_MIN_LEFT = 240  # 見直すのに必要な Task 1 の残り時間 [s]
+    DRAWER_RETRY_END_SEC = 7 * 60   # 開ききらなかった引き出しをやり直すのはここまで（~drawer_retry_end_sec）
+    DRAWER_DONE_RATIO = 0.9      # 引く量のこの割合以上開いていれば、引き切ったとみなす
     DRAWER_END_SEC = 6 * 60      # 引き出しを開けるのはここまで（~drawer_end_sec で変更。3 つで約 4 分）
 
     def elapsed_since_start(self):
@@ -2704,7 +2724,18 @@ class WrsMainController(object):
         rospy.loginfo("Start searching objects.")
 
         time_up = False
-        while not time_up and not all(count >= 2 for count in empty_count):
+        rescans = 0
+        while not time_up:
+            if all(count >= 2 for count in empty_count):
+                # 3 か所とも「物がない」と見たが、見落としで終わらないよう、時間が残っていれば 1 回だけ見直す
+                if rescans < self.TASK1_RESCANS and self.task1_time_left() > self.TASK1_RESCAN_MIN_LEFT:
+                    rescans += 1
+                    rospy.logwarn("No object seen at all places, %.0f s left; scan once more (%d/%d)",
+                                  self.task1_time_left(), rescans, self.TASK1_RESCANS)
+                    empty_count = [0] * len(hsr_position)
+                    attempt_count = [0] * len(hsr_position)
+                else:
+                    break
             for i, (plc, pose) in enumerate(hsr_position):
                 # 次の物体を取りに行く前に、Task 2 の時間が残るか確かめる（1 個の途中では止めない）
                 if self.task1_time_left() < self.TASK1_MIN_CYCLE_SEC:
