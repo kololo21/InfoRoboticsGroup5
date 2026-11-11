@@ -1334,7 +1334,7 @@ class WrsMainController(object):
             # 姿勢変更は MoveIt で計画し、計画できなければ直接指令で動かす（drawer_pose）。
             # 11/9 06:32 の実行では、windex_bottle を持ったまま all_neutral を MoveIt で計画できず、
             # どこにも置けないまま次の物を取りに行って物を蹴っていた。
-            stages = [("transport", lambda: self.drawer_pose("all_neutral")),
+            stages = [("transport", lambda: self.transport_pose(label)),
                       ("navigate", lambda: self.navigate_with_alternate(place)),
                       ("holding", lambda: self.check_holding(label, record))]
             if use_target:
@@ -1375,6 +1375,18 @@ class WrsMainController(object):
             record["elapsed_seconds"] = round(time.monotonic() - started, 3)
             rospy.loginfo("Placement result: %s", json.dumps(record, sort_keys=True))
             self.log_drawer_poses("placing at {}".format(place))
+
+    def transport_pose(self, label):
+        """62401738 いしい
+        運ぶ姿勢（all_neutral）にする。つかんだ直後にもう all_neutral にしてあるので、
+        姿勢の指令が失敗しても物を持っていればそのまま運ぶ（False にしない）。
+        11/11 01:42: 指令が毎回失敗（joints ok false）して 6 回とも transport で中断し、
+        どこにも置かずに次の物を取りに行って、その場で手を開いて物を捨てていた。
+        """
+        if self.drawer_pose("all_neutral"):
+            return True
+        rospy.logwarn("transport pose failed; carry %s in the current pose", label)
+        return True
 
     def pull_out_trofast(self, x, y, z, yaw, pitch, roll):
         """サンプルのまま（担当なし）
@@ -1453,11 +1465,14 @@ class WrsMainController(object):
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
         "bottom": {"x": 0.20, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                    "stand": "drawer_standpoint"},
-        "top": {"x": 0.20, "z": 0.54, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
+        "top": {"x": 0.20, "z": 0.555, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
         "left": {"x": 0.53, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                  "stand": "drawer_left_standpoint"},
     }
     DRAWER_KNOB_FACE_Y = -0.355             # 取っ手の板の前面の y（3 つとも同じ）
+    # 取っ手が見えなかったときに使う前面の y。実際に見えた値は -0.321〜-0.334（11/9・11/11）で、
+    # -0.355 を使うと手を 3cm 奥に入れすぎて空振りしていた（11/11 上段: 3 回とも指の間隔 0.003）
+    DRAWER_KNOB_UNSEEN_Y = -0.328
     DRAWER_FINGER_REACH = 0.063             # 手のひら(hand_palm_link)から指先までの前後距離（実測）
     # 指先を板の前面からどれだけ奥へ入れるか。取っ手は「板（幅 6.6cm・厚さ 1cm）→ 軸（太さ 3cm・長さ 2cm）
     # → 根元の円板（直径 6.8cm）」の順に並ぶ。0.022 では指の腹が板の両端をはさみ（閉じた後の間隔 0.06 前後）、
@@ -1642,15 +1657,18 @@ class WrsMainController(object):
                 if abs(remain) < 0.005 and (x_tol is None or abs(remain_x) < x_tol):
                     return True
                 if shelf_guard:
+                    # shelf_guard に数値を渡したときは、それも下限の候補にする（取っ手が奥に見えたとき）
+                    y_min = (self.DRAWER_PALM_Y_MIN if shelf_guard is True
+                             else min(self.DRAWER_PALM_Y_MIN, float(shelf_guard)))
                     palm_map = self.lookup_xyz("hand_palm_link", "map")
-                    if palm_map is not None and palm_map[1] < self.DRAWER_PALM_Y_MIN:
+                    if palm_map is not None and palm_map[1] < y_min:
                         # 棚に近づきすぎ。押し続けると倒れるので、ここで止める（後ろへ戻る指令は下で通す）
                         goes_in = (remain < 0) if frame == "map" else None
                         if goes_in is None:
                             goes_in = True
                         if goes_in:
-                            rospy.logwarn("hand is too close to the shelf (map y %.3f < %.2f); stop the base",
-                                          palm_map[1], self.DRAWER_PALM_Y_MIN)
+                            rospy.logwarn("hand is too close to the shelf (map y %.3f < %.3f); stop the base",
+                                          palm_map[1], y_min)
                             self.base_stalled = True
                             return False
                 if self.is_base_stalled(window, hand):
@@ -1860,7 +1878,8 @@ class WrsMainController(object):
                 rospy.logwarn("cannot take the drawer grasp pose")
                 continue
             # 台車を前に進めて、手を取っ手に差し込む
-            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10, shelf_guard=True):
+            # 11/11: 取っ手が -0.387 に見えたとき、-0.34 の柵で手前に止まり 3 回空振りした。取っ手の 2cm 先まで許す
+            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10, shelf_guard=grasp_y - 0.02):
                 # 指が取っ手に触れて止まった場合もあるので、閉じて指の間隔で判定する
                 rospy.logwarn("base insertion did not finish for the %s drawer; close and check", level)
             self.close_gripper_on_handle()
@@ -1933,6 +1952,8 @@ class WrsMainController(object):
         knob_seen = knob is not None
         if knob is None:
             rospy.logwarn("%s drawer knob not seen; use the expected position", level)
+            if not second:
+                expected = self.DRAWER_KNOB_UNSEEN_Y
             knob = (self.DRAWERS[level]["x"], expected, self.DRAWERS[level]["z"])
         face0 = knob[1]                 # 閉じているときの取っ手の位置
         if second:
