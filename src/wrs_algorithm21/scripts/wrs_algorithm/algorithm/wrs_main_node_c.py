@@ -1600,8 +1600,13 @@ class WrsMainController(object):
         return (t.translation.x + math.cos(yaw) * x - math.sin(yaw) * y,
                 t.translation.y + math.sin(yaw) * x + math.cos(yaw) * y)
 
+    # 棚に向かう台車の動きの安全柵（map の y）。手のひらがこれより棚側（-y）へ行く指令は出さない。
+    # 棚の前面 -0.39、閉じた取っ手の前面 -0.355、つかむときの手のひら y は約 -0.32。押し付けて車体が倒れた対策
+    DRAWER_PALM_Y_MIN = -0.34
+    DRAWER_DROP_Y_MIN = -0.36    # 落とす指先の y の下限（棚の前面 + 3cm）。これより奥へは寄らない
+
     def move_hand_by_base(self, target_y, keep_x, timeout, watch_grip=False, x_tol=None,
-                          frame="map", hold_yaw=None, line=None):
+                          frame="map", hold_yaw=None, line=None, shelf_guard=False):
         """62401738 いしい
         腕は止めたまま台車だけを動かし、手のひらを map の y = target_y まで真っすぐ運ぶ。
         全身 IK で引くと台車が回ってしまうことがあるので、引き出しは台車でまっすぐ引く。
@@ -1636,6 +1641,18 @@ class WrsMainController(object):
                     remain_x = -across           # 直線から横にずれた分を戻す
                 if abs(remain) < 0.005 and (x_tol is None or abs(remain_x) < x_tol):
                     return True
+                if shelf_guard:
+                    palm_map = self.lookup_xyz("hand_palm_link", "map")
+                    if palm_map is not None and palm_map[1] < self.DRAWER_PALM_Y_MIN:
+                        # 棚に近づきすぎ。押し続けると倒れるので、ここで止める（後ろへ戻る指令は下で通す）
+                        goes_in = (remain < 0) if frame == "map" else None
+                        if goes_in is None:
+                            goes_in = True
+                        if goes_in:
+                            rospy.logwarn("hand is too close to the shelf (map y %.3f < %.2f); stop the base",
+                                          palm_map[1], self.DRAWER_PALM_Y_MIN)
+                            self.base_stalled = True
+                            return False
                 if self.is_base_stalled(window, hand):
                     # 手が何かに当たって進まない（取っ手に押し付けている・引き出しが止まった）。
                     # 押し続けると腕を伸ばしたまま車体が後ろに傾く（11/9 07:59 上段）ので、ここで止める
@@ -1843,7 +1860,7 @@ class WrsMainController(object):
                 rospy.logwarn("cannot take the drawer grasp pose")
                 continue
             # 台車を前に進めて、手を取っ手に差し込む
-            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10):
+            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10, shelf_guard=True):
                 # 指が取っ手に触れて止まった場合もあるので、閉じて指の間隔で判定する
                 rospy.logwarn("base insertion did not finish for the %s drawer; close and check", level)
             self.close_gripper_on_handle()
@@ -2216,12 +2233,13 @@ class WrsMainController(object):
         if knob is None:
             rospy.logwarn("opened %s drawer knob not seen; use the planned drop point", level)
             base = self.drawer_drop_base[place]
-            self.drawer_drops[place] = (base[0] + dx, base[1] + dy)
+            self.drawer_drops[place] = (base[0] + dx, max(base[1] + dy, self.DRAWER_DROP_Y_MIN))
             self.lock_target(place, *self.drawer_drops[place])
             return True
         old = self.drawer_drops[place]
-        self.drawer_drop_base[place] = (knob[0] + off_x, knob[1] + off_y)
-        self.drawer_drops[place] = (knob[0] + off_x + dx, knob[1] + off_y + dy)
+        self.drawer_drop_base[place] = (knob[0] + off_x, max(knob[1] + off_y, self.DRAWER_DROP_Y_MIN + 0.05))
+        self.drawer_drops[place] = (knob[0] + off_x + dx,
+                                    max(knob[1] + off_y + dy, self.DRAWER_DROP_Y_MIN))
         self.lock_target(place, *self.drawer_drops[place])
         rospy.loginfo("drop point for %s: (%.3f, %.3f) -> (%.3f, %.3f) from the knob",
                       place, old[0], old[1], self.drawer_drops[place][0], self.drawer_drops[place][1])
@@ -2340,7 +2358,7 @@ class WrsMainController(object):
         self.lock_target(place, x, y)
         return True
 
-    def align_tips_over(self, place, x, y):
+    def align_tips_over(self, place, x, y, shelf_guard=False):
         """62401738 いしい
         腕の姿勢はそのまま台車だけ動かし、指先を目標の真上に合わせる（台車の向きによらない）。
         目標は locate で odom 座標に直したもの（なければ map の (x, y) を今 odom に直す）。
@@ -2358,7 +2376,8 @@ class WrsMainController(object):
             return True
         palm_x = tips[0] - self.DRAWER_PALM_TO_TIPS * math.cos(yaw)
         palm_y = tips[1] - self.DRAWER_PALM_TO_TIPS * math.sin(yaw)
-        if not self.move_hand_by_base(palm_y, palm_x, timeout=12, x_tol=0.01, frame=frame):
+        if not self.move_hand_by_base(palm_y, palm_x, timeout=12, x_tol=0.01, frame=frame,
+                                      shelf_guard=shelf_guard):
             rospy.logwarn("could not align the hand over %s; release here", place)
         hand = self.lookup_xyz("hand_palm_link", frame)
         if hand is not None:
@@ -2378,7 +2397,7 @@ class WrsMainController(object):
         引き出しの落とす位置（drawer_drops[place]）の真上に指先を合わせる（align_tips_over）。
         """
         x, y = self.drawer_drops[place]
-        return self.align_tips_over(place, x, y)
+        return self.align_tips_over(place, x, y, shelf_guard=True)
 
     def set_drawer_slot(self, place):
         """62401738 いしい
@@ -2392,6 +2411,7 @@ class WrsMainController(object):
         self.drawer_slot = getattr(self, "drawer_slot", {})
         self.drawer_slot[place] = (dx, dy)
         x, y = self.drawer_drop_base[place]
+        y = max(y + dy, self.DRAWER_DROP_Y_MIN) - dy
         self.drawer_drops[place] = (x + dx, y + dy)
         self.coordinates["positions"][place] = [
             x + dx - self.DRAWER_HAND_LEFT, y + dy + self.DRAWER_HAND_FORWARD, -90]
