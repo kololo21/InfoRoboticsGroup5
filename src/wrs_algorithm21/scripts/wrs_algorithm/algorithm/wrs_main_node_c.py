@@ -935,9 +935,11 @@ class WrsMainController(object):
             edge = np.any(np.abs(local) >= half - tolerance, axis=1)
             if np.mean(edge) < 0.65:
                 continue
+            # 長い辺の向き [rad]（map）。細長い物をこの向きにそろえて入れる（turn_long_object）
+            long_yaw = angle if rect[1][0] >= rect[1][1] else angle + math.pi / 2.0
             detections.append({"kind": kind, "x": float(center[0]), "y": float(center[1]),
                                "rim_z": table_z + height, "width": float(width),
-                               "length": float(length)})
+                               "length": float(length), "long_yaw": float(long_yaw)})
         return detections
 
     @staticmethod
@@ -1342,7 +1344,8 @@ class WrsMainController(object):
                 # 引き出しと同じく、決まった腕の姿勢にしてから台車で手を容器の真上に合わせて離す。
                 stages.extend([
                     ("locate", lambda: self.locate_place_target(place)),
-                    ("place", lambda: self.lift_then_pose(self.release_pose_for(place))),
+                    ("place", lambda: self.lift_then_pose(self.release_pose_for(place, label))),
+                    ("turn", lambda: self.turn_long_object(place, label)),
                     ("align", lambda: self.align_hand_over(
                         place, self.placement_targets[place]["x"],
                         self.placement_targets[place]["y"])),
@@ -2279,21 +2282,36 @@ class WrsMainController(object):
         "windex_bottle": 0.27, "bleach_cleanser": 0.25, "chips_can": 0.25, "pitcher_base": 0.24,
         "cracker_box": 0.21, "mustard_bottle": 0.19, "sugar_box": 0.18, "master_chef_can": 0.14,
     }
-    RELEASE_CLEARANCE = 0.02   # 背の高い物の底を、容器の縁からどれだけ上で離すか
+    # 細長い物の長さ [m]。上からつかむと指の間で回って縦にぶら下がることがある
+    LONG_OBJECTS = {"large_marker": 0.12, "small_marker": 0.10, "spatula": 0.33, "fork": 0.20, "spoon": 0.20}
+    RELEASE_CLEARANCE = 0.02   # 背の高い物・細長い物の底を、容器の縁からどれだけ上で離すか
+    # 背の高い物・細長い物を運ぶ高さの余裕: 全長が指の下にぶら下がっても、底が縁よりこれだけ上を通る。
+    # 11/10: 青いボトル（上からつかんで全長が指の下）を指先 0.71 で運び、底（約 0.44）が縁（0.53）に当たった
+    CARRY_CLEARANCE = 0.05
+    ARM_LIFT_MAX = 0.6
+
+    def object_length(self, label):
+        """62401738 いしい
+        背の高い物・細長い物の長さ [m]。どちらでもなければ None（今までどおりの置き方）。
+        """
+        return self.TALL_OBJECTS.get(label) or self.LONG_OBJECTS.get(label)
 
     def lower_tall_object(self, place, label):
         """62401738 いしい
-        背の高い物は、容器の真上で位置を合わせた後に腕を下ろし、底が縁（センサで測った高さ）の
-        RELEASE_CLEARANCE 上に来た所で離す。それ以外の物は何もしない（True）。
-        以前は底を机の天面近くまで下ろしていたが、手が少しずれていると縁に当たって外にこぼれた（11/9）。
+        背の高い物・細長い物は、容器の真上で位置を合わせた後に腕を下ろし、底が縁（センサで測った高さ）の
+        RELEASE_CLEARANCE 上に来た所で離す（上に運んでから、少し下げて離す）。それ以外の物は何もしない。
         """
-        height = self.TALL_OBJECTS.get(label)
-        if height is None:
+        length = self.object_length(label)
+        if length is None:
             return True
         target = self.placement_targets[place]
         rim_z = target.get("rim_z", target["z"] - self.PLACE_RIM_CLEARANCE)
-        tips_z = rim_z + self.RELEASE_CLEARANCE + height / 2.0
-        joints = dict(self.poses[self.release_pose_for(place)])
+        tips_z = rim_z + self.RELEASE_CLEARANCE + length / 2.0
+        # place の段階で作った姿勢（turn で回した手首の向きを含む）から、高さだけ下げる
+        name = "release_{}".format(place)
+        if name not in self.poses:
+            name = self.release_pose_for(place, label)
+        joints = dict(self.poses[name])
         lift = max(0.0, min(joints["arm_lift_joint"], tips_z - self.RELEASE_TIPS_Z0))
         if lift >= joints["arm_lift_joint"] - 0.01:
             return True
@@ -2303,17 +2321,47 @@ class WrsMainController(object):
         self.move_joints(joints)
         return True  # 下ろせなくても、その高さで離す（持ったまま次へ行かない）
 
-    def release_pose_for(self, place):
+    def release_pose_for(self, place, label=None):
         """62401738 いしい
-        place の上で離すときの腕の姿勢名。指先の高さが目標の z になるよう arm_lift を決める。
+        place の上へ運ぶときの腕の姿勢名。指先の高さが目標の z（縁 + 0.18）になるよう arm_lift を決める。
+        背の高い物・細長い物だけ、全長がぶら下がっても底が縁より CARRY_CLEARANCE 上を通る高さまで上げる。
         """
-        z = self.placement_targets[place]["z"]
-        lift = max(0.0, min(0.5, z - self.RELEASE_TIPS_Z0))
+        target = self.placement_targets[place]
+        z = target["z"]
+        length = self.object_length(label) if label else None
+        if length is not None:
+            rim_z = target.get("rim_z", z - self.PLACE_RIM_CLEARANCE)
+            z = max(z, rim_z + length + self.CARRY_CLEARANCE)
+        lift = max(0.0, min(self.ARM_LIFT_MAX if length is not None else 0.5, z - self.RELEASE_TIPS_Z0))
         name = "release_{}".format(place)
         self.poses[name] = {"arm_lift_joint": lift, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
                             "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
                             "head_tilt_joint": 0.0, "head_pan_joint": 0.0}
         return name
+
+    def turn_long_object(self, place, label):
+        """62401738 いしい
+        背の高い物・細長い物を、容器・トレイの長い辺と平行になるよう手首を回す（腕を上げた後、合わせる前）。
+        離す姿勢は手が真下を向き、指は台車の左右に閉じるので、上からつかんだ細長い物は台車の前後を向いている。
+        その向きと長い辺の向き（locate で測った long_yaw）の差だけ手首を回す。向きを測れていなければ回さない。
+        """
+        if self.object_length(label) is None:
+            return True
+        long_yaw = self.placement_targets.get(place, {}).get("long_yaw")
+        yaw = self.base_yaw()
+        if long_yaw is None or yaw is None:
+            return True
+        delta = long_yaw - yaw
+        delta = math.atan2(math.sin(2 * delta), math.cos(2 * delta)) / 2.0   # 180° 回しても同じ向き
+        if abs(delta) < math.radians(15):
+            return True
+        name = "release_{}".format(place)
+        joints = dict(self.poses[name])
+        joints["wrist_roll_joint"] = delta
+        self.poses[name] = joints
+        rospy.loginfo("turn %s along the long side of %s: wrist_roll %.2f rad", label, place, delta)
+        self.move_joints(joints)
+        return True
 
     # 置く直前にカメラで探す容器・トレイの種類（detect_container_rims の kind）
     PLACE_KINDS = {"container_a_place": "container_a", "container_b_place": "container_b",
@@ -2362,10 +2410,12 @@ class WrsMainController(object):
                 for item in self.detect_container_rims(near):
                     dist = math.hypot(item["x"] - x, item["y"] - y)
                     if item["kind"] == kind and dist < self.PLACE_SEARCH_RADIUS:
-                        found.append((dist, item["x"], item["y"]))
+                        found.append((dist, item["x"], item["y"], item.get("long_yaw")))
             if found:
-                _, best_x, best_y = min(found)
-                same = [(fx, fy) for _, fx, fy in found
+                _, best_x, best_y, best_yaw = min(found, key=lambda v: v[0])
+                if best_yaw is not None:
+                    target["long_yaw"] = best_yaw
+                same = [(fx, fy) for _, fx, fy, _ in found
                         if math.hypot(fx - best_x, fy - best_y) < 0.05]
                 seen_x = sum(v[0] for v in same) / len(same)
                 seen_y = sum(v[1] for v in same) / len(same)
