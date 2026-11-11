@@ -935,9 +935,11 @@ class WrsMainController(object):
             edge = np.any(np.abs(local) >= half - tolerance, axis=1)
             if np.mean(edge) < 0.65:
                 continue
+            # 長い辺の向き [rad]（map）。細長い物をこの向きにそろえて入れる
+            long_yaw = angle if rect[1][0] >= rect[1][1] else angle + math.pi / 2.0
             detections.append({"kind": kind, "x": float(center[0]), "y": float(center[1]),
                                "rim_z": table_z + height, "width": float(width),
-                               "length": float(length)})
+                               "length": float(length), "long_yaw": float(long_yaw)})
         return detections
 
     @staticmethod
@@ -1343,6 +1345,7 @@ class WrsMainController(object):
                 stages.extend([
                     ("locate", lambda: self.locate_place_target(place)),
                     ("place", lambda: self.lift_then_pose(self.release_pose_for(place, label))),
+                    ("turn", lambda: self.turn_long_object(place, label)),
                     ("align", lambda: self.align_hand_over(
                         place, self.placement_targets[place]["x"],
                         self.placement_targets[place]["y"])),
@@ -1453,11 +1456,14 @@ class WrsMainController(object):
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
         "bottom": {"x": 0.20, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                    "stand": "drawer_standpoint"},
-        "top": {"x": 0.20, "z": 0.54, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
+        "top": {"x": 0.20, "z": 0.555, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
         "left": {"x": 0.53, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                  "stand": "drawer_left_standpoint"},
     }
     DRAWER_KNOB_FACE_Y = -0.355             # 取っ手の板の前面の y（3 つとも同じ）
+    # 取っ手が見えなかったときに使う前面の y。実際に見えた値は -0.321〜-0.334（11/9・11/11）で、
+    # -0.355 を使うと手を 3cm 奥に入れすぎて空振りしていた（11/11 上段: 3 回とも指の間隔 0.003）
+    DRAWER_KNOB_UNSEEN_Y = -0.328
     DRAWER_FINGER_REACH = 0.063             # 手のひら(hand_palm_link)から指先までの前後距離（実測）
     # 指先を板の前面からどれだけ奥へ入れるか。取っ手は「板（幅 6.6cm・厚さ 1cm）→ 軸（太さ 3cm・長さ 2cm）
     # → 根元の円板（直径 6.8cm）」の順に並ぶ。0.022 では指の腹が板の両端をはさみ（閉じた後の間隔 0.06 前後）、
@@ -1549,6 +1555,33 @@ class WrsMainController(object):
         return False
 
     RELEASE_SHAKE_ROLL = 0.35   # 離した後に手首をひねる量 [rad]（指に引っかかった物を振り落とす）
+
+    def turn_long_object(self, place, label):
+        """62401738 いしい
+        細長い物・背の高い物を、容器・トレイの長い辺と平行になるよう手首を回す（腕を上げた後、合わせる前）。
+        離す姿勢（put_in_* / release_*）は手が真下を向き、指は台車の左右に閉じるので、
+        上からつかんだ細長い物は台車の前後を向いている。その向きと長い辺の向きの差だけ手首を回す。
+        11/11: 青いボトルが容器の短い辺の向きのまま入れようとして、入らなかった。
+        容器の向きが分からなければ、台車の前後に対して 90° 回す（長机の容器は x 向きが長い）。
+        """
+        if self.object_length(label) is None:
+            return True
+        yaw = self.base_yaw()
+        if yaw is None:
+            return True
+        long_yaw = self.placement_targets.get(place, {}).get("long_yaw", 0.0)
+        delta = long_yaw - yaw
+        # 向きは 180° 回しても同じなので、-90°〜+90° にする
+        delta = math.atan2(math.sin(2 * delta), math.cos(2 * delta)) / 2.0
+        if abs(delta) < math.radians(15):
+            return True
+        name = self.release_pose_for(place, label)
+        joints = dict(self.poses[name])
+        joints["wrist_roll_joint"] = delta
+        self.poses[name] = joints   # 下ろす（lower_tall_object）ときも、この向きのまま
+        rospy.loginfo("turn %s along the long side of %s: wrist_roll %.2f rad", label, place, delta)
+        self.move_joints(joints)
+        return True
 
     def release_object(self):
         """62401738 いしい
@@ -1687,15 +1720,18 @@ class WrsMainController(object):
                 if abs(remain) < 0.005 and (x_tol is None or abs(remain_x) < x_tol):
                     return True
                 if shelf_guard:
+                    # shelf_guard に数値を渡したときは、それを下限にする（取っ手が奥に見えたとき）
+                    y_min = (self.DRAWER_PALM_Y_MIN if shelf_guard is True
+                             else min(self.DRAWER_PALM_Y_MIN, float(shelf_guard)))
                     palm_map = self.lookup_xyz("hand_palm_link", "map")
-                    if palm_map is not None and palm_map[1] < self.DRAWER_PALM_Y_MIN:
+                    if palm_map is not None and palm_map[1] < y_min:
                         # 棚に近づきすぎ。押し続けると倒れるので、ここで止める（後ろへ戻る指令は下で通す）
                         goes_in = (remain < 0) if frame == "map" else None
                         if goes_in is None:
                             goes_in = True
                         if goes_in:
-                            rospy.logwarn("hand is too close to the shelf (map y %.3f < %.2f); stop the base",
-                                          palm_map[1], self.DRAWER_PALM_Y_MIN)
+                            rospy.logwarn("hand is too close to the shelf (map y %.3f < %.3f); stop the base",
+                                          palm_map[1], y_min)
                             self.base_stalled = True
                             return False
                 if self.is_base_stalled(window, hand):
@@ -1905,7 +1941,8 @@ class WrsMainController(object):
                 rospy.logwarn("cannot take the drawer grasp pose")
                 continue
             # 台車を前に進めて、手を取っ手に差し込む
-            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10, shelf_guard=True):
+            # 11/11: 取っ手が -0.387 に見えたとき、-0.34 の柵で手前に止まり 3 回空振りした。下限は取っ手の 2cm 先にする
+            if not self.move_hand_by_base(grasp_y, pos_x, timeout=10, shelf_guard=grasp_y - 0.02):
                 # 指が取っ手に触れて止まった場合もあるので、閉じて指の間隔で判定する
                 rospy.logwarn("base insertion did not finish for the %s drawer; close and check", level)
             self.close_gripper_on_handle()
@@ -1978,6 +2015,8 @@ class WrsMainController(object):
         knob_seen = knob is not None
         if knob is None:
             rospy.logwarn("%s drawer knob not seen; use the expected position", level)
+            if not second:
+                expected = self.DRAWER_KNOB_UNSEEN_Y
             knob = (self.DRAWERS[level]["x"], expected, self.DRAWERS[level]["z"])
         face0 = knob[1]                 # 閉じているときの取っ手の位置
         if second:
@@ -2349,7 +2388,11 @@ class WrsMainController(object):
             tips_z = rim_z + self.RELEASE_CLEARANCE + length / 2.0
         else:
             tips_z = rim_z + self.GENERIC_RELEASE_TIPS
-        joints = dict(self.poses[self.release_pose_for(place, label)])
+        # place の段階で作った姿勢（turn で手首を回した向きを含む）から、高さだけ下げる
+        name = "release_{}".format(place)
+        if name not in self.poses:
+            name = self.release_pose_for(place, label)
+        joints = dict(self.poses[name])
         lift = max(0.0, min(joints["arm_lift_joint"], tips_z - self.RELEASE_TIPS_Z0))
         if lift >= joints["arm_lift_joint"] - 0.01:
             return True
@@ -2425,10 +2468,12 @@ class WrsMainController(object):
                 for item in self.detect_container_rims(near):
                     dist = math.hypot(item["x"] - x, item["y"] - y)
                     if item["kind"] == kind and dist < self.PLACE_SEARCH_RADIUS:
-                        found.append((dist, item["x"], item["y"]))
+                        found.append((dist, item["x"], item["y"], item.get("long_yaw")))
             if found:
-                _, best_x, best_y = min(found)
-                same = [(fx, fy) for _, fx, fy in found
+                _, best_x, best_y, best_yaw = min(found, key=lambda v: v[0])
+                if best_yaw is not None:
+                    target["long_yaw"] = best_yaw
+                same = [(fx, fy) for _, fx, fy, _ in found
                         if math.hypot(fx - best_x, fy - best_y) < 0.05]
                 seen_x = sum(v[0] for v in same) / len(same)
                 seen_y = sum(v[1] for v in same) / len(same)
@@ -2542,7 +2587,9 @@ class WrsMainController(object):
     TASK1_MIN_CYCLE_SEC = 60     # 物体 1 個（探す・つかむ・置く）にかかる時間の目安
     TASK1_RESCANS = 1            # 全部の場所で「物なし」になった後に、見直す回数
     TASK1_RESCAN_MIN_LEFT = 240  # 見直すのに必要な Task 1 の残り時間 [s]
-    DRAWER_RETRY_END_SEC = 7 * 60   # 開ききらなかった引き出しをやり直すのはここまで（~drawer_retry_end_sec）
+    # 開ききらなかった引き出しをやり直すのはここまで（~drawer_retry_end_sec）。既定は 0（やり直さない）。
+    # 11/11 01:25: やり直しで横の取っ手を 3 回空振りし、上段も含めて約 3 分使って Task 1 の時間がなくなった
+    DRAWER_RETRY_END_SEC = 0
     DRAWER_DONE_RATIO = 0.9      # 引く量のこの割合以上開いていれば、引き切ったとみなす
     DRAWER_END_SEC = 6 * 60      # 引き出しを開けるのはここまで（~drawer_end_sec で変更。3 つで約 4 分）
 
