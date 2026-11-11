@@ -1,0 +1,47 @@
+# CPU だけで動かす自分用のシミュレータ環境(GPU・NVIDIA ドライバ不要)。
+# 授業の ~/sim_ws/docker-compose.yml と同じ構成(simulator / workspace / xserver、ポート 3000・3001)で、
+#   - simulator は公開版の CPU イメージ(競技場は授業と同じ。採点・衝突判定は公開版のままで、授業とは違う)
+#     lab_sim/build_lab_sim.sh で授業と同じ採点のイメージを作り、.env に SIM_IMAGE=wrs_sim_lab:cpu と書くと、そちらを使う
+#   - workspace は公開の ROS Noetic 開発イメージに、このフォルダの ./workspace(リポジトリ)をマウント
+# GPU の予約(deploy.resources)は入れていない。使い方は README.md。
+services:
+  xserver:
+    image: devrt/xserver
+    ipc: host
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "3000:80"
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /tmp/.X11-unix/X0"]
+      interval: "1s"
+      retries: 20
+  simulator:
+    image: ${SIM_IMAGE:-ghcr.io/hsr-project/tmc_wrs_binary:noetic-latest}
+    ipc: host
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - DISPLAY=:0
+    volumes_from:
+      - xserver
+    depends_on:
+      - xserver
+  workspace:
+    image: devrt/ros-devcontainer-vscode:noetic-desktop
+    ipc: host
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "3001:3000"
+      - "3002:8888"
+    volumes:
+      - ./workspace:/workspace:cached
+    environment:
+      - DISPLAY=:0
+      - ROS_MASTER_URI=http://simulator:11311/
+    volumes_from:
+      - xserver
+      - simulator
+    depends_on:
+      - xserver
