@@ -1268,15 +1268,27 @@ class WrsMainController(object):
 
     def read_placement_cloud(self, after, stride=3):
         """62418450 向井悠人
-        指定時刻より新しい深度点群を取り、地図座標の点群と時刻を返す。
+        指定時刻より新しい点群を地図座標に変換し、TFが取れない場合は次の点群を待つ。
         """
         deadline = time.monotonic() + 4.0
-        while not rospy.is_shutdown() and time.monotonic() < deadline:
+        last_tf_error = None
+        while not rospy.is_shutdown():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             clouds = self.depth_clouds.copy()
-            if clouds and clouds[-1].header.stamp > after:
-                cloud = clouds[-1]
-                return self.cloud_in_map(cloud, stride), cloud.header.stamp
-            time.sleep(0.03)
+            if not clouds or clouds[-1].header.stamp <= after:
+                time.sleep(min(0.03, remaining))
+                continue
+            cloud = clouds[-1]
+            after = cloud.header.stamp
+            try:
+                return self.cloud_in_map(cloud, stride, tf_timeout=min(1.0, remaining)), after
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException) as error:
+                last_tf_error = error
+        if last_tf_error is not None:
+            raise last_tf_error
         raise ValueError("No new depth cloud after the observation pose")
 
     @staticmethod
@@ -1850,14 +1862,14 @@ class WrsMainController(object):
             raise ValueError("Expected three coordinates per depth point")
         return points
 
-    def cloud_in_map(self, cloud, stride):
+    def cloud_in_map(self, cloud, stride, tf_timeout=1.0):
         """62418450 向井悠人
-        深度点群を間引き、撮影時刻のTFで地図座標に変換する。
+        深度点群を間引き、指定時間内に得た撮影時刻のTFで地図座標に変換する。
         """
         if not cloud.header.frame_id or cloud.height <= 1:
             raise ValueError("Expected registered, organized depth")
         transform = self.lookup_transform(
-            "map", cloud.header.frame_id, cloud.header.stamp, 1.0)
+            "map", cloud.header.frame_id, cloud.header.stamp, tf_timeout)
         pixels = [(u, v) for v in range(0, cloud.height, stride)
                   for u in range(0, cloud.width, stride)]
         points = self.decode_depth_points(cloud, pixels, skip_nans=True)
