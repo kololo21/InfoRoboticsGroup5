@@ -1876,7 +1876,17 @@ class WrsMainController(object):
             rospy.sleep(0.5)
         return True
 
-    DRAWER_TOP_TILTS = (-0.45, -0.75, -0.35)   # 上段の取っ手が見えないときに試す首の角度 [rad]
+    DRAWER_TOP_TILTS = (-0.45, -0.75, -0.35)
+    # week1 で上段が開いた手順（origin/claude/restore-week1-grasp の pull_drawer / open_drawers）:
+    #   下段を 0.20 だけ引く → 上段の取っ手へ全身 IK で手を出す（手の向き (-90, 100, 0)、手のひら y -0.29・z 0.55）
+    # ~drawer_top_method:=pose で、決まった姿勢 + 台車でつかむやり方に戻す
+    DRAWER_BOTTOM_FIRST_PULL = 0.20
+
+    def top_by_ik(self):
+        """62401738 いしい
+        上段を week1 と同じ全身 IK でつかむか（既定 True）。
+        """
+        return rospy.get_param("~drawer_top_method", "ik") == "ik"   # 上段の取っ手が見えないときに試す首の角度 [rad]
 
     def look_at_drawer(self, level, fold_arm=True, tilt=None):
         """62401738 いしい
@@ -2132,10 +2142,11 @@ class WrsMainController(object):
         for attempt in range(tries):
             remain = goal - knob[1]
             rospy.loginfo("pull %s drawer: try %d, %.3f m left", level, attempt + 1, remain)
-            if level == "top":
-                # 上段は下段を開けた後なので、全身 IK ではなく決まった姿勢 + 台車でつかむ
+            if level == "top" and not self.top_by_ik():
+                # 決まった姿勢 + 台車でつかむ（~drawer_top_method:=pose のとき）
                 hand = self.grasp_drawer_handle_by_pose(level, knob)
             else:
+                # week1 と同じく、上段も全身 IK で手を出す（下段を 0.20 だけ引いた状態なら届いていた）
                 hand = self.grasp_drawer_handle(level, knob)
             if hand is None:
                 break
@@ -2325,6 +2336,10 @@ class WrsMainController(object):
                 try:
                     self.go_to_drawer(level)
                     level_pull = pull
+                    if level == "bottom" and self.top_by_ik() and "top" in self.DRAWER_LEVELS:
+                        # week1 の手順: 下段は先に 0.20 だけ引く（全部引くと上段に手が届かない）。
+                        # 上段を開けた後で、下段を全部まで引き足す
+                        level_pull = min(pull, self.DRAWER_BOTTOM_FIRST_PULL)
                     if level == "left":
                         # 横は 0.32 でも足りないと言われた（11/11）。少しだけ多く引く（上限 DRAWER_PULL_MAX）
                         level_pull = min(self.DRAWER_PULL_MAX, pull + self.DRAWER_LEFT_EXTRA)
@@ -2334,6 +2349,17 @@ class WrsMainController(object):
                     # 1 つで失敗しても、残りの引き出しは試す
                     opened[level] = False
                     rospy.logerr("could not open the %s drawer: %s", level, error)
+                    gripper.command(1)
+                    self.drawer_pose("all_neutral")
+            done = getattr(self, "drawer_opened", {}).get("bottom", 0.0)
+            if opened.get("bottom") and done < pull * 0.9:
+                # 下段を全部まで引き足す（取っ手の今の位置からつかみ、閉じていた位置から合計 pull まで）
+                rospy.loginfo("pull the bottom drawer the rest (%.3f -> %.2f m)", done, pull)
+                try:
+                    self.go_to_drawer("bottom")
+                    self.pull_drawer("bottom", pull=pull, total=pull)
+                except Exception as error:
+                    rospy.logerr("could not pull the bottom drawer the rest: %s", error)
                     gripper.command(1)
                     self.drawer_pose("all_neutral")
         except Exception as error:  # 引き出しで失敗しても Task 1 は続ける
@@ -2510,8 +2536,9 @@ class WrsMainController(object):
         return name
 
     # 手首を回すのは細長い物だけ。pitcher_base（縁をつかむ）は回すと胴体が奥へずれ、容器の奥に落ちた（11/11）
-    TURN_LABELS = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
-                   "fork", "spoon")
+    # 11/11: 平行に回すと容器の中でお互いに当たって入らなかった。回さない（縦のまま下ろす）。
+    # 離す姿勢は手が前に水平（arm_flex -1.0 + wrist_flex -0.57 ≒ -π/2）なので、上からつかんだ細長い物は縦に立つ
+    TURN_LABELS = ()
 
     # 緑のボックス（Bin A、wrc_bin_green）に入れる細長い物（~long_to_green_bin:=false で元の置き場所）
     LONG_TO_GREEN_BIN = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
