@@ -2014,17 +2014,25 @@ class WrsMainController(object):
         grasp_y = face_y - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH
         self.drawer_pose("grasp_on_table")
         self.square_to_drawer()
+        self.drawer_hits0 = self.furniture_hits()
+        self.drawer_restands = 0
         for dz in self.DRAWER_Z_RETRY:
             pos_z = knob_z + dz
             rospy.loginfo("grasp %s drawer handle (hand x=%.3f y=%.3f z=%.3f)",
                           level, pos_x, grasp_y, pos_z)
             gripper.command(1)
-            if not whole_body.move_end_effector_pose(
-                    pos_x, grasp_y + self.DRAWER_APPROACH, pos_z, yaw, pitch, roll):
-                rospy.logwarn("cannot reach the front of the %s drawer handle", level)
+            moved = whole_body.move_end_effector_pose(
+                pos_x, grasp_y + self.DRAWER_APPROACH, pos_z, yaw, pitch, roll)
+            state = self.drawer_hand_state(level, (pos_x, grasp_y + self.DRAWER_APPROACH, pos_z), moved)
+            if state == "stop":
+                return None
+            if state == "retry":
                 continue
-            if not whole_body.move_end_effector_pose(pos_x, grasp_y, pos_z, yaw, pitch, roll):
-                rospy.logwarn("cannot insert the hand to the %s drawer handle", level)
+            moved = whole_body.move_end_effector_pose(pos_x, grasp_y, pos_z, yaw, pitch, roll)
+            state = self.drawer_hand_state(level, (pos_x, grasp_y, pos_z), moved)
+            if state == "stop":
+                return None
+            if state == "retry":
                 continue
             self.close_gripper_on_handle()
             gap = self.finger_gap()
@@ -2037,6 +2045,39 @@ class WrsMainController(object):
             whole_body.move_end_effector_pose(
                 pos_x, grasp_y + self.DRAWER_APPROACH, pos_z, yaw, pitch, roll)
         return None
+
+    # 全身 IK の後、手のひらがこれより目標から離れていたら届いていないとみなす [m]。
+    # うまくいった回（11/11 の 3 回）の実測は 0.004〜0.025、02:35 の失敗は 0.13〜0.39
+    DRAWER_HAND_TOL = 0.06
+    DRAWER_RESTAND_MAX = 1   # 届かなかったとき、立ち位置に戻ってやり直す回数
+
+    def drawer_hand_state(self, level, target, moved):
+        """62401738 いしい
+        全身 IK で手を出した後の状態を返す。"ok"（手が target に来た）/ "retry"（立ち位置に戻ったので次の高さで試す）
+        / "stop"（棚に当たった・戻り直しても届かない → この引き出しはやめる）。
+        11/11 02:35: 最初の IK が CONTROL_FAILED で止まった後、MoveIt は「成功」でも手は 13〜39cm ずれていて、
+        ずれたまま試し続けて台車が棚に突っ込み、傾いた。
+        """
+        hand = self.lookup_xyz("hand_palm_link")
+        off = (math.sqrt(sum((a - b) ** 2 for a, b in zip(hand, target)))
+               if hand is not None else None)
+        hit = self.furniture_hits() > getattr(self, "drawer_hits0", 0)
+        if moved and not hit and (off is None or off <= self.DRAWER_HAND_TOL):
+            return "ok"
+        rospy.logwarn("%s drawer: hand is not at the handle (moved %s, off %s m, hit %s)",
+                      level, moved, None if off is None else round(off, 3), hit)
+        gripper.command(1)
+        if hit or self.drawer_restands >= self.DRAWER_RESTAND_MAX:
+            # 棚に当たったら押し続けない（倒れる）。腕をたたんで下がり、この引き出しはやめる
+            rospy.logwarn("%s drawer: give up this drawer", level)
+            self.drawer_pose("all_neutral")
+            self.go_to_drawer(level)
+            return "stop"
+        self.drawer_restands += 1
+        self.go_to_drawer(level)          # 腕をたたんで立ち位置に戻り直す（ずれたまま続けない）
+        self.drawer_pose("grasp_on_table")
+        self.square_to_drawer()
+        return "retry"
 
     def pull_drawer(self, level, pull=None, total=None):
         """62401738 いしい
