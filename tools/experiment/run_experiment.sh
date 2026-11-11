@@ -78,7 +78,7 @@ if [ -z "${START_CMD:-}" ]; then
     START_CMD="${DETECTOR_OPT:+env DETECTOR=$DETECTOR_OPT }/workspace/src/wrs_algorithm21/scripts/start_all.sh${VARIANT:+ $VARIANT}"
   fi
 fi
-CODE_FILE="${CODE_FILE:-workspace/src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node${VARIANT:+_$VARIANT}.py}"
+CODE_REL="src/wrs_algorithm21/scripts/wrs_algorithm/algorithm/wrs_main_node${VARIANT:+_$VARIANT}.py"   # CODE_FILE は GITDIR が決まってから
 
 cd "$DIR" || { echo "ERROR: $DIR に移動できません"; exit 1; }
 
@@ -110,7 +110,16 @@ for svc in xserver simulator workspace; do
   fi
 done
 
-GITDIR="$DIR/workspace"   # リポジトリのルート(src/ と tools/ がある場所)
+# リポジトリのルート(src/ と tools/ がある場所)。環境変数 GITDIR で指定できる。
+# 既定は $DIR/workspace(授業の ~/sim_ws/workspace)。なければ、docker-compose.yml のある $DIR 自体がリポジトリのとき($DIR/src がある)はそちら。
+# (ディレクトリ構成が変わって ~/workspace に直接ある場合は、-d ~/workspace か GITDIR=~/workspace)
+GITDIR="${GITDIR:-$DIR/workspace}"
+if [ ! -d "$GITDIR/src" ] && [ -d "$DIR/src" ]; then GITDIR="$DIR"; fi
+if [ ! -d "$GITDIR/src" ]; then
+  echo "ERROR: リポジトリ($GITDIR/src)が見つかりません。GITDIR=<リポジトリのルート> を指定してください"; exit 1
+fi
+CODE_FILE="${CODE_FILE:-$GITDIR/$CODE_REL}"
+echo "DIR=$DIR GITDIR=$GITDIR"
 
 # -f / -G: 実行するノードを GitHub や任意のファイルから取得して wrs_main_node_local.py に置く
 SOURCE="workspace"
@@ -192,8 +201,12 @@ wait_moveit() {  # Play のあとに、MoveIt(move_group の execute_trajectory)
 }
 
 set_seed() {
+  # change_seed.sh は docker compose exec simulator を呼ぶので、docker-compose.yml のある $DIR で実行する。
+  # $DIR になければ、リポジトリ内の同じスクリプト(src/wrs_controller21/scripts)を使う
   if [ -x ./change_seed.sh ]; then
     ./change_seed.sh "$1" >/dev/null
+  elif [ -f "$GITDIR/src/wrs_controller21/scripts/change_seed.sh" ]; then
+    bash "$GITDIR/src/wrs_controller21/scripts/change_seed.sh" "$1" >/dev/null
   else
     echo "  (change_seed.sh が無いのでSeed切替をスキップ)"
   fi
