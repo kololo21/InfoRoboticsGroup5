@@ -1540,7 +1540,9 @@ class WrsMainController(object):
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
         "bottom": {"x": 0.20, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                    "stand": "drawer_standpoint"},
-        "top": {"x": 0.20, "z": 0.555, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
+        # 上段の取っ手は、見えたときは毎回 x 0.143〜0.154・z 0.536〜0.549 だった（11/9〜11/11 の 6 回）。
+        # 見えないときに x 0.20 を使っていたので手が 5cm 横にずれ、板をつかめずに空振りしていた
+        "top": {"x": 0.15, "z": 0.54, "pull": DRAWER_FULL_PULL, "tilt": -0.6, "stand": "drawer_standpoint"},
         "left": {"x": 0.53, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
                  "stand": "drawer_left_standpoint"},
     }
@@ -1931,8 +1933,10 @@ class WrsMainController(object):
     # 例: 20° で台車の中心は (−0.08, 0.40) 付近。開いた下段の箱（x 0.03〜0.38, 前端 y −0.03）から 0.3m 以上離れる。
     # 11/11 から既定で右側から（15°）。引く向きは台車の角度によらず棚に垂直（map の +y）で、
     # 引いている間は台車の角度を保ったまま真後ろへ平行に下がる（pull_drawer の line / hold_yaw）
-    DRAWER_TOP_SIDE_DEG = 15.0
-    DRAWER_TOP_EXTRA_DEPTH = 0.03   # 上段だけ、手をこれだけ深く入れる [m]
+    # 11/11: 右から斜め（15°）では手が棚に斜めに入り、つかめなかった。正面（棚に垂直）に戻す
+    DRAWER_TOP_SIDE_DEG = 0.0
+    # 上段だけ、手をこれだけ深く入れる [m]。11/11: 0.03 では奥に入りすぎて詰まった。外れた原因は横のずれ（x）だった
+    DRAWER_TOP_EXTRA_DEPTH = 0.0
 
     def top_side_yaw(self):
         """62401738 いしい
@@ -2063,7 +2067,14 @@ class WrsMainController(object):
             rospy.logwarn("%s drawer knob not seen; use the expected position", level)
             if not second:
                 expected = self.DRAWER_KNOB_UNSEEN_Y
-            knob = (self.DRAWERS[level]["x"], expected, self.DRAWERS[level]["z"])
+            knob_x = self.DRAWERS[level]["x"]
+            if level == "top" and "bottom" in getattr(self, "drawer_knob_x", {}):
+                # 上段と下段の取っ手は同じ列にある。下段で実際に見えた x を使う
+                knob_x = self.drawer_knob_x["bottom"]
+            knob = (knob_x, expected, self.DRAWERS[level]["z"])
+        if knob_seen and not second:
+            self.drawer_knob_x = getattr(self, "drawer_knob_x", {})
+            self.drawer_knob_x[level] = knob[0]
         face0 = knob[1]                 # 閉じているときの取っ手の位置
         if second:
             # 2 回目: 閉じていたときの位置から合計 total 引いた所までにする
