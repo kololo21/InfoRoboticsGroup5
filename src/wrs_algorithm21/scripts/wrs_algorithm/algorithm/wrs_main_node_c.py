@@ -701,6 +701,7 @@ class WrsMainController(object):
         # 把持実行
         gripper.command(0)
         rospy.sleep(0.3)
+        self.squeeze_object()
 
         # 把持成功判定（空振りのチェック）
         # ※グリッパー開口幅が0（完全に閉じきっている）場合は物体を掴めていないと判断
@@ -722,6 +723,26 @@ class WrsMainController(object):
             yaw, pitch, roll
         )
         return True
+
+    OBJECT_GRASP_EFFORT = -0.5   # つかんだ後に握り続ける力（引き出しの取っ手で閉じられた値）
+
+    def squeeze_object(self):
+        """62401738 いしい
+        gripper.command(0)（位置で閉じる）の後、力の指令で握り直す。
+        11/11: 位置で閉じただけでは握る力が弱く、腕を上げる・運ぶ途中で落としていた
+        （toy_airplane・lego_duplo・pitcher_base が「lost on the way」、何も持たずに置き場所へ行っていた）。
+        """
+        try:
+            import actionlib
+            from tmc_control_msgs.msg import GripperApplyEffortAction, GripperApplyEffortGoal
+            client = actionlib.SimpleActionClient(
+                "/hsrb/gripper_controller/grasp", GripperApplyEffortAction)
+            if not client.wait_for_server(rospy.Duration(2.0)):
+                return
+            client.send_goal(GripperApplyEffortGoal(effort=self.OBJECT_GRASP_EFFORT))
+            client.wait_for_result(rospy.Duration(3.0))
+        except Exception as error:  # 握り直せなくても、位置で閉じたまま続ける
+            rospy.logwarn("could not squeeze the object: %s", error)
 
     def grasp_from_front_side(self, grasp_pos):
         """62408993 Masami Sakuma
@@ -1524,8 +1545,9 @@ class WrsMainController(object):
     #   x: 箱の内幅は約 0.28（中心 ±0.14）。物の半径 5cm を引いて ±0.07 なら壁から 2cm 以上離れる。
     #   y: 0.30 引いたとき、落とせる範囲は棚の前面 -0.39 〜 判定の箱の前の端 -0.125（真ん中 -0.258）。
     #      奥の列 -0.303（棚の前面まで 8.7cm）、手前の列 -0.218（判定の箱の端まで 9.3cm）。
-    DRAWER_DROP_SLOTS = ((0.0, -0.045), (-0.07, -0.045), (0.07, -0.045),
-                         (0.0, 0.04), (-0.07, 0.04), (0.07, 0.04))
+    # 11/11: ずらすと仕切りの上や箱の端に落ちて点にならなかった（緑の物が 2 つの箱の間に乗った）。
+    # 毎回同じ所（真ん中）に落とす
+    DRAWER_DROP_SLOTS = ((0.0, 0.0),)
     DRAWER_PLACE_NAME = "drawer_top_place"      # 2 段の引き出し（開いた段のうち上の方に入れる。名前は前のまま）
     # 開ける引き出しの順番。下段を先に開ける（上段を先に開けると、下段へ腕を下ろすときに上段に引っかかる）。
     # 上段は傾いて抜けることがあったので最後にする（失敗しても下段と横は開いている）。
@@ -2339,13 +2361,17 @@ class WrsMainController(object):
                             "head_tilt_joint": 0.0, "head_pan_joint": 0.0}
         return name
 
+    # 手首を回すのは細長い物だけ。pitcher_base（縁をつかむ）は回すと胴体が奥へずれ、容器の奥に落ちた（11/11）
+    TURN_LABELS = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
+                   "fork", "spoon")
+
     def turn_long_object(self, place, label):
         """62401738 いしい
         背の高い物・細長い物を、容器・トレイの長い辺と平行になるよう手首を回す（腕を上げた後、合わせる前）。
         離す姿勢は手が真下を向き、指は台車の左右に閉じるので、上からつかんだ細長い物は台車の前後を向いている。
         その向きと長い辺の向き（locate で測った long_yaw）の差だけ手首を回す。向きを測れていなければ回さない。
         """
-        if self.object_length(label) is None:
+        if label not in self.TURN_LABELS:
             return True
         long_yaw = self.placement_targets.get(place, {}).get("long_yaw")
         yaw = self.base_yaw()
