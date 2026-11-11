@@ -1342,13 +1342,13 @@ class WrsMainController(object):
                 # 引き出しと同じく、決まった腕の姿勢にしてから台車で手を容器の真上に合わせて離す。
                 stages.extend([
                     ("locate", lambda: self.locate_place_target(place)),
-                    ("place", lambda: self.lift_then_pose(self.release_pose_for(place))),
+                    ("place", lambda: self.lift_then_pose(self.release_pose_for(place, label))),
                     ("align", lambda: self.align_hand_over(
                         place, self.placement_targets[place]["x"],
                         self.placement_targets[place]["y"])),
                     ("lower", lambda: self.lower_tall_object(place, label)),
                     ("holding", lambda: self.check_holding(label, record)),
-                    ("release", lambda: gripper.command(1))])
+                    ("release", self.release_object)])
             else:
                 stages.append(("place", lambda: self.lift_then_pose(into_pose)))
                 if place in getattr(self, "drawer_places", {}):
@@ -1357,7 +1357,7 @@ class WrsMainController(object):
                     stages.insert(-1, ("locate", lambda: self.locate_drawer_drop(place)))
                     stages.append(("align", lambda: self.align_hand_over_drawer(place)))
                 stages.append(("holding", lambda: self.check_holding(label, record)))
-                stages.append(("release", lambda: gripper.command(1)))
+                stages.append(("release", self.release_object))
             stages.append(("retreat", lambda: self.drawer_pose("all_neutral")))
             for stage, action in stages:
                 record["stage"] = stage
@@ -1547,6 +1547,51 @@ class WrsMainController(object):
             record["lost"] = True
         gripper.command(1)
         return False
+
+    RELEASE_SHAKE_ROLL = 0.35   # 離した後に手首をひねる量 [rad]（指に引っかかった物を振り落とす）
+
+    def release_object(self):
+        """62401738 いしい
+        ハンドを開いて物を離す。11/10: 物が指に引っかかって離せないことがあった。
+        gripper.command(1) は MoveIt で計画するので、物が指に触れていると開かないことがある。
+        開いたか指の間隔で確かめ、開いていなければ力の指令で開く。その後、手首を左右にひねって振り落とす。
+        """
+        gripper.command(1)
+        gap = self.finger_gap()
+        if gap is not None and gap < self.DRAWER_OPEN_GAP:
+            rospy.logwarn("gripper did not open to release (gap %.3f); open with effort", gap)
+            try:
+                import actionlib
+                from tmc_control_msgs.msg import GripperApplyEffortAction, GripperApplyEffortGoal
+                client = actionlib.SimpleActionClient(
+                    "/hsrb/gripper_controller/grasp", GripperApplyEffortAction)
+                if client.wait_for_server(rospy.Duration(2.0)):
+                    client.send_goal(GripperApplyEffortGoal(effort=0.5))
+                    client.wait_for_result(rospy.Duration(3.0))
+            except Exception as error:
+                rospy.logwarn("effort open failed: %s", error)
+            gripper.command(1)
+        rospy.sleep(0.3)
+        self.shake_wrist()
+        return True  # 離せなくても次へ進む（持ったまま止まらない）
+
+    def shake_wrist(self):
+        """62401738 いしい
+        今の手首の向きから左右に RELEASE_SHAKE_ROLL ひねって戻す（引っかかった物を落とす）。
+        """
+        try:
+            from sensor_msgs.msg import JointState as _JointState
+            msg = rospy.wait_for_message("/hsrb/joint_states", _JointState, timeout=1.0)
+            # 腕の 5 関節をそろえて送る（一部の関節だけの指令はコントローラが受け付けないことがある）
+            arm = {name: msg.position[msg.name.index(name)] for name in (
+                "arm_lift_joint", "arm_flex_joint", "arm_roll_joint",
+                "wrist_flex_joint", "wrist_roll_joint")}
+        except Exception as error:
+            rospy.logwarn("cannot read the arm joints; skip shaking: %s", error)
+            return
+        roll = arm["wrist_roll_joint"]
+        for delta in (self.RELEASE_SHAKE_ROLL, -self.RELEASE_SHAKE_ROLL, 0.0):
+            self.move_joints(dict(arm, wrist_roll_joint=roll + delta), timeout=3.0)
 
     def lift_then_pose(self, name):
         """62401738 いしい
@@ -2274,21 +2319,37 @@ class WrsMainController(object):
         "windex_bottle": 0.27, "bleach_cleanser": 0.25, "chips_can": 0.25, "pitcher_base": 0.24,
         "cracker_box": 0.21, "mustard_bottle": 0.19, "sugar_box": 0.18, "master_chef_can": 0.14,
     }
-    RELEASE_CLEARANCE = 0.02   # 背の高い物の底を、容器の縁からどれだけ上で離すか
+    # 細長い物の長さ [m]。上からつかむと指の間で回って縦にぶら下がり、高い所から離すと的を外していた（11/10）。
+    LONG_OBJECTS = {
+        "large_marker": 0.12, "small_marker": 0.10, "spatula": 0.33, "fork": 0.20, "spoon": 0.20,
+    }
+    RELEASE_CLEARANCE = 0.02   # 背の高い物・細長い物の底を、容器の縁からどれだけ上で離すか
+    # 運ぶ高さの余裕: 物がつかんだ所から丸ごと下にぶら下がっても、底が縁よりこれだけ上を通る。
+    # 11/10: 青いボトル（上からつかんで全長が指の下）を指先 0.71 で運び、底（約 0.44）が縁（0.53）に当たった
+    CARRY_CLEARANCE = 0.05
+    GENERIC_RELEASE_TIPS = 0.12   # それ以外の物を離す指先の高さ（縁から）。運ぶときは 0.18 上
+    ARM_LIFT_MAX = 0.6
+
+    def object_length(self, label):
+        """62401738 いしい
+        背の高い物・細長い物の長さ [m]。どちらでもなければ None。
+        """
+        return self.TALL_OBJECTS.get(label) or self.LONG_OBJECTS.get(label)
 
     def lower_tall_object(self, place, label):
         """62401738 いしい
-        背の高い物は、容器の真上で位置を合わせた後に腕を下ろし、底が縁（センサで測った高さ）の
-        RELEASE_CLEARANCE 上に来た所で離す。それ以外の物は何もしない（True）。
-        以前は底を机の天面近くまで下ろしていたが、手が少しずれていると縁に当たって外にこぼれた（11/9）。
+        容器・トレイの真上で位置を合わせた後、腕を少し下げてから離す（高い所から離すと的を外す）。
+        背の高い物・細長い物は、真ん中をつかんでいるとして底が縁の RELEASE_CLEARANCE 上に来る高さ、
+        それ以外の物は指先が縁の GENERIC_RELEASE_TIPS 上に来る高さまで下げる。下げるだけで上げない。
         """
-        height = self.TALL_OBJECTS.get(label)
-        if height is None:
-            return True
         target = self.placement_targets[place]
         rim_z = target.get("rim_z", target["z"] - self.PLACE_RIM_CLEARANCE)
-        tips_z = rim_z + self.RELEASE_CLEARANCE + height / 2.0
-        joints = dict(self.poses[self.release_pose_for(place)])
+        length = self.object_length(label)
+        if length is not None:
+            tips_z = rim_z + self.RELEASE_CLEARANCE + length / 2.0
+        else:
+            tips_z = rim_z + self.GENERIC_RELEASE_TIPS
+        joints = dict(self.poses[self.release_pose_for(place, label)])
         lift = max(0.0, min(joints["arm_lift_joint"], tips_z - self.RELEASE_TIPS_Z0))
         if lift >= joints["arm_lift_joint"] - 0.01:
             return True
@@ -2298,12 +2359,19 @@ class WrsMainController(object):
         self.move_joints(joints)
         return True  # 下ろせなくても、その高さで離す（持ったまま次へ行かない）
 
-    def release_pose_for(self, place):
+    def release_pose_for(self, place, label=None):
         """62401738 いしい
-        place の上で離すときの腕の姿勢名。指先の高さが目標の z になるよう arm_lift を決める。
+        place の上へ運ぶときの腕の姿勢名。指先の高さが目標の z（縁 + 0.18）になるよう arm_lift を決める。
+        背の高い物・細長い物は、全長がぶら下がっても底が縁より CARRY_CLEARANCE 上を通る高さまで上げる
+        （上に運んでから lower_tall_object で少し下げて離す）。
         """
-        z = self.placement_targets[place]["z"]
-        lift = max(0.0, min(0.5, z - self.RELEASE_TIPS_Z0))
+        target = self.placement_targets[place]
+        z = target["z"]
+        length = self.object_length(label) if label else None
+        if length is not None:
+            rim_z = target.get("rim_z", z - self.PLACE_RIM_CLEARANCE)
+            z = max(z, rim_z + length + self.CARRY_CLEARANCE)
+        lift = max(0.0, min(self.ARM_LIFT_MAX, z - self.RELEASE_TIPS_Z0))
         name = "release_{}".format(place)
         self.poses[name] = {"arm_lift_joint": lift, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
                             "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
