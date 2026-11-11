@@ -744,6 +744,52 @@ class WrsMainController(object):
         except Exception as error:  # 握り直せなくても、位置で閉じたまま続ける
             rospy.logwarn("could not squeeze the object: %s", error)
 
+    # 指に引っかかりやすい物（離した後に手首を振って落とす）
+    STICKY_LABELS = ("clamp", "cup", "mug")
+    RELEASE_SHAKE_ROLL = 0.35
+
+    def release_object(self, label):
+        """62401738 いしい
+        ハンドを開いて離す。指に引っかかりやすい物（STICKY_LABELS）は、開いた後にその場で手首を左右にひねって落とす。
+        """
+        gripper.command(1)
+        if label in self.STICKY_LABELS:
+            rospy.sleep(0.3)
+            self.shake_wrist()
+        return True
+
+    def shake_wrist(self):
+        """62401738 いしい
+        今の腕の姿勢のまま、手首を左右に RELEASE_SHAKE_ROLL ひねって戻す（腕の 5 関節をそろえて送る）。
+        """
+        try:
+            from sensor_msgs.msg import JointState as _JointState
+            msg = rospy.wait_for_message("/hsrb/joint_states", _JointState, timeout=1.0)
+            arm = {name: msg.position[msg.name.index(name)] for name in (
+                "arm_lift_joint", "arm_flex_joint", "arm_roll_joint",
+                "wrist_flex_joint", "wrist_roll_joint")}
+        except Exception as error:  # 関節の角度が読めなければ振らない
+            rospy.logwarn("cannot read the arm joints; skip shaking: %s", error)
+            return
+        roll = arm["wrist_roll_joint"]
+        for delta in (self.RELEASE_SHAKE_ROLL, -self.RELEASE_SHAKE_ROLL, 0.0):
+            self.move_joints(dict(arm, wrist_roll_joint=roll + delta), timeout=3.0)
+
+    def still_in_hand(self, label):
+        """62401738 いしい
+        離した後にもう一度握ってみて、指の間隔が残れば物が指に引っかかったまま（True、握ったまま）。
+        何もなければ手を開いて False。薄い物は間隔で分からないので False。
+        """
+        if label in self.THIN_LABELS:
+            return False
+        self.squeeze_object()
+        gap = self.finger_gap()
+        if gap is not None and gap >= self.GRASP_EMPTY_GAP:
+            rospy.logwarn("%s is still in the hand after release (gap %.3f); place it again", label, gap)
+            return True
+        gripper.command(1)
+        return False
+
     def grasp_from_front_side(self, grasp_pos):
         """62408993 Masami Sakuma
         正面把持を行う。
@@ -1180,6 +1226,9 @@ class WrsMainController(object):
             "bin_b": (("bin_b_place", "put_in_bin"),),
         }
         category = next((name for name, labels in categories.items() if label in labels), None)
+        if label in self.LONG_TO_GREEN_BIN and rospy.get_param("~long_to_green_bin", True):
+            # 細長い物は、いったん全部 緑のボックス（Bin A）に入れる（容器・トレイに向きを合わせて入れられないため）
+            category = "bin_a"
         if category is None:
             raise ValueError("Unrecognized placement label: {}".format(label))
         if category in ("drawer_tools", "drawer_shape"):
@@ -1372,7 +1421,7 @@ class WrsMainController(object):
                         self.placement_targets[place]["y"])),
                     ("lower", lambda: self.lower_tall_object(place, label)),
                     ("holding", lambda: self.check_holding(label, record)),
-                    ("release", lambda: gripper.command(1))])
+                    ("release", lambda: self.release_object(label))])
             else:
                 stages.append(("place", lambda: self.lift_then_pose(into_pose)))
                 if place in getattr(self, "drawer_places", {}):
@@ -1381,7 +1430,7 @@ class WrsMainController(object):
                     stages.insert(-1, ("locate", lambda: self.locate_drawer_drop(place)))
                     stages.append(("align", lambda: self.align_hand_over_drawer(place)))
                 stages.append(("holding", lambda: self.check_holding(label, record)))
-                stages.append(("release", lambda: gripper.command(1)))
+                stages.append(("release", lambda: self.release_object(label)))
             stages.append(("retreat", lambda: self.drawer_pose("all_neutral")))
             for stage, action in stages:
                 record["stage"] = stage
@@ -1486,6 +1535,7 @@ class WrsMainController(object):
     # 11/11: 0.30 引いても測ると 0.28 前後しか開いておらず、点にならなかった。0.32 にする（上限 0.34 は守る）
     DRAWER_FULL_PULL = 0.32
     DRAWER_PULL_MAX = 0.34
+    DRAWER_LEFT_EXTRA = 0.02      # 横の引き出しだけ、これだけ多く引く
     DRAWERS = {
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
         "bottom": {"x": 0.20, "z": 0.28, "pull": DRAWER_FULL_PULL, "tilt": -0.85,
@@ -1879,7 +1929,9 @@ class WrsMainController(object):
     # 0 なら今までどおり真正面から。11/11: 下段を開けた後、上段は真正面から 6 回とも空振り・手が止まった。
     # 角度 φ のとき、台車は右へ約 0.6·sinφ ずれて立ち、腕は左斜め前（棚の方）へ伸びる。
     # 例: 20° で台車の中心は (−0.08, 0.40) 付近。開いた下段の箱（x 0.03〜0.38, 前端 y −0.03）から 0.3m 以上離れる。
-    DRAWER_TOP_SIDE_DEG = 0.0
+    # 11/11 から既定で右側から（15°）。引く向きは台車の角度によらず棚に垂直（map の +y）で、
+    # 引いている間は台車の角度を保ったまま真後ろへ平行に下がる（pull_drawer の line / hold_yaw）
+    DRAWER_TOP_SIDE_DEG = 15.0
 
     def top_side_yaw(self):
         """62401738 いしい
@@ -2212,7 +2264,11 @@ class WrsMainController(object):
                     continue
                 try:
                     self.go_to_drawer(level)
-                    opened[level] = self.pull_drawer(level, pull=pull)
+                    level_pull = pull
+                    if level == "left":
+                        # 横は 0.32 でも足りないと言われた（11/11）。少しだけ多く引く（上限 DRAWER_PULL_MAX）
+                        level_pull = min(self.DRAWER_PULL_MAX, pull + self.DRAWER_LEFT_EXTRA)
+                    opened[level] = self.pull_drawer(level, pull=level_pull)
                     self.log_drawer_poses("pulling the {} drawer".format(level))
                 except Exception as error:
                     # 1 つで失敗しても、残りの引き出しは試す
@@ -2234,7 +2290,8 @@ class WrsMainController(object):
             self.register_drawer_place(self.DRAWER_PLACE_NAME, self.drawer_drop_point(level, pull), level)
         # 横の引き出しの置き場所
         if opened.get("left"):
-            self.register_drawer_place(self.DRAWER_LEFT_PLACE_NAME, self.drawer_drop_point("left", pull),
+            self.register_drawer_place(self.DRAWER_LEFT_PLACE_NAME, self.drawer_drop_point(
+                "left", min(self.DRAWER_PULL_MAX, pull + self.DRAWER_LEFT_EXTRA)),
                                        "left")
         self.drawers_open = any(opened.values())
         if not self.drawers_open:
@@ -2396,6 +2453,10 @@ class WrsMainController(object):
     TURN_LABELS = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
                    "fork", "spoon")
 
+    # 緑のボックス（Bin A、wrc_bin_green）に入れる細長い物（~long_to_green_bin:=false で元の置き場所）
+    LONG_TO_GREEN_BIN = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
+                         "fork", "spoon")
+
     def turn_long_object(self, place, label):
         """62401738 いしい
         背の高い物・細長い物を、容器・トレイの長い辺と平行になるよう手首を回す（腕を上げた後、合わせる前）。
@@ -2552,7 +2613,9 @@ class WrsMainController(object):
         入れられる引き出しが開いていなければ例外にして、Task 1 側の代わりの置き場所（put_in_fallback）に任せる。
         """
         places = getattr(self, "drawer_places", {})
-        if rospy.get_param("~drawer_any", True):
+        # 11/11: ペンチ（clamp）が横の引き出しに入って 10 点（正しい場所なら 20 点）だった。
+        # 工具は 2 段の引き出し、形のものは横の引き出しに分ける（~drawer_any:=true で前の動き）
+        if rospy.get_param("~drawer_any", False):
             # 11/10 判明したルール: 引き切った引き出しのどれかに入れば「引き出しに入れた」になる。
             # 引き出し行きの物（工具も形のものも）は基本的に横の 1 段の引き出しに入れる。
             # 横が開いていないときだけ 2 段の方に入れる。
@@ -2648,7 +2711,11 @@ class WrsMainController(object):
         released = getattr(self, "last_placement_result", {}).get("released", False)
         if not released:
             return False, True
-        return self.wait_for_score(before), False
+        if self.wait_for_score(before):
+            return True, False
+        # 離したのに点が入らないとき、物が指に引っかかったまま持ってきていないか確かめる（11/11 ペンチ・コップ）。
+        # 引っかかっていれば「まだ持っている」として、もう一度置きに行く（足元を探して拾い直さない）
+        return False, self.still_in_hand(label)
 
     def place_until_scored(self, label):
         """62401738 いしい
