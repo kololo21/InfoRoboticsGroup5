@@ -1875,6 +1875,29 @@ class WrsMainController(object):
     DRAWER_POSE_FORWARD = 0.603  # 手のひらの前への距離
     DRAWER_POSE_LEFT = 0.075     # 手のひらの左への距離
 
+    # 上段を 2 段の引き出しの右側（map の -x 側）から斜めにつかむ角度 [deg]（~drawer_top_side_deg）。
+    # 0 なら今までどおり真正面から。11/11: 下段を開けた後、上段は真正面から 6 回とも空振り・手が止まった。
+    # 角度 φ のとき、台車は右へ約 0.6·sinφ ずれて立ち、腕は左斜め前（棚の方）へ伸びる。
+    # 例: 20° で台車の中心は (−0.08, 0.40) 付近。開いた下段の箱（x 0.03〜0.38, 前端 y −0.03）から 0.3m 以上離れる。
+    DRAWER_TOP_SIDE_DEG = 0.0
+
+    def top_side_yaw(self):
+        """62401738 いしい
+        上段をつかむときの台車の向き [deg]。真正面は DRAWER_YAW（-90）、右側からなら -90 + φ。
+        """
+        phi = float(rospy.get_param("~drawer_top_side_deg", self.DRAWER_TOP_SIDE_DEG))
+        phi = max(0.0, min(35.0, phi))
+        return self.DRAWER_YAW + phi
+
+    def base_for_palm(self, palm_x, palm_y, yaw_deg):
+        """62401738 いしい
+        DRAWER_POSE_GRASP の腕の姿勢で、手のひらが (palm_x, palm_y) に来る台車の位置。
+        手のひらは台車から前へ DRAWER_POSE_FORWARD、左へ DRAWER_POSE_LEFT（yaw -90 のとき今までの式と同じ）。
+        """
+        yaw = math.radians(yaw_deg)
+        return (palm_x - self.DRAWER_POSE_FORWARD * math.cos(yaw) + self.DRAWER_POSE_LEFT * math.sin(yaw),
+                palm_y - self.DRAWER_POSE_FORWARD * math.sin(yaw) - self.DRAWER_POSE_LEFT * math.cos(yaw))
+
     def grasp_drawer_handle_by_pose(self, level, knob):
         """62401738 いしい
         腕を決まった姿勢（手先が水平に前）にし、台車を前に進めて手を取っ手に差し込んでつかむ。
@@ -1891,14 +1914,17 @@ class WrsMainController(object):
             gripper.command(1)
             # 取っ手の手前 DRAWER_APPROACH の所に手が来る位置まで、腕をたたんだまま台車で下がる/進む
             self.drawer_pose("all_neutral")
-            self.coordinates["positions"]["drawer_pose_approach"] = [
-                pos_x - self.DRAWER_POSE_LEFT,
-                grasp_y + self.DRAWER_APPROACH + self.DRAWER_POSE_FORWARD, -90.0]
+            yaw_deg = self.top_side_yaw() if level == "top" else self.DRAWER_YAW
+            base_x, base_y = self.base_for_palm(pos_x, grasp_y + self.DRAWER_APPROACH, yaw_deg)
+            self.coordinates["positions"]["drawer_pose_approach"] = [base_x, base_y, yaw_deg]
+            if yaw_deg != self.DRAWER_YAW:
+                rospy.loginfo("top drawer from the right side: base (%.3f, %.3f, %.0f deg)",
+                              base_x, base_y, yaw_deg)
             if not self.navigate_for_placement("drawer_pose_approach"):
                 # 腕の姿勢が固定なので、立ち位置がずれたまま手を出すと棚にぶつかる
                 rospy.logwarn("cannot reach the approach point for the %s drawer; do not grasp", level)
                 return None
-            self.square_to_drawer()
+            self.square_to_drawer(yaw_deg=yaw_deg)
             joints = dict(self.DRAWER_POSE_GRASP, arm_lift_joint=lift)
             if not self.move_joints(joints):
                 rospy.logwarn("cannot take the drawer grasp pose")
@@ -2113,7 +2139,7 @@ class WrsMainController(object):
         norm = math.hypot(p_1[0] - p_0[0], p_1[1] - p_0[1])
         return (palm[0], palm[1]), ((p_1[0] - p_0[0]) / norm, (p_1[1] - p_0[1]) / norm), length
 
-    def square_to_drawer(self, timeout=6.0):
+    def square_to_drawer(self, timeout=6.0, yaw_deg=None):
         """62401738 いしい
         台車をその場で回して、棚の正面に垂直（map で DRAWER_YAW）に向ける。
         move_base で着いた向きは数度ずれていて、そのまま引くと斜めに引いて引っかかっていた（11/9）。
@@ -2124,8 +2150,8 @@ class WrsMainController(object):
                 yaw = self.base_yaw()
                 if yaw is None:
                     return False
-                err = math.degrees(math.atan2(math.sin(math.radians(self.DRAWER_YAW) - yaw),
-                                              math.cos(math.radians(self.DRAWER_YAW) - yaw)))
+                goal = math.radians(self.DRAWER_YAW if yaw_deg is None else yaw_deg)
+                err = math.degrees(math.atan2(math.sin(goal - yaw), math.cos(goal - yaw)))
                 if abs(err) < self.DRAWER_YAW_TOL:
                     return True
                 rate = max(-self.DRAWER_YAW_MAX, min(self.DRAWER_YAW_MAX, self.DRAWER_YAW_GAIN * err))

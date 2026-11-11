@@ -1,7 +1,10 @@
 <launch>
   <!-- 実行するファイル: wrs_main_node.py（統合版）/ wrs_main_node_a.py / _b.py / _c.py -->
   <arg name="node" default="wrs_main_node.py" />
+  <!-- node_c: 上段の引き出しを右側から斜めにつかむ角度 [deg]。0 なら真正面から（今までどおり） -->
+  <arg name="drawer_top_side_deg" default="0" />
   <node pkg="wrs_algorithm" type="$(arg node)" name="wrs_main" output="screen" required="true">
     <param name="test_mode" value="false" />
+    <param name="drawer_top_side_deg" value="$(arg drawer_top_side_deg)" />
   </node>
 </launch>
