@@ -2510,10 +2510,8 @@ class WrsMainController(object):
         return name
 
     # 手首を回すのは細長い物だけ。pitcher_base（縁をつかむ）は回すと胴体が奥へずれ、容器の奥に落ちた（11/11）
-    # 11/11: 平行に回すと容器の中でお互いに当たって入らなかった。回さない（縦のまま下ろす）。
-    # 離す姿勢は手が前に水平（arm_flex -1.0 + wrist_flex -0.57 ≒ -π/2）なので、
-    # 上からつかんだ細長い物・ボトルは手の下で縦に立ち、高く運んでから縦のまま下ろして離す（lower_tall_object）
-    TURN_LABELS = ()
+    TURN_LABELS = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
+                   "fork", "spoon")
 
     # 緑のボックス（Bin A、wrc_bin_green）に入れる細長い物（~long_to_green_bin:=false で元の置き場所）
     LONG_TO_GREEN_BIN = ("windex_bottle", "bleach_cleanser", "large_marker", "small_marker", "spatula",
