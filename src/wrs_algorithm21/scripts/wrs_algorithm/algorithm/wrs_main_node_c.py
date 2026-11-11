@@ -1483,7 +1483,8 @@ class WrsMainController(object):
     #   0.42 で後ろの縁が上のレールから外れて抜け落ちる。
     #   実測: 下段 0.30 は全開で問題なし（11/9 04:26 に 3 つとも開いた回）。上段 0.36 は傾いて抜け落ちた（11/9）。
     #   → 0.30 にする。0.34 を上限とし、それより大きい値を指定されても使わない（散らかさない）。
-    DRAWER_FULL_PULL = 0.30
+    # 11/11: 0.30 引いても測ると 0.28 前後しか開いておらず、点にならなかった。0.32 にする（上限 0.34 は守る）
+    DRAWER_FULL_PULL = 0.32
     DRAWER_PULL_MAX = 0.34
     DRAWERS = {
         # x: 取っ手の x、z: 取っ手の高さ、pull: 引く距離、tilt: 取っ手を見るときの頭の傾き [rad]
@@ -1996,6 +1997,10 @@ class WrsMainController(object):
         # 引き出しが抜けて落ちた（11/9 06:00）ので、引く先は測った量に頼らない。
         hand_goal_y = face0 - self.DRAWER_GRASP_DEPTH + self.DRAWER_FINGER_REACH + pull
         tries = self.DRAWER_PULL_TRIES   # 上段も半分だけなので傾かない。外れたらつかみ直す
+        if level == "top":
+            # 11/11: 上段は下段が開いていると手が届かず、つかみ直しても毎回空振りで約 4 分（シミュレータ時間）使っていた。
+            # 1 回だけ試して、時間を Task 1 に回す
+            tries = 1
         opened = 0.0
         for attempt in range(tries):
             remain = goal - knob[1]
@@ -3010,6 +3015,30 @@ class WrsMainController(object):
             return None
         return trans.translation
 
+    # 人に差し出す姿勢（腕を前に水平、手先も水平）と、そこから台車で前に出る距離 [m]
+    HAND_OVER_POSE = {"arm_lift_joint": 0.45, "arm_flex_joint": -1.57, "arm_roll_joint": 0.0,
+                      "wrist_flex_joint": 0.0, "wrist_roll_joint": 0.0,
+                      "head_tilt_joint": 0.0, "head_pan_joint": 0.0}
+    HAND_OVER_FORWARD = 0.15
+
+    def creep_forward(self, distance, speed=0.05):
+        """62401738 いしい
+        台車をゆっくり distance [m] 前に出す（人の手元まで手を差し出す）。odom で進んだ距離を測る。
+        """
+        start = self.lookup_xyz("base_footprint", "odom")
+        deadline = rospy.Time.now() + rospy.Duration(distance / speed * 2 + 2)
+        try:
+            while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+                now = self.lookup_xyz("base_footprint", "odom")
+                if start is None or now is None:
+                    break
+                if math.hypot(now[0] - start[0], now[1] - start[1]) >= distance:
+                    break
+                omni_base.cmd_vel(speed, 0.0, 0.0)
+                rospy.sleep(0.05)
+        finally:
+            omni_base.cmd_vel(0.0, 0.0, 0.0)
+
     def deliver_to_target(self, target_obj, target_person):
         """62401738 いしい
         棚で target_obj を取り、target_person に渡す。
@@ -3056,10 +3085,12 @@ class WrsMainController(object):
             target_person = self.DEFAULT_PERSON
         self.change_pose("look_at_near_floor")
         self.goto_name(self.PERSON_WAYPOINTS[target_person])
-        self.change_pose("deliver_to_human")
+        # 11/11: deliver_to_human（腕を斜め上）では人に届いておらず、正しい人に渡した判定にならなかった。
+        # 腕を前に水平に突き出し、台車も少し前に出して、人の手元まで差し出す。物は離さない（持ったまま待つ）。
+        if not self.move_joints(self.HAND_OVER_POSE):
+            self.change_pose("deliver_to_human")
+        self.creep_forward(self.HAND_OVER_FORWARD)
         rospy.sleep(10.0)
-        gripper.command(1)
-        self.change_pose("all_neutral")
 
     @classmethod
     def is_task2a_obstacle(cls, pos):
