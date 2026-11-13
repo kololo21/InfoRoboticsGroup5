@@ -1,31 +1,23 @@
 #!/bin/bash -eu
 # 使い方: [DETECTOR=yolo] start_all.sh [a|b|c]
 #   引数なし → wrs_main_node.py（統合版）、a/b/c → wrs_main_node_a.py などを実行
-#   local → wrs_main_node_local.py（tools/experiment の -f / -G が GitHub や任意のファイルから置く一時ファイル）
 #   DETECTOR=yolo / frcnn → 物体検出器を指定する
-#   省略時: 統合版（引数なし）・c・local は YOLOv8、a・b は今までの Faster R-CNN
+#   省略時: 統合版（引数なし）と c は YOLOv8、a・b は今までの Faster R-CNN
 #   YOLO のライブラリ（/workspace/.yolo_env）か重みがなければ Faster R-CNN に戻す
 
 if [ $# -ge 1 ]; then
   case "$1" in
-    a|b|c|local) NODE="wrs_main_node_$1.py" ;;
-    quick) NODE="wrs_main_node_quick.py" ;;   # 短縮確認: 1物体だけ 探す→つかむ→置く。環境変数 QUICK_BASE_NODE のノードのクラスを使う
-    *) echo "usage: $0 [a|b|c|local|quick]" >&2; exit 1 ;;
+    a|b|c) NODE="wrs_main_node_$1.py" ;;
+    *) echo "usage: $0 [a|b|c]" >&2; exit 1 ;;
   esac
 else
   NODE="wrs_main_node.py"
 fi
 if [ -z "${DETECTOR:-}" ]; then
   case "${NODE}" in
-    wrs_main_node.py|wrs_main_node_c.py|wrs_main_node_local.py|wrs_main_node_quick.py) DETECTOR=yolo ;;
+    wrs_main_node.py|wrs_main_node_c.py) DETECTOR=yolo ;;
     *) DETECTOR=frcnn ;;
   esac
-  # NVIDIA GPU のない環境(tools/local_cpu の CPU 環境など)では、Faster R-CNN 用の
-  # PyTorch が入っていないので YOLO を使う
-  if [ ! -e /dev/nvidiactl ] && ! command -v nvidia-smi >/dev/null 2>&1 && [ "${DETECTOR}" = "frcnn" ]; then
-    echo "[info] GPU がないので検出器を YOLO にします(DETECTOR=frcnn で明示すれば変わりません)" >&2
-    DETECTOR=yolo
-  fi
 fi
 if [ "${DETECTOR}" = "yolo" ]; then
   if [ ! -d /workspace/.yolo_env/ultralytics ] || \

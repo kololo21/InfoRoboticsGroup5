@@ -11,25 +11,13 @@ class YoloDetector:
     """62401738 いしい
     YOLOv8 で物体検出を行うクラス。predict() の入出力は FasterRcnnDetector と同じ。
     """
-    def __init__(self, weights_path, image_size=640, device=None):
+    def __init__(self, weights_path, image_size=640, device=0):
         """62401738 いしい
         学習済みの重み（.pt）を読み込む。クラス名は重みに入っている名前（wod-c のラベル名）を使う。
-
-        device を省略すると、GPU があれば GPU(0)、なければ CPU を使う（GPU のない PC で
-        "Invalid CUDA device=0" で落ちないように）。環境変数 YOLO_DEVICE（cpu または 0）と
-        YOLO_IMAGE_SIZE（例 416。小さいほど CPU で速いが精度は下がる）で上書きできる。
         """
-        import os  # pylint: disable=import-outside-toplevel
         from ultralytics import YOLO  # pylint: disable=import-outside-toplevel
         self.model = YOLO(weights_path)
-        self.image_size = int(os.environ.get("YOLO_IMAGE_SIZE", image_size))
-        if device is None:
-            device = os.environ.get("YOLO_DEVICE", "")
-            if device.isdigit():
-                device = int(device)
-            elif not device:
-                import torch  # pylint: disable=import-outside-toplevel
-                device = 0 if torch.cuda.is_available() else "cpu"
+        self.image_size = image_size
         self.device = device
         self.names = self.model.names
 

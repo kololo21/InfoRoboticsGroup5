@@ -22,8 +22,7 @@ class FasterRcnnDetector:
             self.class_info = json.load(json_file)["classes"]
 
         # デフォルトモデルをロード
-        # GPU があれば GPU、なければ CPU（GPU のない PC で落ちないように）
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda')
         self.model = fasterrcnn_resnet50_fpn(pretrained=True)
 
         # パラメータをロード
