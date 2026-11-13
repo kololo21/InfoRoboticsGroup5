@@ -801,6 +801,7 @@ class WrsMainController(object):
         pos_z = grasp_pos.z
 
         rospy.loginfo("grasp_from_front_side (%.2f, %.2f, %.2f)", pos_x, pos_y, pos_z)
+        self.last_grasp_side = "front"   # 細長い物は手先の向き（手のひらの z）に沿って持っている
 
         return self.grasp_from_side(
             pos_x, pos_y, pos_z,
@@ -818,6 +819,7 @@ class WrsMainController(object):
 
         rospy.loginfo("grasp_from_upper_side (%.2f, %.2f, %.2f)", pos_x, pos_y, pos_z)
 
+        self.last_grasp_side = "upper"   # 細長い物は手のひらの x（上からつかむと台車の前後）に沿って持っている
         return self.grasp_from_side(
             pos_x, pos_y, pos_z,
             -90, -160, 0,
@@ -847,6 +849,7 @@ class WrsMainController(object):
 
         if label == "windex_bottle":
             # 胴を縦に保ち、手先を真下へ向けてつかむ。
+            self.last_grasp_side = "down"
             return self.grasp_from_side(
                 grasp_pos.x, grasp_pos.y, grasp_pos.z + self.HAND_PALM_Z_OFFSET,
                 -90, -180, 0, "-y", vertical_approach=True)
@@ -1456,6 +1459,10 @@ class WrsMainController(object):
                     ("holding", lambda: self.check_holding(label, record)),
                     ("release", lambda: self.release_object(label))])
             else:
+                if into_pose == "put_in_drawer_high" and label and \
+                        self.normalize_placement_label(label) in self.HANGING_TOOLS:
+                    into_pose = "put_in_drawer_higher"
+                    rospy.loginfo("carry %s higher over the top drawer (%s)", label, into_pose)
                 stages.append(("place", lambda: self.lift_then_pose(into_pose)))
                 if place in getattr(self, "drawer_places", {}):
                     # 引き出し: move_base も自己位置も 5cm ほどずれるので、置く直前に開いた取っ手を見て
@@ -1624,7 +1631,14 @@ class WrsMainController(object):
         "put_in_drawer_high": {"arm_lift_joint": 0.2, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
                                "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
                                "head_tilt_joint": 0.0, "head_pan_joint": 0.0},
+        # 11/13 seed 25: extra_large_clamp（長さ約 0.2）は離す姿勢で縦にぶら下がり（指先の下に約 0.1）、
+        # 指先 0.71 では先が上段の前板（縁 0.59）に当たって台車が止まり（あと 9cm）、引き出しの右外で離していた。
+        # 工具は指先 0.83 まで上げて運ぶ（ぶら下がった先が縁より 0.1 以上上を通る）
+        "put_in_drawer_higher": {"arm_lift_joint": 0.32, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
+                                 "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
+                                 "head_tilt_joint": 0.0, "head_pan_joint": 0.0},
     }
+    HANGING_TOOLS = ("clamp", "large_marker", "small_marker", "padlock", "bolt_and_nut")
     # 物体を落とす位置の x と、離すときの腕の姿勢（縁の高さ: 上段 0.59、下段・横 0.33）。
     # y は引いた距離から drawer_drop_point で決める。
     DRAWER_DROP = {
@@ -1651,6 +1665,11 @@ class WrsMainController(object):
     DRAWER_YAW = -90.0          # 引き出しを引くときの台車の向き [deg]（棚の正面に垂直）
     DRAWER_YAW_TOL = 1.0        # 向きを合わせる許容誤差 [deg]
     DRAWER_YAW_GAIN = 1.5       # 向きの誤差 [deg] → 回転速度 [deg/s]
+    # 11/13 seed 25: 横（左）の引き出しを引くと、台車が右へ回って取っ手が外れることがあった。
+    # 手は台車の中心より 7.8cm 左にあるので、引く力で台車が回る。引いている間の向きの保持を強くする
+    # （以前は 1.5 deg/s/deg・最大 5 deg/s で、回り始めると戻しきれなかった）
+    DRAWER_HOLD_YAW_GAIN = 3.0
+    DRAWER_HOLD_YAW_MAX = 15.0
     DRAWER_YAW_MAX = 15.0       # 向きを合わせる最大の回転速度 [deg/s]
     DRAWER_LEFT_PLACE_NAME = "drawer_left_place"  # 形のもの（横の引き出し）
     def lookup_xyz(self, child, frame="map"):
@@ -1690,8 +1709,32 @@ class WrsMainController(object):
         """
         joints = self.poses.get(name, {})
         if "arm_lift_joint" in joints:
-            self.move_joints({"arm_lift_joint": joints["arm_lift_joint"]})
+            # 11/13: arm_lift だけの指令は腕のコントローラに受け付けられず（joints ok false、0.02 秒）、
+            # 上げないまま腕を前に出していた。持った windex_bottle の下の端が容器・机に当たって腕が止まり
+            # （arm_lift 0.598 の指令で実際は 0.316）、低いまま押し込んでいた。腕の 5 関節を今の値でそろえて送る
+            current = self.current_arm_joints()
+            if current is None or current["arm_lift_joint"] < joints["arm_lift_joint"] - 0.01:
+                lift_only = dict(current or {}, arm_lift_joint=joints["arm_lift_joint"])
+                if not self.move_joints(lift_only):
+                    rospy.logwarn("could not lift the arm to %.3f before %s", joints["arm_lift_joint"], name)
         return self.drawer_pose(name)
+
+    ARM_JOINTS = ("arm_lift_joint", "arm_flex_joint", "arm_roll_joint", "wrist_flex_joint", "wrist_roll_joint")
+
+    def current_arm_joints(self):
+        """62401738 いしい
+        腕の 5 関節の今の値 {名前: 値}。取れなければ None。
+        """
+        try:
+            arm = whole_body.ARM_CMD
+            values = dict(zip(arm.get_active_joints(), arm.get_current_joint_values()))
+            joints = {name: float(values[name]) for name in self.ARM_JOINTS}
+        except (KeyError, TypeError, ValueError, rospy.ROSException) as error:
+            rospy.logwarn("cannot read the arm joints: %s", error)
+            return None
+        if not all(math.isfinite(v) for v in joints.values()):
+            return None
+        return joints
 
     def finger_gap(self):
         """62401738 いしい
@@ -1823,7 +1866,9 @@ class WrsMainController(object):
                 yaw_rate = 0.0
                 if hold_yaw is not None:
                     err = math.degrees(math.atan2(math.sin(hold_yaw - yaw), math.cos(hold_yaw - yaw)))
-                    yaw_rate = max(-5.0, min(5.0, self.DRAWER_YAW_GAIN * err))
+                    yaw_rate = max(-self.DRAWER_HOLD_YAW_MAX, min(self.DRAWER_HOLD_YAW_MAX,
+                                                                  self.DRAWER_HOLD_YAW_GAIN * err))
+                    self.pull_yaw_drift = max(getattr(self, "pull_yaw_drift", 0.0), abs(err))
                 omni_base.cmd_vel(vel_x, vel_y, yaw_rate)
                 window.append((rospy.Time.now().to_sec(), hand, math.hypot(vx_map, vy_map)))
                 if wall_deadline is None:
@@ -2289,10 +2334,12 @@ class WrsMainController(object):
             # 斜めに引いて引っかかっていた（11/9）。odom で引くときは、map の +y を odom の向きに直す。
             line = self.drawer_pull_line(frame, pos_x, grasp_y, remain)
             hold_yaw = self.base_yaw(frame)   # 引いている間、つかんだ時の向きを保つ
+            self.pull_yaw_drift = 0.0
             pull_finished = self.move_hand_by_base(
                 pull_goal[1], pull_goal[0], timeout=remain / self.DRAWER_PULL_SPEED * 3 + 5,
                 watch_grip=True, frame=frame, hold_yaw=hold_yaw, line=line, wall_timeout=5.)
             stopped_hand = self.lookup_xyz("hand_palm_link", frame)
+            rospy.loginfo("%s drawer pull: largest yaw error %.1f deg", level, self.pull_yaw_drift)
             progress = None
             if stopped_hand is not None and line is not None:
                 origin, direction, _ = line
@@ -2667,9 +2714,16 @@ class WrsMainController(object):
     # 容器の縁から内側の底までの深さ [m]（tmc_wrs_gazebo_worlds の model.sdf: 壁の高さ − 底板 0.004）。
     # container_a_place は大きい方（シミュレータの wrc_container_b、壁 0.11）、container_b_place は小さい方（壁 0.10）
     CONTAINER_DEPTH = {"container_a_place": 0.106, "container_b_place": 0.096}
-    FLOOR_RELEASE_LABELS = ("windex_bottle",)   # 底の近くまで下ろして離す物（真ん中をつかむ背の高い物）
+    # 11/13 seed 25: 細い物（マーカー・フォーク・スプーン）は縦に入れないと、判定（物の下）が容器の中に入らず
+    # 点にならなかった（large_marker を手首で 1.49 rad 回して横にし、容器 B の上に乗せた: 90 → 80 点）。
+    # URDF の順運動学で確かめると、離す姿勢（put_in_bin: 手が水平に前）では手のひらの x が真上を向く。
+    # 上からつかんだ細い物は手のひらの x に沿っているので、手首を回さなければ縦にぶら下がる。
+    # 正面からつかんだ物は手先の向き（手のひらの z）に沿っているので、手を真下へ向ける姿勢にすれば縦になる。
+    VERTICAL_LABELS = ("large_marker", "small_marker", "fork", "spoon")
+    FLOOR_RELEASE_LABELS = ("windex_bottle",) + VERTICAL_LABELS   # 底の近くまで下ろして離す物（真ん中をつかむ細長い物）
     FLOOR_RELEASE_MAX_ERROR = 0.025   # 指先がこれ以上ずれていたら、壁に当たるので底まで下ろさない [m]
     FLOOR_RELEASE_TIPS_OVER_RIM = 0.03   # 指先を縁よりこれだけ上に残す [m]
+    LOWER_MAX_ERROR = 0.04   # 指先のずれがこれより大きければ、容器の中へ下ろさない [m]
 
     def lower_tall_object(self, place, label):
         """62401738 いしい / 62418450 向井悠人
@@ -2713,6 +2767,10 @@ class WrsMainController(object):
                                   label, measured_z, tips_z, lift)
             except (KeyError, TypeError, ValueError, rospy.ROSException) as error:
                 rospy.logwarn("Cannot read arm lift for %s: %s", label, error)
+        if residual is not None and residual > self.LOWER_MAX_ERROR:
+            # 11/13: 24cm ずれたまま下ろし、容器の縁に押し付けていた。合っていなければ下ろさない
+            rospy.logwarn("%s is %.3f m off %s; do not lower", label, residual, place)
+            return True
         if lift >= joints["arm_lift_joint"] - 0.01:
             return True
         rospy.loginfo("lower %s into %s: arm_lift %.3f -> %.3f",
@@ -2737,7 +2795,10 @@ class WrsMainController(object):
         self.poses[name] = {"arm_lift_joint": lift, "arm_flex_joint": -1.0, "arm_roll_joint": 0.0,
                             "wrist_flex_joint": -0.57, "wrist_roll_joint": 0.0,
                             "head_tilt_joint": 0.0, "head_pan_joint": 0.0}
-        if label and self.normalize_placement_label(label) == "windex_bottle":
+        name_l = self.normalize_placement_label(label) if label else None
+        down = (name_l == "windex_bottle"
+                or (name_l in self.VERTICAL_LABELS and getattr(self, "last_grasp_side", None) != "upper"))
+        if down:
             # arm_flex+wrist_flex=-piで手先のz軸を鉛直下向きにする。
             # URDFの手のひら高さ0.2702mと既存の指先距離0.058mから初期高さを求める。
             tips_z0 = .2702 - self.DRAWER_PALM_TO_TIPS
@@ -2747,8 +2808,10 @@ class WrsMainController(object):
                 arm_lift_joint=max(0., min(self.ARM_LIFT_MAX, carry_z - tips_z0)),
                 arm_flex_joint=-1.35, arm_roll_joint=0.,
                 wrist_flex_joint=1.35 - math.pi, wrist_roll_joint=0.)
-            rospy.loginfo("Upright spray release pose for %s: arm_lift=%.3f",
-                          place, self.poses[name]["arm_lift_joint"])
+            rospy.loginfo("Upright release pose (hand down) for %s %s: arm_lift=%.3f",
+                          name_l, place, self.poses[name]["arm_lift_joint"])
+        elif name_l in self.VERTICAL_LABELS:
+            rospy.loginfo("keep %s vertical (grasped from above): hand forward, no wrist turn", name_l)
         return name
 
     # 手首を回すのは細長い物だけ。pitcher_base（縁をつかむ）は回すと胴体が奥へずれ、容器の奥に落ちた（11/11）
@@ -2765,8 +2828,8 @@ class WrsMainController(object):
         離す姿勢は手が真下を向き、指は台車の左右に閉じるので、上からつかんだ細長い物は台車の前後を向いている。
         その向きと長い辺の向き（locate で測った long_yaw）の差だけ手首を回す。向きを測れていなければ回さない。
         """
-        if label and self.normalize_placement_label(label) == "windex_bottle":
-            rospy.loginfo("Keep spray upright over %s", place)
+        if label and self.normalize_placement_label(label) in self.FLOOR_RELEASE_LABELS:
+            rospy.loginfo("Keep %s upright over %s (no wrist turn)", label, place)
             return True
         if label not in self.TURN_LABELS:
             return True
@@ -3224,6 +3287,7 @@ class WrsMainController(object):
             return False
         rospy.loginfo("re-pick %s at (%.2f, %.2f, %.2f)", label, pos.x, pos.y, pos.z)
         yaw_h, pitch, roll = self.REPICK_HAND_RPY
+        self.last_grasp_side = "front"   # 拾い直しは手を前に向けてつかむ（DRAWER_HAND_RPY と同じ向き）
         # 手前（+y、ロボット側）から差し込む。手のひらは物の中心より HAND_PALM_OFFSET 手前
         self.grasp_from_side(pos.x, pos.y + self.HAND_PALM_OFFSET, pos.z,
                              yaw_h, pitch, roll, "+y")
@@ -3340,6 +3404,8 @@ class WrsMainController(object):
                 rospy.logwarn("missed %s (finger gap %.3f); detect again", label, gap)
         return None, "failed"
 
+    UNDER_LONG_TABLE = {"under_long_table_r": (1.30, 1.0, 90), "under_long_table_l": (0.70, 1.0, 90)}
+
     def execute_task1(self):
         """62408993 Masami Sakuma / 62418450 向井悠人
         Task1を実行する。
@@ -3349,8 +3415,15 @@ class WrsMainController(object):
         hsr_position = [
             ("tall_table", "look_at_tall_table"),
             ("near_long_table_l", "look_at_near_floor"),
-            ("long_table_r", "look_at_tall_table")
+            ("long_table_r", "look_at_tall_table"),
+            ("under_long_table_r", "look_at_near_floor"),
+            ("under_long_table_l", "look_at_near_floor"),
         ]
+        # 11/13 seed 25: 長机（map x 0.4〜1.6, y 1.6〜2.0、天板 0.4）の下の床の物を見ていなかった。
+        # 長机の手前 y 1.0 から下を見る（look_at_near_floor の首 -1.0 で y 1.6 前後の床が見える）。
+        # y 1.85 より奥の床の物は手が届かないので exec_graspable_method が選ばない
+        for name, pos in self.UNDER_LONG_TABLE.items():
+            self.coordinates["positions"].setdefault(name, list(pos))
 
         # 置き場所の判断は B（put_object_by_label）に任せる（統合時に一本化）
         placed = []
